@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "inventory-planning"
+version = "0.2.0"
+description = "Distribution centre inventory planning — demand classification, safety stock, forecasting, purchase recommendations"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "statsmodels>=0.14",
+    "openpyxl>=3.1",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+[project.scripts]
+inventory-plan = "inventory_planning.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["inventory_planning*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

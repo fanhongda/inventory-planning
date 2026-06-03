@@ -1,0 +1,8 @@
+{
+  "_note": "Maps supplier ID/name patterns to incoterm. Used when incoterm is absent from PO files.",
+  "suppliers": {
+    "SIM001": "EXW",
+    "SRM005": "EXW"
+  },
+  "default": "FOB"
+}

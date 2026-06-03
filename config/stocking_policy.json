@@ -1,0 +1,30 @@
+{
+  "cycles_per_year": 12,
+  "stocking_tiers": [
+    {
+      "name": "stocking-high",
+      "label": "Stocking - High Service",
+      "min_active_cycles": 9,
+      "service_level": 0.95,
+      "z_score": 1.645
+    },
+    {
+      "name": "stocking-med",
+      "label": "Stocking - Medium Service",
+      "min_active_cycles": 6,
+      "service_level": 0.90,
+      "z_score": 1.282
+    },
+    {
+      "name": "non-stocking",
+      "label": "Non-Stocking - Order on Demand",
+      "min_active_cycles": 0,
+      "service_level": null,
+      "z_score": null
+    }
+  ],
+  "lt_outlier_sigma": 3.0,
+  "lt_rolling_months": 6,
+  "demand_rolling_cycles": 12,
+  "forecast_horizon_months": 6
+}

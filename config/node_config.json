@@ -1,0 +1,10 @@
+{
+  "location_id": "DC-01",
+  "location_name": "Distribution Center 1",
+  "currency": "USD",
+  "planning_cycle": "monthly",
+  "echelon_level": 1,
+  "parent_node": null,
+  "child_nodes": [],
+  "_note": "Multi-echelon expansion: add nodes here, set parent/child relationships"
+}

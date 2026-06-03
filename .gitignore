@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Env
+.env
+.venv/
+venv/
+
+# Outputs (timestamped runs — don't commit)
+output/
+eval-workspace/
+
+# Keep these committed output files (persisted planning params)
+!output/supplier_params.csv
+!output/sku_planning_params.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/

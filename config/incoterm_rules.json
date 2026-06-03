@@ -1,0 +1,46 @@
+{
+  "rules": {
+    "EXW": {
+      "goods_in_transit_owner": "buyer",
+      "include_git_in_inventory": true,
+      "note": "Buyer owns goods from factory gate; GIT is buyer's inventory"
+    },
+    "FCA": {
+      "goods_in_transit_owner": "buyer",
+      "include_git_in_inventory": true,
+      "note": "Risk transfers at named place; GIT is buyer's inventory"
+    },
+    "FOB": {
+      "goods_in_transit_owner": "buyer",
+      "include_git_in_inventory": true,
+      "note": "Risk transfers at port of loading; GIT is buyer's inventory"
+    },
+    "CFR": {
+      "goods_in_transit_owner": "buyer",
+      "include_git_in_inventory": true,
+      "note": "Buyer owns goods once on vessel"
+    },
+    "CIF": {
+      "goods_in_transit_owner": "buyer",
+      "include_git_in_inventory": true,
+      "note": "Buyer owns goods once on vessel; seller arranges insurance"
+    },
+    "DAP": {
+      "goods_in_transit_owner": "seller",
+      "include_git_in_inventory": false,
+      "note": "Seller responsible until destination; do not double-count with open PO"
+    },
+    "DDP": {
+      "goods_in_transit_owner": "seller",
+      "include_git_in_inventory": false,
+      "note": "Seller responsible until delivery, duty paid; do not double-count with open PO"
+    },
+    "DPU": {
+      "goods_in_transit_owner": "seller",
+      "include_git_in_inventory": false,
+      "note": "Seller responsible until unloaded at destination"
+    }
+  },
+  "default_incoterm": "FOB",
+  "note": "If incoterm unknown, assume FOB and flag for user confirmation"
+}

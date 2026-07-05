@@ -26,5 +26,9 @@
   "lt_outlier_sigma": 3.0,
   "lt_rolling_months": 6,
   "demand_rolling_cycles": 12,
-  "forecast_horizon_months": 6
+  "forecast_horizon_months": 6,
+  "cv_intermittent_threshold": 0.5,
+  "cv_erratic_threshold": 1.0,
+  "excess_dos_threshold_days": 90,
+  "service_level_metric": "CSL"
 }

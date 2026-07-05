@@ -10,6 +10,7 @@ from typing import Union, Optional
 
 import pandas as pd
 
+from .feedback.snapshot import SnapshotSaver
 from .readers.sales_history_reader import SalesHistoryReader
 from .readers.po_history_reader import POHistoryReader
 from .readers.open_so_reader import OpenSOReader
@@ -49,8 +50,8 @@ class InventoryPlanner:
         # Analytics
         policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text())
         self.classifier    = DemandClassifier(self.config_dir)
-        self.ss_calc       = SafetyStockCalculator()
-        self.projector     = InventoryProjector()
+        self.ss_calc       = SafetyStockCalculator(self.config_dir)
+        self.projector     = InventoryProjector(self.config_dir)
         self.forecaster    = Forecaster(horizon=policy_cfg["forecast_horizon_months"])
         self.recommender   = PurchaseRecommender()
 
@@ -126,18 +127,32 @@ class InventoryPlanner:
         print(f"      {len(supplier_lt)} SKU×supplier LT records")
 
         # Step 3: Demand classification
-        print("\n[3/6] Classifying demand (stocking policy)...")
+        print("\n[3/6] Classifying demand (stocking policy + CV pattern)...")
         classified = self.classifier.classify(demand_summary, ts)
         counts = classified["stocking_class"].value_counts().to_dict()
-        print(f"      {counts}")
+        pattern_counts = classified["demand_pattern"].value_counts().to_dict() if "demand_pattern" in classified.columns else {}
+        print(f"      Stocking classes: {counts}")
+        if pattern_counts:
+            print(f"      Demand patterns: {pattern_counts}")
 
-        # Step 4: Safety stock
-        print("\n[4/6] Calculating safety stock...")
-        ss_df = self.ss_calc.calculate(classified, supplier_lt)
+        # Step 4: Forecast — must run before safety stock to supply forecast RMSE
+        print("\n[4/6] Forecasting demand (6 months)...")
+        forecast_detail = self.forecaster.forecast_all(ts, classified=classified)
+        forecast_summary_df = self.forecaster.summary(forecast_detail)
+        if not forecast_detail.empty:
+            model_counts = forecast_detail.drop_duplicates("sku")["model_used"].value_counts().to_dict()
+            print(f"      Models used: {model_counts}")
 
-        # Step 5: Effective inventory + projection
-        print("\n[5/6] Projecting inventory position...")
-        # Fill estimated delivery dates now that we have LT data
+        # Step 5: Safety stock — uses forecast RMSE from step 4 as σDL
+        print("\n[5/6] Calculating safety stock...")
+        ss_df = self.ss_calc.calculate(classified, supplier_lt,
+                                       forecast_summary=forecast_summary_df if not forecast_detail.empty else None)
+        sigma_sources = ss_df["sigma_source"].value_counts().to_dict() if "sigma_source" in ss_df.columns else {}
+        if sigma_sources:
+            print(f"      σ source: {sigma_sources}")
+
+        # Step 6: Effective inventory + projection + recommendations
+        print("\n[6/6] Projecting inventory & generating recommendations...")
         if open_po_df is not None:
             open_po_df = self.open_po_reader.fill_estimated_delivery(open_po_df, supplier_lt)
         open_po_summary = self.open_po_reader.inbound_schedule(open_po_df) if open_po_df is not None else None
@@ -149,15 +164,8 @@ class InventoryPlanner:
         shortage_count = (projection["inventory_status"] == "SHORTAGE-RISK").sum()
         print(f"      EXCESS: {excess_count} SKUs | SHORTAGE-RISK: {shortage_count} SKUs")
 
-        # Step 6: Forecast
-        print("\n[6/6] Forecasting demand (6 months)...")
-        forecast_detail = self.forecaster.forecast_all(ts)
-        forecast_summary = self.forecaster.summary(forecast_detail)
-        if len(forecast_detail):
-            model_counts = forecast_detail.drop_duplicates("sku")["model_used"].value_counts().to_dict()
-            print(f"      Models used: {model_counts}")
-
-        # Purchase recommendations
+        # Purchase recommendations — uses forecast_next_period (t+1), not 6-month avg
+        forecast_summary = forecast_summary_df
         recommendations = self.recommender.recommend(projection, forecast_summary, open_so_summary, open_po_summary)
 
         results = {
@@ -211,6 +219,14 @@ class InventoryPlanner:
             print(f"  Open report: open {report_path}")
         except Exception as e:
             print(f"  Warning: HTML report failed ({e}) — CSV outputs still saved")
+
+        # Save planning snapshot for next-month feedback comparison
+        try:
+            policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text())
+            snapshot_path = SnapshotSaver().save(results, policy_cfg, out)
+            print(f"  Snapshot saved:   {snapshot_path.name}")
+        except Exception as e:
+            print(f"  Warning: snapshot save failed ({e})")
 
         print(f"\n  Outputs saved to: {out}")
 

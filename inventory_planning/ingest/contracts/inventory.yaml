@@ -1,0 +1,127 @@
+doc_type: inventory
+description: >
+  Stock position snapshot. Grain is the trap here: warehouse exports are usually one
+  row per SKU-location-bin-lot, so the naive read double-counts unless the rollup to
+  SKU-location is declared. The contract states the intended grain explicitly and the
+  structural test compares row count against distinct key count to catch it.
+grain: sku_location
+natural_key: [sku, location_id]
+capabilities: [position_signal, cost_signal]
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, stock code]
+
+  location_id:
+    type: string
+    role: identifier
+    description: DC / plant / warehouse. Carried on every output for multi-echelon readiness.
+    normalize: upper_strip
+    aliases: [location, location id, location code, warehouse, warehouse code,
+              warehouse id, plant, storage location, sloc, site, dc, wh, wrh, branch,
+              facility, stock location]
+
+  qty_on_hand:
+    type: decimal
+    unit: base_uom
+    role: measure
+    required: true
+    description: Physical stock present and sellable
+    aliases: [qty on hand, on hand, on-hand, on hand qty, onhand, onhand qty,
+              stock qty, stock on hand, soh, available qty, available quantity,
+              unrestricted stock, unrestricted, physical stock, inventory on hand,
+              closing stock, quantity, ending inventory]
+    assertions:
+      - expr: "qty_on_hand >= 0"
+        severity: warn
+        description: Negative stock means unposted issues — real, but it must be visible
+
+  qty_in_transit:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: >
+      Goods shipped but not yet received. Whether this counts toward the inventory
+      position depends on incoterm — under EXW the buyer owns it in transit, under
+      DDP the supplier does — which is why the incoterm rules are a separate config.
+    aliases: [qty in transit, in transit, in-transit, intransit, git, git qty,
+              goods in transit, transit stock, transit qty, on water, on the water,
+              pipeline qty, in transfer]
+
+  qty_allocated:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: >
+      On-hand stock already committed to orders. Treating allocated stock as available
+      is a common way to overstate the position and under-order.
+    aliases: [allocated, allocated qty, qty allocated, reserved, reserved qty,
+              committed qty, hard allocated, picked not shipped]
+
+  qty_available:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Free stock net of allocation
+    aliases: [available to promise, atp, free stock, unrestricted use, net available]
+    derivable_from:
+      - "qty_on_hand - coalesce(qty_allocated, 0)"
+      - "qty_on_hand"
+    assertions:
+      - expr: "qty_available <= qty_on_hand"
+        severity: warn
+
+  qty_on_order:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: >
+      Open purchase quantity as reported by the inventory system. Kept separate from
+      the open PO document because when both exist they must be reconciled, not summed.
+    aliases: [openpo quantity, openpo qty, openpo, open po qty, open po quantity,
+              on order, on order qty, qty on order, ordered not received, incoming]
+
+  unit_cost:
+    type: decimal
+    unit: currency_per_base_uom
+    role: measure
+    description: Inventory valuation per unit — converts days on hand into currency
+    aliases: [unit cost, unit price, standard cost, std cost, item cost, cost,
+              average cost, moving average price, valuation price, book value per unit]
+    derivable_from:
+      - "inventory_value / qty_on_hand"
+    assertions:
+      - expr: "unit_cost >= 0"
+        severity: error
+
+  inventory_value:
+    type: decimal
+    unit: currency
+    role: measure
+    description: Extended stock value
+    aliases: [inventory value, stock value, total value, extended value, value,
+              amount, valuation, book value]
+
+  uom_raw:
+    type: string
+    role: dimension
+    aliases: [uom, unit, unit of measure, base unit, stock unit]
+
+  snapshot_date:
+    type: date
+    role: timestamp
+    description: >
+      As-of date of the count. Silently assuming "today" when the extract is a week
+      old shifts every projected stockout date by that same week.
+    aliases: [snapshot date, report date, as of date, as-of date, date, run date,
+              extract date, posting date, period end]
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error

@@ -1,0 +1,168 @@
+doc_type: sales_history
+description: >
+  Transactional outbound demand at order- or shipment-line grain. One of two ways
+  to satisfy demand_signal; the other is a pre-compiled demand_timeseries. Sales
+  history is the richer of the two because it retains customer and value detail,
+  which the aggregated time series has already thrown away.
+grain: sales_order_line
+
+# Sales history is what actually shipped. The mirror of open_so's discriminator, for
+# the case where both documents come from the same ERP report under different filters.
+discriminator: "not_null(ship_date)"
+natural_key: [so_number, sku, ship_date]
+capabilities: [demand_signal, customer_dimension, revenue_dimension]
+
+value_domains:
+  uom:
+    canonical: [EA, CS, PL, KG, LB, L, M, BOX, PC, SET]
+    default: EA
+    map:
+      "ea": EA
+      "each": EA
+      "pc": PC
+      "pcs": PC
+      "piece": PC
+      "unit": EA
+      "un": EA
+      "cs": CS
+      "case": CS
+      "ctn": CS
+      "carton": CS
+      "box": BOX
+      "pl": PL
+      "plt": PL
+      "pallet": PL
+      "kg": KG
+      "kgs": KG
+      "kilogram": KG
+      "lb": LB
+      "lbs": LB
+      "l": L
+      "ltr": L
+      "litre": L
+      "liter": L
+      "m": M
+      "mtr": M
+      "set": SET
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, article no, stock code,
+              product_id, item_id]
+
+  order_date:
+    type: date
+    role: timestamp
+    description: Date the customer placed the order
+    aliases: [order date, so date, sales order date, created date, creation date,
+              doc date, document date, order dt, booking date]
+
+  ship_date:
+    type: date
+    role: timestamp
+    description: >
+      Date goods actually left. Preferred over order_date for building the demand
+      time series, because consumption is what the inventory model must cover.
+    # Excludes bare "delivery date": on an open order that is the promised date, not
+    # a shipment. This field decides sales-history-vs-open-order, so an ambiguous
+    # alias here would make the test inherit the ambiguity it exists to resolve.
+    aliases: [ship date, shipped date, actual ship date, delivered date,
+              goods issue date, gi date, delv date, actual delivery date,
+              despatch date, dispatch date]
+
+  demand_date:
+    type: date
+    role: timestamp
+    required: true
+    description: >
+      The date the time series is bucketed on. Derived by preference — ship date is
+      the true consumption signal; order date is the fallback when the export has no
+      shipment detail.
+    aliases: [demand date, transaction date, posting date]
+    derivable_from:
+      - "ship_date"
+      - "order_date"
+      - "customer_request_date"
+    assertions:
+      - expr: "not_null(demand_date)"
+        severity: error
+        description: Without a date the row cannot be placed in any period
+
+  customer_request_date:
+    type: date
+    role: timestamp
+    description: Date the customer asked for — the baseline for on-time delivery measurement
+    aliases: [customer request date, request date, requested date,
+              original requested date, requested delivery date, crd,
+              req date, customer req. date, required date, need by date, wish date]
+
+  promise_date:
+    type: date
+    role: timestamp
+    description: Date committed back to the customer — the other OTD baseline
+    aliases: [promise date, promised date, confirmed delivery date, confirmed date,
+              commit date, committed date, confirmation date]
+
+  qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    required: true
+    description: Quantity shipped or ordered on this line
+    aliases: [qty, quantity, order qty, ordered qty, shipped qty, shipped quantity,
+              sales qty, demand qty, delivered quantity, delivered qty, invoiced qty,
+              volume, units]
+    assertions:
+      - expr: "qty >= 0"
+        severity: warn
+        description: Negative lines are returns; they belong in the series but should be visible
+
+  amount:
+    type: decimal
+    unit: currency
+    role: measure
+    description: Line revenue — drives the revenue-at-risk ranking in the report
+    # `amt` is a distinct token from `amount`, so the abbreviated spellings need
+    # listing explicitly — token matching cannot bridge an abbreviation.
+    aliases: [amount, amt, revenue, net amount, net amt, net value, sales amount,
+              sales amt, order amount, order amt, line amount, line amt,
+              extended amount, invoice amount, sales value, turnover]
+
+  unit_price:
+    type: decimal
+    unit: currency_per_base_uom
+    role: measure
+    description: Selling price per unit, used for stockout cost estimation
+    aliases: [unit price, price, selling price, net price, sales price]
+    derivable_from:
+      - "amount / qty"
+
+  customer:
+    type: string
+    role: dimension
+    description: Enables per-customer service measurement and revenue-at-risk ranking
+    aliases: [customer, customer name, customer code, customer no, sold to, sold-to,
+              sold to party, account, client, ship to, buyer]
+
+  so_number:
+    type: string
+    role: identifier
+    aliases: [so number, so no, sales order, sales order number, order number,
+              document number, doc no, invoice no, invoice number]
+
+  uom_raw:
+    type: string
+    role: dimension
+    value_domain: uom
+    description: Raw unit code — mixed UoM in one series is a silent corruption source
+    aliases: [uom, unit, unit of measure, base unit, sales unit, uom code]
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error

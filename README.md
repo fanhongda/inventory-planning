@@ -66,6 +66,98 @@ Single-stage DC inventory planning pipeline, grounded in MIT CTL MicroMasters su
 | Feedback loop | Cumulative gap attribution across months | OPERATOR_DEVIATION / SUPPLY_GAP / MODEL_BIAS |
 | HTML dashboard | Self-contained report with 9 charts | inventory_report_<ts>.html |
 
+### Data intake as program synthesis, not schema matching
+
+Getting a second ERP's data in took longer than analysing it. Splitting that pain
+apart gave three different problems that had been sharing one code path:
+
+| Failure | Example | Does an alias list solve it? |
+|---|---|---|
+| **Lexical** — same meaning, new name | `Bal. Qty` / `Outstanding Quantity` | Yes, but by unbounded enumeration |
+| **Derivational** — the field isn't in the source | Open PO has no open qty; needs `order_qty − delivered_qty` | **No.** This is program synthesis |
+| **Grain / value domain** — the row means something else | PO header vs line vs schedule line; `CLSD` / `C` / `99` / `Closed` | **No.** Needs declared grain and a value map |
+
+The old `schema.py` alias dict handled only the first. The other two required editing
+a reader for every new ERP.
+
+So the knowledge moved out of code and into two data artefacts. A **contract** states
+what a field means — its type, its grain, the expressions it can be *reconstructed*
+from, and the invariants it must satisfy. An **adapter** states how one specific export
+satisfies that contract. Adapters are generated once, verified by assertions, reviewed,
+then frozen into git; from then on every run is deterministic with no model in the loop.
+
+The verification half is what makes the generation half safe. Three layers of test run
+on every load:
+
+- **structural** — required fields present; declared grain matches an actual unique key
+- **semantic** — `open_qty >= 0`, `open_qty <= order_qty`, lead time within a plausible band
+- **reconciliation** — control totals, and distribution drift against the previous load
+
+The grain test earns its place repeatedly. A PO *schedule line* export carries two or
+three rows per PO line; summed without a rollup, every quantity inflates, the position
+looks healthy, and the pipeline quietly stops recommending purchases — with no error
+anywhere, because the numbers stay internally consistent.
+
+### Should-be inventory, and why the lever ranking is computed
+
+The planner's core operation is not "forecast then order" — it is "what *should* stock
+be, and where is the gap". So should-be is the central object, decomposed by lever:
+
+```
+should-be = cycle(R, lot size) + safety(z, σ_D, σ_LT, R+LT) + pipeline(buyer-owned transit)
+```
+
+Two decisions in that formula change the answer more than the arithmetic does.
+
+**Ownership boundary.** Goods the supplier has not shipped are on nobody's finished-goods
+books; goods in transit are the buyer's only when the incoterm passes title at origin.
+Counting a full `D·LT` of pipeline overstates the balance sheet, usually by a lot, since
+production dominates lead time. Getting this right reverses the headline conclusion:
+
+| Lever | Pipeline counted in full | Ownership boundary applied |
+|---|---|---|
+| Review 30d → 7d | −12% | **−38%** |
+| σ_LT 15d → 5d | — | −12% |
+| Mean LT 75d → 45d | **−29%** | −5% |
+
+Mean lead time stops being the big lever, because it now acts only through the
+√(R+LT) term. **Lead-time variability becomes several times more valuable than
+lead-time speed** — which makes the supplier conversation about reliability, not
+about going faster.
+
+**Net, not gross.** A lever is ranked on annual net benefit, not on the cash it frees.
+The stock reduction is one-off; the ordering cost it incurs repeats every year. On real
+data "review weekly" routinely frees five figures of stock and destroys six figures of
+value — a result the gross ranking gets exactly backwards.
+
+EOQ lives here as a **constraint, not an objective**. Planners order to a review
+cadence, not to EOQ; EOQ's job is to say when that cadence has passed the economic
+point. So it appears in the output only when violated, and it is evaluated against the
+cadence a lever *proposes*, not the one it starts from.
+
+### On-time delivery, split four ways
+
+OTD is measured, not modelled: a line is on time when it shipped on or before the
+customer's request date. What earns it a module is that the failures are not one thing.
+
+| State | Owner |
+|---|---|
+| On time | — |
+| Shipped late | supply |
+| Past due, no stock | supply — a genuine miss |
+| **Past due, stock available** | **not supply** — the goods were there, uncollected |
+
+That last row is the one that makes the metric credible. It is not a planning failure,
+but counting it as one both overstates the supply miss and hides that the stock is
+committed, aged and immobile. Two owners, two fixes; a combined number serves neither.
+The report prints the fair reading beside the naive one and names the difference.
+
+Request-date quality is measured rather than caveated. A request date equal to the
+order date is "as soon as possible", not a requirement — OTD against it is unwinnable
+by construction. Those lines, plus ones already past due when raised, are counted and
+reported, and a clean-lines-only OTD is shown when it differs. If the two readings
+diverge, the metric is measuring order-entry habits and the fix is upstream of planning.
+
 ### Key design decisions vs standard approaches
 
 **Croston's method for intermittent demand.** ETS and ARIMA applied to sparse demand (e.g., 6 out of 12 active months) produce systematically unstable forecasts. Per MIT CTL, Croston's method separates demand magnitude from inter-arrival frequency, producing stable estimates for slow-moving and erratic SKUs.
@@ -175,16 +267,42 @@ Output:
 
 ## Input Formats
 
-All files accept CSV or Excel (.xlsx / .xls / .xlsm). Column names are auto-detected across ERP formats.
+Hand it the files in any order without saying what they are:
 
-| File | Required columns |
-|---|---|
-| Sales history | SKU/Item, Order Date or Ship Date, Qty |
-| PO history | SKU, Supplier, PO Date, Receive Date (or pre-computed LT column) |
-| Open SO | SKU, Open Qty |
-| Open PO | SKU, Order Qty, Delivered Qty, Closed Status |
-| Inventory | SKU, On-Hand Qty |
-| Time series *(optional)* | Item/SKU column + monthly period columns (wide format) |
+```python
+planner = InventoryPlanner(output_dir="output/")
+inputs  = planner.load_all(glob("exports/*"))
+results = planner.run_planning(**inputs)
+```
+
+Each file is profiled, routed to a contract, transformed by an adapter, and verified
+by contract tests before it reaches the analytics. CSV and Excel are both accepted.
+
+### Requirements are capabilities, not filenames
+
+| Capability | Required | Satisfied by |
+|---|---|---|
+| `demand_signal` | yes | pre-compiled demand time series **or** sales history |
+| `position_signal` | yes | inventory snapshot |
+| `lead_time_signal` | no | PO history |
+| `inbound_signal` | no | open POs |
+| `commitment_signal` | no | open sales orders |
+| `cost_signal` | no | inventory **or** PO history |
+| `order_pattern_signal` | no | PO history **or** open POs |
+| `service_signal` | no | open sales orders |
+
+A planner-supplied SKU × period matrix satisfies `demand_signal` by itself; the wide
+layout is recognised from the header, so no separate loader has to be called. Missing
+optional inputs do not fail the run — they produce a specific statement of what the
+analysis can no longer tell you:
+
+```
+○ lead_time_signal     fallback: config default lead time, zero lead-time variance
+
+What this run cannot tell you:
+  • Safety stock loses its lead-time variability term and will be understated
+  • Open PO arrival dates cannot be estimated when the export omits them
+```
 
 ## Configuration
 
@@ -214,6 +332,26 @@ output/<timestamp>/
 ```
 inventory_planning/
 ├── orchestrator.py
+├── ingest_bridge.py           canonical frames → analytics column expectations
+├── policy/                    ← should-be, levers, targets, decision loop
+│   ├── parameters.py          planning_parameters.md parser + scoped rule engine
+│   ├── assemble.py            one per-SKU attribute frame the whole layer reads
+│   ├── should_be.py           cycle + safety + buyer-owned pipeline, incoterm-aware
+│   ├── levers.py              per-SKU lever ranking on net annual benefit; EOQ guard
+│   ├── target.py              hard-target action frontier with burn-down limits
+│   ├── service.py             OTD measured, split four ways; request-date quality
+│   ├── diagnostics.py         over-ordering, chronic air, stockout risk, slow burn
+│   └── decisions.py           accept/reject log → constraint candidates
+├── ingest/                    ← contract-driven intake (no imports from this package)
+│   ├── contracts/*.yaml       canonical fields: type, grain, derivable_from, assertions
+│   ├── adapters/*/*.yaml      how one ERP export satisfies a contract (frozen, versioned)
+│   ├── expressions.py         AST-whitelisted evaluator for derivations + assertions
+│   ├── profiler.py            deterministic portrait; wide/long + locale detection
+│   ├── adapter.py             map → parse → value-map → derive → filter → roll up
+│   ├── registry.py            fingerprint routing; drafts an adapter when none matches
+│   ├── contract_tests.py      structural / semantic / reconciliation assertions
+│   ├── capabilities.py        capability resolution + degradation reporting
+│   └── intake.py              entry point: files in, canonical frames out
 ├── analytics/
 │   ├── demand_classifier.py   CV + frequency → demand pattern
 │   ├── forecaster.py          ETS / Croston / ARIMA / SMA
@@ -224,9 +362,16 @@ inventory_planning/
 │   ├── snapshot.py            auto-saves planning state after each run
 │   ├── collector.py           records actuals against prior snapshot
 │   └── loss.py                cumulative gap analysis + deviation attribution
-├── readers/                   5 document readers + time series reader
-└── reporting/                 charts + HTML report generator
+├── readers/                   legacy per-document readers (superseded by ingest/)
+└── reporting/
+    ├── kpi_report.py          two-chapter review: what happened / what is coming
+    ├── charts.py              matplotlib charts for the planning report
+    └── html_report.py         planning report generator
 ```
+
+`ingest/` imports nothing from the rest of the package, so it can be lifted into a
+shared `sc-canonical` distribution when the reconciliation skill needs the same
+machinery. `ingest_bridge.py` is the only place that knows this pipeline's column names.
 
 ## Running Tests
 

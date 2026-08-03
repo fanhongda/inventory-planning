@@ -1,0 +1,133 @@
+doc_type: open_so
+description: >
+  Open sales order lines — demand already committed to customers but not yet shipped.
+  Beyond feeding the net requirement as backlog, this document is the only source of
+  *realised* service performance: a line whose request date has passed while still
+  open is a live delivery miss, which is what makes an on-time-delivery KPI
+  measurable rather than merely modelled.
+grain: sales_order_line
+
+# An open order has not shipped. Used only when the headers cannot separate this from
+# sales history — which happens whenever both come from one ERP report run with a
+# different filter, and is otherwise unresolvable.
+discriminator: "is_null(ship_date)"
+natural_key: [so_number, sku]
+capabilities: [commitment_signal, service_signal]
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, stock code]
+
+  customer:
+    type: string
+    role: dimension
+    description: Enables ranking shortage risk by customer exposure, not just SKU count
+    aliases: [customer, customer name, customer code, customer no, sold to, sold-to,
+              sold to party, account, client, ship to, buyer]
+
+  so_number:
+    type: string
+    role: identifier
+    aliases: [so number, so no, sales order, sales order number, order number,
+              document number, doc no, reference]
+
+  open_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    required: true
+    description: Quantity still owed to the customer
+    aliases: [open qty, open quantity, backlog qty, backlog quantity, remaining qty,
+              outstanding qty, outstanding quantity, balance quantity, bal. qty,
+              undelivered qty, pending qty, unshipped qty, confirmed qty]
+    derivable_from:
+      - "order_qty - coalesce(shipped_qty, 0)"
+      - "order_qty"
+    assertions:
+      - expr: "open_qty >= 0"
+        severity: error
+
+  order_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Original ordered quantity, retained so open_qty can be derived and fill rate computed
+    aliases: [order qty, order quantity, ordered qty, ordered quantity, quantity, qty]
+
+  shipped_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    aliases: [shipped qty, shipped quantity, delivered qty, delivered quantity,
+              qty shipped, qty delivered, picked qty]
+
+  open_amount:
+    type: decimal
+    unit: currency
+    role: measure
+    description: Value at risk if this line cannot be served
+    aliases: [open amount, open amt, open value, backlog amount, backlog value,
+              remaining amount, remaining amt, outstanding amount, outstanding amt,
+              outstanding value, net value, net amt, order value, order amt]
+
+  unit_price:
+    type: decimal
+    unit: currency_per_base_uom
+    role: measure
+    aliases: [unit price, price, selling price, net price, sales price]
+    derivable_from:
+      - "open_amount / open_qty"
+
+  customer_request_date:
+    type: date
+    role: timestamp
+    required: true
+    description: >
+      What the customer asked for. The stricter of the two OTD baselines — measuring
+      against the promise date instead flatters performance, because the promise was
+      already renegotiated once.
+    aliases: [customer request date, request date, requested date,
+              original requested date, requested delivery date, crd,
+              req date, customer req. date, customer req date, required date,
+              need by date, wish date, first request date]
+    derivable_from:
+      - "promise_date"
+    assertions:
+      - expr: "not_null(customer_request_date)"
+        severity: warn
+        description: Without a request date this line cannot be aged or counted as past due
+
+  promise_date:
+    type: date
+    role: timestamp
+    description: Date confirmed back to the customer — the commercial commitment
+    aliases: [promise date, promised date, confirmed delivery date, confirmed date,
+              commit date, committed date, confirmation date, planned ship date,
+              scheduled ship date]
+
+  ship_date:
+    type: date
+    role: timestamp
+    description: >
+      Actual goods-issue date. On an open order this is empty by definition, and that
+      emptiness is what distinguishes this document from sales history when both come
+      from the same ERP report under different filters. Aliases are deliberately
+      narrow: a "delivery date" on an open order is a promise, not a shipment.
+    aliases: [ship date, shipped date, actual ship date, actual shipment date,
+              goods issue date, gi date, despatch date, dispatch date]
+
+  order_date:
+    type: date
+    role: timestamp
+    aliases: [order date, so date, sales order date, created date, doc date,
+              document date, booking date, entry date]
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error

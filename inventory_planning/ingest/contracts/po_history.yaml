@@ -1,0 +1,153 @@
+doc_type: po_history
+description: >
+  Closed / received purchase order lines. Supplies two distinct signals that the
+  previous pipeline only half-used: realised lead time and its variability, and the
+  historical ordering pattern (how much, how often) that the EOQ conformance
+  diagnostic compares against the economic order quantity.
+grain: po_receipt_line
+
+# PO history is *received* supply. The receipt date is what separates it from an
+# open PO, whose defining property is that nothing has arrived yet.
+discriminator: "not_null(receive_date)"
+natural_key: [po_number, sku, receive_date]
+capabilities: [lead_time_signal, order_pattern_signal, cost_signal]
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, stock code]
+
+  supplier:
+    type: string
+    role: dimension
+    required: true
+    description: Lead time is a property of the SKU-supplier pair, not the SKU alone
+    aliases: [supplier, supplier name, supplier id, supplier code, supplier no,
+              vendor, vendor name, vendor no, vendor code, vendor id, creditor,
+              seller, source, manufacturer]
+
+  po_number:
+    type: string
+    role: identifier
+    aliases: [po number, po no, po num, po, purchase order, purchase order number,
+              purch.doc., purchasing document, document number, doc no, order number]
+
+  po_date:
+    type: date
+    role: timestamp
+    required: true
+    description: Order placement date — the start of the lead time clock
+    aliases: [po date, order date, purchase order date, doc date, document date,
+              created date, creation date, order dt, requisition date]
+
+  receive_date:
+    type: date
+    role: timestamp
+    description: Goods receipt date — the end of the lead time clock
+    # Deliberately excludes bare "delivery date" and "arrival date": on an open PO
+    # those mean the *expected* arrival, so admitting them here makes an open PO look
+    # like a completed receipt — and this field is what the discriminator relies on.
+    aliases: [receive date, received date, receipt date, goods receipt date, gr date,
+              actual delivery, actual delivery date, actual receipt date, grn date,
+              posting date, actual arrival date]
+
+  lead_time_days:
+    type: decimal
+    unit: days
+    role: measure
+    required: true
+    description: >
+      Realised lead time. Derived from the two dates when both exist, otherwise taken
+      from a pre-computed column — some ERP extracts ship the LT and not the receipt
+      date, and previously that path needed a special case in the reader.
+    aliases: [lead time, lead time days, lt, lt days, actual lead time,
+              delivery lead time, procurement lead time, cycle time]
+    derivable_from:
+      - "days_between(receive_date, po_date)"
+    assertions:
+      - expr: "lead_time_days >= 0"
+        severity: error
+        description: Receipt before order means the two date columns are swapped
+      - expr: "lead_time_days <= 400"
+        severity: warn
+        description: Beyond ~13 months is almost always a data error, not a real lead time
+
+  po_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    required: true
+    description: >
+      Quantity ordered. Doubles as the order-size sample for EOQ conformance —
+      the distribution of these values reveals whether any lot-sizing policy exists.
+    aliases: [po qty, po quantity, order qty, ordered qty, ordered quantity,
+              quantity, qty, received qty, receipt qty, delivered qty]
+    assertions:
+      - expr: "po_qty > 0"
+        severity: warn
+        description: Zero-quantity lines distort the order-size distribution
+
+  po_amount:
+    type: decimal
+    unit: currency
+    role: measure
+    description: Line value — the basis for deriving unit cost
+    aliases: [po amount, po value, po line amount, net amount, net value,
+              purchase amount, receipt value, line amount, extended amount,
+              total value, gross value]
+
+  unit_cost:
+    type: decimal
+    unit: currency_per_base_uom
+    role: measure
+    description: >
+      Purchase cost per unit. Required by EOQ (holding cost) and by the conversion
+      of days-on-hand into currency, so it is derived from line value when absent.
+    aliases: [unit cost, unit price, price, net price, po price, purchase price,
+              cost, standard cost, item cost, moving average price]
+    derivable_from:
+      - "po_amount / po_qty"
+    assertions:
+      - expr: "unit_cost >= 0"
+        severity: error
+
+  freight_cost:
+    type: decimal
+    unit: currency
+    role: measure
+    description: >
+      Freight charged on this receipt. When present it calibrates the freight KPI
+      against actuals instead of against modelled rate cards.
+    aliases: [freight, freight cost, freight amount, freight charge, shipping cost,
+              transport cost, transportation cost, delivery charge, carriage]
+
+  transport_mode:
+    type: string
+    role: dimension
+    description: Realised shipping mode — the historical baseline for mode trade-off analysis
+    aliases: [transport mode, mode, ship mode, ship method, shipping method,
+              shipping mode, shipment mode, transportation mode, freight mode,
+              delivery mode, service level, carrier service, route]
+
+  incoterm_raw:
+    type: string
+    role: dimension
+    aliases: [incoterm, inco term, inco terms, incoterms, delivery term,
+              delivery terms, trade term, terms of delivery, shipping terms]
+
+  moq:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Supplier minimum order quantity — a hard constraint on any EOQ recommendation
+    aliases: [moq, min order qty, minimum order quantity, minimum qty, min qty,
+              order multiple, lot size, rounding value]
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error

@@ -1,0 +1,70 @@
+doc_type: demand_timeseries
+description: >
+  Pre-aggregated demand: one row per SKU, one column per period. This is what a
+  planner hands over when they have already done the bucketing themselves — the
+  common real-world case that previously required the caller to know to call a
+  separate loader.
+
+  The profiler detects this shape from the header (a run of period-like columns) and
+  routes here automatically, then melts it to the long grain below. Because the
+  aggregation already happened upstream, customer and revenue detail are gone; the
+  capability declaration records exactly that, so the planner is told what the run
+  lost rather than silently getting a thinner analysis.
+grain: sku_period
+natural_key: [sku, period]
+capabilities: [demand_signal]
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, stock code, product]
+
+  period:
+    type: string
+    role: timestamp
+    required: true
+    description: >
+      Period label produced by melting the wide header. Normalised to a monthly
+      period by the reader; the raw header text is retained in period_raw for audit.
+    assertions:
+      - expr: "not_null(period)"
+        severity: error
+
+  qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    required: true
+    description: Demand quantity in that period. Zero is meaningful — it is a real
+      no-demand period, not missing data, and drives intermittency classification.
+    assertions:
+      - expr: "qty >= 0"
+        severity: warn
+
+  description:
+    type: string
+    role: dimension
+    description: Item description, carried through to the report for readability
+    aliases: [description, item description, material description, product name,
+              item name, name, desc, long description]
+
+  sopc_classification:
+    type: string
+    role: dimension
+    description: Planner-supplied segmentation, preserved rather than recomputed
+    aliases: [sopc, sopc class, sopc classification, classification, class,
+              abc class, abc, segment, category, item class, planning class]
+
+  uom_raw:
+    type: string
+    role: dimension
+    aliases: [uom, unit, unit of measure, base unit]
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error

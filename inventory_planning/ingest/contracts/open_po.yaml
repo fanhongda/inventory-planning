@@ -1,0 +1,258 @@
+doc_type: open_po
+description: >
+  Open (not yet fully received) purchase order lines — the inbound supply pipeline.
+  This is the document where ERP exports differ most: some carry an outstanding
+  quantity directly, many force you to derive it, and the closed-status vocabulary
+  is different in every system.
+grain: po_line
+
+# An open PO has not been received. Mirror of po_history's discriminator.
+discriminator: "is_null(receive_date) or open_qty > 0"
+natural_key: [po_number, sku]
+capabilities: [inbound_signal, order_pattern_signal]
+
+value_domains:
+
+  po_status:
+    canonical: [open, closed, cancelled]
+    default: open
+    # Failure mode 3 from the architecture doc. The previous reader tested
+    # `closed_status != "yes"`, so SAP's "CLSD", Oracle's "C", D365's "99" and a
+    # plain "Closed" all silently passed through as open supply — inflating the
+    # inventory position and suppressing genuine purchase requests.
+    map:
+      "yes": closed
+      "y": closed
+      "true": closed
+      "closed": closed
+      "clsd": closed
+      "c": closed
+      "complete": closed
+      "completed": closed
+      "fully received": closed
+      "99": closed
+      "9": closed
+      "x": closed
+      "no": open
+      "n": open
+      "false": open
+      "open": open
+      "": open
+      "o": open
+      "1": open
+      "partially received": open
+      "partial": open
+      "in process": open
+      "released": open
+      "cancelled": cancelled
+      "canceled": cancelled
+      "cancel": cancelled
+      "deleted": cancelled
+      "void": cancelled
+
+  incoterm:
+    canonical: [EXW, FCA, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP]
+    default: null
+    map:
+      "exw": EXW
+      "exworks": EXW
+      "ex works": EXW
+      "ex-works": EXW
+      "fca": FCA
+      "fob": FOB
+      "f.o.b.": FOB
+      "free on board": FOB
+      "cfr": CFR
+      "c&f": CFR
+      "cnf": CFR
+      "cif": CIF
+      "cpt": CPT
+      "cip": CIP
+      "dap": DAP
+      "dpu": DPU
+      "ddu": DAP
+      "ddp": DDP
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    description: Item identifier, joined to item master
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, article no, stock code,
+              product_id, item_id]
+
+  supplier:
+    type: string
+    role: dimension
+    description: Vendor supplying this line
+    aliases: [supplier, supplier name, supplier id, vendor, vendor name, vendor no,
+              vendor code, creditor, seller, source]
+
+  po_number:
+    type: string
+    role: identifier
+    description: Purchase order document number
+    aliases: [po number, po no, po, purchase order, purchase order number,
+              purch.doc., purchasing document, document number, doc no, order number]
+
+  po_line_number:
+    type: string
+    role: identifier
+    description: >
+      Line item within the PO — needed to establish po_line grain. Note that `item`
+      is deliberately listed here as well as under sku: SAP uses it for the line
+      number while other systems use it for the material. Which one wins is decided
+      by the data profile, not by alias order.
+    aliases: [line, line no, line number, po line, item, item no., position, pos,
+              line item, seq, sequence, sched. line, schedule line]
+
+  order_qty:
+    type: decimal
+    unit: base_uom
+    grain: po_line
+    role: measure
+    description: Quantity ordered on this line
+    aliases: [order qty, order quantity, ordered qty, ordered quantity, po qty,
+              po quantity, quantity, qty, scheduled qty, purchase qty]
+    assertions:
+      - expr: "order_qty >= 0"
+        severity: error
+        description: A negative ordered quantity means the export mixed in returns or credits
+
+  delivered_qty:
+    type: decimal
+    unit: base_uom
+    grain: po_line
+    role: measure
+    description: Quantity already received against this line
+    aliases: [delivered qty, delivered quantity, received qty, received quantity,
+              qty delivered, qty received, goods receipt qty, gr qty, receipt qty]
+
+  open_qty:
+    type: decimal
+    unit: base_uom
+    grain: po_line
+    role: measure
+    required: true
+    description: >
+      Outstanding quantity still expected to arrive. Frequently absent from the
+      export, which is the canonical example of failure mode 2 — the field must be
+      synthesised rather than renamed.
+    aliases: [open qty, open quantity, remaining qty, remaining quantity,
+              outstanding qty, outstanding quantity, balance qty, balance quantity,
+              bal. qty, bal qty, po open qty, undelivered qty, still to be delivered,
+              open po qty, pending qty]
+    derivable_from:
+      - "order_qty - coalesce(delivered_qty, 0)"
+      - "order_qty"
+    assertions:
+      - expr: "open_qty >= 0"
+        severity: error
+        description: Over-receipt produces a negative balance; must be clamped upstream, not silently carried
+      - expr: "open_qty <= order_qty"
+        severity: warn
+        description: Open exceeding ordered usually means order_qty was mapped to the wrong column
+    required_by: [inventory-planning]
+
+  open_amount:
+    type: decimal
+    unit: currency
+    grain: po_line
+    role: measure
+    description: Value of the outstanding quantity — feeds committed-spend reporting
+    aliases: [open amount, open value, remaining amount, remaining value,
+              outstanding amount, outstanding value, po value, balance amount, net value]
+
+  unit_cost:
+    type: decimal
+    unit: currency_per_base_uom
+    role: measure
+    description: >
+      Purchase price per unit. Feeds EOQ holding cost and the DIOH-to-currency
+      conversion, so it is worth deriving from the line value when not exported directly.
+    aliases: [unit cost, unit price, price, net price, po price, purchase price,
+              cost, standard cost, item cost]
+    derivable_from:
+      - "open_amount / open_qty"
+    assertions:
+      - expr: "unit_cost >= 0"
+        severity: error
+
+  order_date:
+    type: date
+    role: timestamp
+    description: Date the PO was raised
+    aliases: [order date, po date, doc date, document date, purchase order date,
+              created date, creation date, order dt]
+
+  committed_delivery:
+    type: date
+    role: timestamp
+    description: >
+      Supplier-confirmed arrival date. When absent the planner must fall back to
+      order_date + lead time, which is flagged so the report can mark the ETA as estimated.
+    aliases: [committed delivery, committed delivery date, confirmed delivery date,
+              delivery date, scheduled delivery, scheduled delivery date, eta,
+              expected delivery, expected arrival, planned delivery, planned del date,
+              statistical delivery date, stat. del. date, stat del date, del. date,
+              promised date, requested delivery date, arrival date]
+    derivable_from:
+      - "order_date + lead_time_days"
+    assertions:
+      - expr: "committed_delivery >= order_date"
+        severity: warn
+        description: An ETA before the order date indicates a date-format misparse (DMY vs MDY)
+
+  receive_date:
+    type: date
+    role: timestamp
+    description: >
+      Actual goods-receipt date. Empty by definition on an open PO — that emptiness is
+      what separates this document from PO history. Aliases exclude "delivery date",
+      which on an open PO means the expected arrival, not a receipt that happened.
+    aliases: [received date, receipt date, goods receipt date, gr date, grn date,
+              actual receipt date, actual goods receipt]
+
+  po_status_raw:
+    type: string
+    role: dimension
+    value_domain: po_status
+    description: Raw status code, translated through the po_status value domain
+    aliases: [closed status, closed, status, po status, order status, line status,
+              processing status, deletion indicator, del. ind., completion status]
+
+  incoterm_raw:
+    type: string
+    role: dimension
+    value_domain: incoterm
+    description: Raw incoterm code, translated through the incoterm value domain
+    aliases: [incoterm, inco term, inco terms, incoterms, delivery term,
+              delivery terms, trade term, terms of delivery, shipping terms]
+
+  transport_mode:
+    type: string
+    role: dimension
+    description: >
+      Sea / air / express / road. Absent from most ERP PO exports but required for
+      the mode trade-off analysis, so it is declared here and populated from the
+      supplier or lane configuration when the export omits it.
+    aliases: [transport mode, mode, ship mode, shipping mode, shipment mode,
+              transportation mode, freight mode, delivery mode, route]
+
+# An "open PO" document that still contains closed and cancelled lines is not a
+# preference to be configured — it contradicts what the document claims to be.
+# Counting those lines as inbound supply is the single most expensive silent error
+# in this pipeline: it inflates the projected position and suppresses real purchase
+# requests. Applied only when the status resolved, so sources without one are unaffected.
+default_filters:
+  - "po_status == 'open'"
+  - "open_qty > 0"
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error
+    description: Rows without an item cannot be joined to demand

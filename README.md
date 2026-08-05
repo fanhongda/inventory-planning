@@ -363,6 +363,10 @@ inventory_planning/
 │   ├── collector.py           records actuals against prior snapshot
 │   └── loss.py                cumulative gap analysis + deviation attribution
 ├── readers/                   legacy per-document readers (superseded by ingest/)
+│
+│   (outside the package, at repo root:)
+│   skill/SKILL.md             Claude Code workflow — how to run it and what to relay
+│   .github/copilot-instructions.md   VS Code + GitHub Copilot — invariants and layout
 └── reporting/
     ├── kpi_report.py          two-chapter review: what happened / what is coming
     ├── charts.py              matplotlib charts for the planning report

@@ -1,0 +1,22 @@
+[
+  {"query": "I need to run my monthly inventory planning cycle. I have sales history, PO history, open SO, open PO and an inventory snapshot from our DC in Singapore. Suppliers SIM001 and SRM005 are on EXW terms.", "should_trigger": true},
+  {"query": "Can you check my stock levels and tell me what I need to buy this month? I'll upload the files.", "should_trigger": true},
+  {"query": "which SKUs are at shortage risk right now? and which open POs should I push out? here are my files", "should_trigger": true},
+  {"query": "run inventory planning using the 3-year time series i attached, EXW incoterm for all suppliers", "should_trigger": true},
+  {"query": "I need to figure out safety stock levels for all my SKUs. I have PO history and sales data going back 2 years.", "should_trigger": true},
+  {"query": "what should i reorder? my warehouse manager says we're running low on several items. here's our inventory export from the ERP", "should_trigger": true},
+  {"query": "generate purchase recommendations for next month's buying cycle. attached: sales_history.xlsx, po_history.xlsx, open_orders.xlsx, inventory.xlsx", "should_trigger": true},
+  {"query": "my CFO wants to know which open POs we can defer to free up cash. can you analyse our inventory position?", "should_trigger": true},
+  {"query": "i need a demand forecast for the next 6 months for our distribution centre SKUs", "should_trigger": true},
+  {"query": "help me classify which of our 800 SKUs should be stocking items vs non-stocking based on demand frequency", "should_trigger": true},
+  {"query": "write me a python function to calculate safety stock given demand mean, std dev, lead time and service level", "should_trigger": false},
+  {"query": "create a chart showing our monthly revenue trend from this CSV", "should_trigger": false},
+  {"query": "i need to optimise our warehouse layout and picking routes — we have 5000 SKUs across 3 zones", "should_trigger": false},
+  {"query": "can you help me write a supplier evaluation template in excel?", "should_trigger": false},
+  {"query": "analyse this sales data and tell me which products are growing vs declining", "should_trigger": false},
+  {"query": "i want to build an ARIMA forecasting model for time series data in python", "should_trigger": false},
+  {"query": "review my logistics contract — I need to check if the DDP vs EXW terms are commercially fair", "should_trigger": false},
+  {"query": "create a dashboard to track KPIs for our supply chain operations — on-time delivery, fill rate, inventory turns", "should_trigger": false},
+  {"query": "help me reconcile my freight invoice against the rate card for this shipment from Germany", "should_trigger": false},
+  {"query": "I have a CSV of product sales. Can you group them by category and show monthly totals?", "should_trigger": false}
+]

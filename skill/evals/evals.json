@@ -1,0 +1,117 @@
+{
+  "skill_name": "inventory-planning",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have my monthly inventory planning to run. Here are my 5 files: sales history, PO history, open SO, open PO, and inventory snapshot. Both my main suppliers SIM001 and SRM005 are on EXW terms. I also have a pre-compiled 3-year time series. Please run the full planning cycle and give me the purchase recommendations and HTML report.",
+      "expected_output": "Full pipeline runs, HTML report generated with 9 charts, purchase recommendation summary printed, output files saved to timestamped directory.",
+      "files": [
+        "/Users/fanhongda/Downloads/sales history record sample.xlsx",
+        "/Users/fanhongda/Downloads/PO history record sample.xlsx",
+        "/Users/fanhongda/Downloads/open sales order sample.xlsx",
+        "/Users/fanhongda/Downloads/open purchase order sample.xlsx",
+        "/Users/fanhongda/Downloads/inventory report sample.xlsx",
+        "/Users/fanhongda/Downloads/3 years sales history time series example.xlsx"
+      ],
+      "assertions": [
+        {
+          "text": "HTML report file is created in the output directory",
+          "type": "file_exists_pattern",
+          "pattern": "output/**/inventory_report_*.html"
+        },
+        {
+          "text": "Purchase recommendations CSV is created",
+          "type": "file_exists_pattern",
+          "pattern": "output/**/purchase_recommendations_*.csv"
+        },
+        {
+          "text": "Summary mentions PURCHASE-REQUEST count",
+          "type": "output_contains",
+          "value": "PURCHASE-REQUEST"
+        },
+        {
+          "text": "Summary mentions PUSH-OUT-OPEN-PO",
+          "type": "output_contains",
+          "value": "PUSH-OUT"
+        },
+        {
+          "text": "Reports the path to the HTML report",
+          "type": "output_contains",
+          "value": ".html"
+        },
+        {
+          "text": "HTML report is >500KB (contains embedded charts)",
+          "type": "file_size_min",
+          "pattern": "output/**/inventory_report_*.html",
+          "min_bytes": 512000
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Quick question — I just want to know which SKUs are at shortage risk and which ones I should push out open POs for. I have my inventory files from last week. Can you run the inventory planning and just highlight the urgent items?",
+      "expected_output": "Pipeline runs, shortage-risk SKUs and push-out candidates clearly highlighted in response, HTML report generated.",
+      "files": [
+        "/Users/fanhongda/Downloads/sales history record sample.xlsx",
+        "/Users/fanhongda/Downloads/PO history record sample.xlsx",
+        "/Users/fanhongda/Downloads/open sales order sample.xlsx",
+        "/Users/fanhongda/Downloads/open purchase order sample.xlsx",
+        "/Users/fanhongda/Downloads/inventory report sample.xlsx"
+      ],
+      "assertions": [
+        {
+          "text": "Shortage-risk SKUs are listed or mentioned",
+          "type": "output_contains",
+          "value": "SHORTAGE"
+        },
+        {
+          "text": "Push-out candidates are listed or mentioned",
+          "type": "output_contains",
+          "value": "push"
+        },
+        {
+          "text": "HTML report is generated",
+          "type": "file_exists_pattern",
+          "pattern": "output/**/inventory_report_*.html"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Run inventory planning. Use the 3-year time series for demand history. Suppliers are EXW. After the run, tell me: what's the total value I need to buy, which are the top 10 most urgent purchase requests, and which open POs should I push out?",
+      "expected_output": "Pipeline runs with timeseries, structured answer with total buy qty, top 10 purchase requests table, push-out list, and HTML report.",
+      "files": [
+        "/Users/fanhongda/Downloads/sales history record sample.xlsx",
+        "/Users/fanhongda/Downloads/PO history record sample.xlsx",
+        "/Users/fanhongda/Downloads/open sales order sample.xlsx",
+        "/Users/fanhongda/Downloads/open purchase order sample.xlsx",
+        "/Users/fanhongda/Downloads/inventory report sample.xlsx",
+        "/Users/fanhongda/Downloads/3 years sales history time series example.xlsx"
+      ],
+      "assertions": [
+        {
+          "text": "Top 10 purchase requests listed with SKU codes",
+          "type": "output_contains_count",
+          "value": "SKU",
+          "min_count": 5
+        },
+        {
+          "text": "Total buy quantity mentioned",
+          "type": "output_contains",
+          "value": "161"
+        },
+        {
+          "text": "Push-out candidates listed",
+          "type": "output_contains",
+          "value": "4098-9714"
+        },
+        {
+          "text": "HTML report generated with charts",
+          "type": "file_size_min",
+          "pattern": "output/**/inventory_report_*.html",
+          "min_bytes": 512000
+        }
+      ]
+    }
+  ]
+}

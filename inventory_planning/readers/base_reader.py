@@ -135,9 +135,11 @@ class BaseReader(ABC):
 
     def _clean(self, df: pd.DataFrame) -> pd.DataFrame:
         """Common cleaning: strip whitespace, normalize SKU, parse dates/numerics."""
-        # Strip object columns
-        for col in df.select_dtypes(include="object").columns:
-            df[col] = df[col].str.strip()
+        # Strip text columns. Not select_dtypes(include="object"): pandas 3 stores
+        # text as `str`, and pandas 4 drops it from the `object` selector.
+        for col in df.columns:
+            if pd.api.types.is_string_dtype(df[col]):
+                df[col] = df[col].str.strip()
 
         # Normalize SKU: uppercase, no leading/trailing spaces
         if "sku" in df.columns:

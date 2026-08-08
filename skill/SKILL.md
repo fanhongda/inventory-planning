@@ -16,7 +16,7 @@ description: >
 # DC Inventory Planning Skill
 
 You are running a single-stage distribution-centre inventory planning pipeline.
-The package lives at `/Users/fanhongda/ccAgent/inventory-planning/`.
+The package lives at `/Users/fanhongda/dev/inventory-planning/`.
 All logic is in `inventory_planning/` — do not rewrite it; orchestrate it.
 
 > **Canonical location:** `skill/SKILL.md` inside the `inventory-planning` repo, so this
@@ -80,11 +80,11 @@ name the *information*, not a filename:
 
 ```python
 import sys
-sys.path.insert(0, '/Users/fanhongda/ccAgent/inventory-planning')
+sys.path.insert(0, '/Users/fanhongda/dev/inventory-planning')
 from inventory_planning.orchestrator import InventoryPlanner
 
 planner = InventoryPlanner(
-    output_dir='/Users/fanhongda/ccAgent/inventory-planning/output/<YYYYMMDD_HHMM>',
+    output_dir='/Users/fanhongda/dev/inventory-planning/output/<YYYYMMDD_HHMM>',
     interactive=False,
 )
 inputs = planner.load_all([<every file path the user gave, in any order>])

@@ -35,6 +35,11 @@ _DOWNSTREAM_RENAMES: Dict[str, Dict[str, str]] = {
     "open_po": {},
     "po_history": {},
     "sales_history": {},
+    "item_master": {},
+    # Planner-set parameters keep their `planner_` prefix all the way through. The
+    # prefix is the point: it marks every one of these as a decision to be compared
+    # against, not a measurement to plan on.
+    "planning_master": {},
 }
 
 
@@ -67,12 +72,18 @@ class IngestBridge:
             "inventory_df": None,
             "timeseries_pivot": None,
             "timeseries_meta": None,
+            "item_master_df": None,
+            "planning_master_df": None,
         }
 
         for doc_type, doc in result.documents.items():
             frame = self._prepare(doc.frame.copy(), doc_type)
             if doc_type == "inventory":
                 out["inventory_df"] = frame
+            elif doc_type == "item_master":
+                out["item_master_df"] = frame
+            elif doc_type == "planning_master":
+                out["planning_master_df"] = frame
             elif doc_type == "open_po":
                 out["open_po_df"] = self._prepare_open_po(frame)
             elif doc_type == "open_so":

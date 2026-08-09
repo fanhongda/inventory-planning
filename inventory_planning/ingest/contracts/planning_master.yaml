@@ -1,0 +1,185 @@
+doc_type: planning_master
+description: >
+  The planner's own worksheet — the spreadsheet where the safety stock, min/max,
+  review period and lead time actually in use are maintained by hand, usually
+  alongside a few columns of demand history.
+
+  This document has a different standing from every other input, and the distinction
+  is the whole point of reading it. Everything else here is *evidence*: what shipped,
+  what was received, what is on the shelf. This is *decisions*: what a person set the
+  parameters to. So it is never treated as a measurement to trust — it is the
+  benchmark the computed parameters are compared against, and the gap between the two
+  is the finding.
+
+  The one exception is lead time, and only where no receipt history exists. A planner
+  who has been buying an item for years knows its lead time; a config-wide default
+  does not. Where both are available the measured value wins and the two are
+  cross-checked.
+
+  If the worksheet is laid out wide — one row per SKU, one column per month — the
+  profiler routes it to `demand_timeseries` for the demand and this contract picks up
+  the parameter columns from the same file. Planners keep it that way and the pipeline
+  should not make them split it.
+grain: sku
+natural_key: [sku]
+capabilities: [planner_baseline, lead_time_signal]
+
+# Distinguished from the item master by the presence of a parameter no ERP master
+# carries as such: a safety stock or a min/max the planner set themselves.
+discriminator: >
+  not_null(planner_safety_stock) or not_null(planner_reorder_point)
+  or not_null(planner_max_qty) or not_null(planner_review_period_days)
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, stock code, item id]
+
+  description:
+    type: string
+    role: dimension
+    aliases: [description, item description, material description, product name,
+              item name, name, desc]
+
+  planner_safety_stock:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: >
+      The safety stock the planner has set. Compared against the quantity the measured
+      lead time, its variability and the forecast error actually justify — that
+      comparison is the main reason to load this file.
+    aliases: [safety stock, ss, safety stock qty, safety qty, buffer stock, buffer,
+              ss qty, safety stock level, planned safety stock, min stock,
+              minimum stock, safety stock quantity]
+    assertions:
+      - expr: "planner_safety_stock >= 0"
+        severity: warn
+
+  planner_reorder_point:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Reorder point in use — compared against demand-during-lead-time + SS
+    aliases: [reorder point, rop, re-order point, order point, trigger point,
+              reorder level, min level, s level]
+
+  planner_min_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Min of a min-max policy
+    aliases: [min, min qty, minimum, min level qty, min stock qty, minmax min,
+              min-max min, lower limit]
+
+  planner_max_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Max of a min-max policy — the ceiling the position is managed to
+    aliases: [max, max qty, maximum, max level, max stock, max stock qty,
+              minmax max, min-max max, upper limit, target max, s]
+
+  planner_lead_time_days:
+    type: decimal
+    unit: days
+    role: measure
+    description: >
+      Lead time the planner is working to. Fills in where no receipt history exists;
+      otherwise cross-checked against the measured value.
+    aliases: [lead time, lead time days, lt, lt days, planning lead time,
+              planned lead time, supplier lead time, total lead time, lt (days)]
+    assertions:
+      - expr: "planner_lead_time_days > 0"
+        severity: warn
+
+  planner_review_period_days:
+    type: decimal
+    unit: days
+    role: measure
+    description: How often the planner actually reviews this item
+    aliases: [review period, review period days, review cycle, review frequency,
+              order cycle, ordering cycle, planning cycle, review days,
+              reorder cycle days]
+
+  planner_service_level:
+    type: decimal
+    role: measure
+    description: >
+      Target service level. Accepted as either a fraction or a percentage — a value
+      above 1 is read as a percentage, because both conventions appear in practice.
+    aliases: [service level, target service level, service level target, csl,
+              fill rate target, sl, service %, service factor]
+
+  planner_min_order_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: MOQ as the planner records it — cross-checked against the item master
+    aliases: [moq, min order qty, minimum order quantity, order minimum,
+              minimum lot size]
+
+  planner_order_multiple:
+    type: decimal
+    unit: base_uom
+    role: measure
+    aliases: [order multiple, pack size, pack qty, case qty, rounding value,
+              multiple, increment]
+
+  planner_stocking_class:
+    type: string
+    role: dimension
+    description: >
+      The planner's own segmentation — stock / non-stock, A/B/C, make-to-order.
+      Preserved rather than recomputed, and compared against the classification the
+      demand history supports.
+    aliases: [stocking class, stock class, stocking policy, policy, abc, abc class,
+              abc code, classification, class, segment, item class, planning class,
+              stock type, sopc, sopc class]
+
+  planner_annual_demand:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: >
+      Annual usage as the planner records it. Cross-checked against the demand history
+      — a large disagreement usually means the two are counting different things
+      (shipments vs orders, or a different date basis) and every derived number
+      inherits that difference.
+    aliases: [annual demand, annual usage, yearly usage, annual qty, aur,
+              annual usage rate, 12 month usage, yearly demand, forecast annual]
+
+  planner_monthly_demand:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Average monthly usage as the planner records it
+    aliases: [monthly demand, avg monthly usage, average monthly usage, amu,
+              monthly usage, avg monthly demand, mean monthly demand,
+              average usage, monthly avg]
+
+  supplier:
+    type: string
+    role: dimension
+    aliases: [supplier, supplier name, vendor, vendor name, source]
+
+  unit_cost:
+    type: decimal
+    unit: currency_per_base_uom
+    role: measure
+    aliases: [unit cost, standard cost, std cost, cost, unit price, price]
+
+  planner_notes:
+    type: string
+    role: dimension
+    description: Free text the planner keeps — never parsed, but shown next to the SKU
+    aliases: [notes, note, comment, comments, remark, remarks, reason, rationale]
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error

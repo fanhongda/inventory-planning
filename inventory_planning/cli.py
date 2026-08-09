@@ -3,7 +3,8 @@ CLI entry point: inventory-plan
 Usage:
   inventory-plan --sales <path> --po-history <path> --open-so <path>
                  --open-po <path> --inventory <path>
-                 [--timeseries <path>] [--output <dir>] [--no-interactive]
+                 [--timeseries <path>] [--item-master <path>]
+                 [--planning-master <path>] [--output <dir>] [--no-interactive]
 """
 
 import argparse
@@ -24,6 +25,8 @@ def main():
     parser.add_argument("--open-po",      required=True,  help="Open purchase orders file (CSV/xlsx)")
     parser.add_argument("--inventory",    required=True,  help="Inventory snapshot file (CSV/xlsx)")
     parser.add_argument("--timeseries",   default=None,   help="Pre-compiled time series file (wide format, optional)")
+    parser.add_argument("--item-master",  default=None,   help="ERP item master (optional): supplier, lead time, MOQ, cost")
+    parser.add_argument("--planning-master", default=None, help="Planner worksheet (optional): safety stock, min/max, LT — compared, not consumed")
     parser.add_argument("--ts-months",    type=int, default=36, help="Rolling months for time series (default 36)")
     parser.add_argument("--output",       default="output", help="Output directory (default: ./output)")
     parser.add_argument("--config",       default=None,   help="Config directory (default: ./config)")
@@ -48,10 +51,27 @@ def main():
     if args.timeseries:
         ts_pivot, ts_meta, _ = planner.load_timeseries(args.timeseries, rolling_months=args.ts_months)
 
-    planner.run_planning(
+    # The two masters go through the contract-driven intake rather than a legacy
+    # reader: there is no fixed schema to write one against, and the contract already
+    # knows every alias an ERP export or a planner's spreadsheet is likely to use.
+    item_master_df = planning_master_df = None
+    if args.item_master or args.planning_master:
+        from .ingest_bridge import IngestBridge
+        paths = [p for p in (args.item_master, args.planning_master) if p]
+        loaded = IngestBridge(config_dir=args.config, verbose=True).load(paths)
+        item_master_df = loaded.get("item_master_df")
+        planning_master_df = loaded.get("planning_master_df")
+
+    results = planner.run_planning(
         sales_df, po_hist_df, open_so_df, open_po_df, inv_df,
         timeseries_pivot=ts_pivot,
         timeseries_meta=ts_meta,
+        item_master_df=item_master_df,
+        planning_master_df=planning_master_df,
+    )
+    planner.run_policy_analysis(
+        results, inventory_df=inv_df, open_po_df=open_po_df,
+        item_master_df=item_master_df, planning_master_df=planning_master_df,
     )
 
 

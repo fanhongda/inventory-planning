@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inventory-planning"
-version = "0.2.0"
+version = "0.3.0"
 description = "Distribution centre inventory planning — demand classification, safety stock, forecasting, purchase recommendations"
 requires-python = ">=3.9"
 dependencies = [
@@ -13,9 +13,6 @@ dependencies = [
     "scipy>=1.10",
     "statsmodels>=0.14",
     "openpyxl>=3.1",
-    "matplotlib>=3.7",
-    "seaborn>=0.12",
-    "jinja2>=3.1",
     "pyyaml>=6.0",
 ]
 

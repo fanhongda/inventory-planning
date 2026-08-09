@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Union, Optional
 
+import numpy as np
 import pandas as pd
 
 from .feedback.snapshot import SnapshotSaver
@@ -15,8 +16,9 @@ from .readers.sales_history_reader import SalesHistoryReader
 from .readers.po_history_reader import POHistoryReader
 from .readers.open_so_reader import OpenSOReader
 from .readers.open_po_reader import OpenPOReader
-from .readers.inventory_reader import InventoryReader
+from .readers.inventory_reader import InventoryReader, consolidate_to_planning_grain
 from .readers.timeseries_reader import TimeSeriesReader
+from .analytics.backlog_realization import BacklogRealizationEstimator, RealizationResult
 from .analytics.demand_classifier import DemandClassifier
 from .analytics.safety_stock import SafetyStockCalculator
 from .analytics.inventory_projector import InventoryProjector
@@ -51,11 +53,19 @@ class InventoryPlanner:
 
         # Analytics
         policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text())
+        self.policy_cfg    = policy_cfg
+        self.backlog_horizon_days = int(policy_cfg.get("backlog_horizon_days", 30))
         self.classifier    = DemandClassifier(self.config_dir)
         self.ss_calc       = SafetyStockCalculator(self.config_dir)
         self.projector     = InventoryProjector(self.config_dir)
         self.forecaster    = Forecaster(horizon=policy_cfg["forecast_horizon_months"])
-        self.recommender   = PurchaseRecommender()
+        self.recommender   = PurchaseRecommender(
+            demand_basis=policy_cfg.get("demand_basis", "forecast_consumption"),
+            horizon_days=self.backlog_horizon_days,
+        )
+        self.realization_estimator = BacklogRealizationEstimator(
+            floor=float(policy_cfg.get("backlog_realization_floor", 0.25))
+        )
 
     # ------------------------------------------------------------------
     # Phase 1: Data Ingestion (run in any order; returns raw clean dfs)
@@ -105,6 +115,8 @@ class InventoryPlanner:
         target_value: float = None,
         deadline=None,
         parameters_file=None,
+        item_master_df=None,
+        planning_master_df=None,
     ) -> dict:
         """
         Answer the planner's actual questions on top of a completed planning run.
@@ -125,22 +137,33 @@ class InventoryPlanner:
         from .policy.levers import LeverAnalyzer
         from .policy.parameters import PlanningParameters
         from .policy.should_be import ShouldBeCalculator
+        from .policy.suggestions import SuggestionBuilder
         from .policy.target import TargetPlanner
 
         print("\n[7/7] Policy analysis — should-be, levers, target...")
 
+        inventory_df = consolidate_to_planning_grain(
+            inventory_df, planning_location=self.inv_reader.location_id, verbose=False
+        )
         params_file = parameters_file or (self.config_dir / "planning_parameters.md")
         planning_params = PlanningParameters(params_file)
 
-        attributes = build_sku_attributes(
+        attributes, crosscheck = build_sku_attributes(
             classified_demand=results["classified_demand"],
             supplier_lt=results.get("supplier_lt"),
             inventory=inventory_df,
             forecast_summary=results.get("forecast_summary"),
             timeseries_meta=results.get("timeseries_meta"),
             params=planning_params,
+            item_master=item_master_df if item_master_df is not None else results.get("item_master"),
+            planning_master=(planning_master_df if planning_master_df is not None
+                             else results.get("planning_master")),
         )
+        if crosscheck.resolutions:
+            print()
+            print(crosscheck.summary())
         resolved = planning_params.resolve(attributes)
+        print()
         print(resolved.summary())
 
         calculator = ShouldBeCalculator(self.config_dir)
@@ -153,11 +176,31 @@ class InventoryPlanner:
         print()
         print(levers.summary())
 
+        # What the data says the parameters should be, next to what they are. Written
+        # out, never applied — a parameter that changed because a script decided it
+        # should is one nobody can defend in a review.
+        suggestions = SuggestionBuilder(self.config_dir).build(resolved)
+        print()
+        print(suggestions.summary())
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        csv_path = suggestions.to_csv(self.output_dir / f"parameter_suggestions_{stamp}.csv")
+        md_path = self.output_dir / f"suggested_rules_{stamp}.md"
+        suggestions.to_rules_markdown(md_path)
+        print(f"\n    Per-SKU suggestions : {csv_path}")
+        print(f"    Paste-able rules    : {md_path}")
+
+        if len(crosscheck.all_disagreements):
+            xc_path = self.output_dir / f"source_crosscheck_{stamp}.csv"
+            crosscheck.frame().to_csv(xc_path, index=False)
+            print(f"    Source disagreements: {xc_path}")
+
         out = {
             "sku_attributes": attributes,
             "parameters": resolved,
             "should_be": should_be,
             "levers": levers,
+            "suggestions": suggestions,
+            "crosscheck": crosscheck,
             "frontier": None,
         }
 
@@ -216,6 +259,10 @@ class InventoryPlanner:
         from .reporting.kpi_report import KPIReport
 
         print("\n[8/8] KPI attribution — service, ordering, forward risk...")
+
+        inventory_df = consolidate_to_planning_grain(
+            inventory_df, planning_location=self.inv_reader.location_id, verbose=False
+        )
 
         # One anchor for the whole review, taken from the data. Mixing a data-derived
         # date in one section with today's date in another makes the two halves
@@ -348,10 +395,28 @@ class InventoryPlanner:
         inventory_df: pd.DataFrame,
         timeseries_pivot: pd.DataFrame = None,   # pre-compiled TS overrides sales_df TS
         timeseries_meta: pd.DataFrame = None,
+        item_master_df: pd.DataFrame = None,     # ERP master: supplier, LT, MOQ, cost
+        planning_master_df: pd.DataFrame = None, # planner's worksheet: SS, min/max, LT
     ) -> dict:
         print("\n" + "="*60)
         print("  INVENTORY PLANNING PIPELINE")
         print("="*60)
+
+        # Step 0: One row per SKU, one "now" for the whole run.
+        #
+        # The inventory export is one row per SKU x storage location. Planning here is
+        # single-node and every join downstream is on `sku` alone, so a SKU held in two
+        # locations would fan out into two planning rows that each match the same open
+        # PO and the same backlog — one saying pull in, the other saying push out.
+        inventory_df = consolidate_to_planning_grain(
+            inventory_df, planning_location=self.inv_reader.location_id
+        )
+        from .policy.service import latest_observed_date
+        as_of, stale = latest_observed_date(sales_df, open_so_df, po_history_df)
+        if as_of and stale > 45:
+            print(f"      Anchored to the newest date in the data ({as_of}), {stale} days "
+                  f"ago — not today. Scoring this extract against today would mark every "
+                  f"open order past due.")
 
         # Step 1: Demand time series + summary
         print("\n[1/6] Building demand time series...")
@@ -367,8 +432,16 @@ class InventoryPlanner:
 
         # Step 2: Supplier lead times
         print("\n[2/6] Computing supplier lead times...")
-        supplier_lt = self.po_reader.compute_supplier_lt(po_history_df)
-        print(f"      {len(supplier_lt)} SKU×supplier LT records")
+        supplier_lt = (
+            self.po_reader.compute_supplier_lt(po_history_df)
+            if po_history_df is not None and len(po_history_df)
+            else pd.DataFrame(columns=["sku", "supplier", "wma_lead_time_days",
+                                       "lt_std_days", "sample_count", "incoterm"])
+        )
+        print(f"      {len(supplier_lt)} SKU×supplier LT records measured from receipts")
+        supplier_lt = self._fill_lead_time_from_masters(
+            supplier_lt, ts.columns, item_master_df, planning_master_df
+        )
 
         # Step 3: Demand classification
         print("\n[3/6] Classifying demand (stocking policy + CV pattern)...")
@@ -400,7 +473,12 @@ class InventoryPlanner:
         if open_po_df is not None:
             open_po_df = self.open_po_reader.fill_estimated_delivery(open_po_df, supplier_lt)
         open_po_summary = self.open_po_reader.inbound_schedule(open_po_df) if open_po_df is not None else None
-        open_so_summary = self.open_so_reader.backlog_summary(open_so_df) if open_so_df is not None else None
+        open_so_summary = (
+            self.open_so_reader.backlog_summary(
+                open_so_df, as_of=as_of, horizon_days=self.backlog_horizon_days
+            )
+            if open_so_df is not None else None
+        )
         eff_inv = self.inv_reader.effective_inventory(inventory_df, open_po_summary, supplier_lt)
         projection = self.projector.project(ss_df, eff_inv, open_po_summary)
 
@@ -408,9 +486,19 @@ class InventoryPlanner:
         shortage_count = (projection["inventory_status"] == "SHORTAGE-RISK").sum()
         print(f"      EXCESS: {excess_count} SKUs | SHORTAGE-RISK: {shortage_count} SKUs")
 
+        # How much of the open order book actually ships. Measured, not assumed — the
+        # recommender needs it to net backlog against the forecast rather than add the
+        # two together and buy the same demand twice.
+        realization = self._estimate_realization(open_so_df, inventory_df, as_of)
+        print()
+        print(realization.summary())
+
         # Purchase recommendations — uses forecast_next_period (t+1), not 6-month avg
         forecast_summary = forecast_summary_df
-        recommendations = self.recommender.recommend(projection, forecast_summary, open_so_summary, open_po_summary)
+        recommendations = self.recommender.recommend(
+            projection, forecast_summary, open_so_summary, open_po_summary,
+            realization=realization,
+        )
 
         results = {
             "time_series": ts,
@@ -423,6 +511,11 @@ class InventoryPlanner:
             "forecast_detail": forecast_detail,
             "forecast_summary": forecast_summary,
             "recommendations": recommendations,
+            "backlog_realization": realization,
+            "inventory_consolidated": inventory_df,
+            "item_master": item_master_df,
+            "planning_master": planning_master_df,
+            "as_of": as_of,
             "_quality_reports": self._quality_log,
         }
 
@@ -430,10 +523,92 @@ class InventoryPlanner:
         self._print_summary(recommendations)
         return results
 
-    def _save_outputs(self, results: dict) -> None:
-        from .reporting.charts import ChartBuilder
-        from .reporting.html_report import HTMLReportGenerator
+    @staticmethod
+    def _fill_lead_time_from_masters(supplier_lt, skus, item_master_df, planning_master_df):
+        """
+        Give SKUs with no receipt history a lead time from master data.
 
+        Without this a SKU that has simply never been bought through this ERP export
+        gets a lead time of zero, and therefore a safety stock of zero — the pipeline
+        confidently recommends holding nothing for an item with a three-month lead
+        time. A stated value from the item master or the planner's worksheet is not a
+        measurement, and it is labelled as such, but it is enormously better than that.
+
+        The variability term is the honest casualty: a stated lead time carries no
+        sigma, so safety stock for these SKUs covers demand variability only and is
+        understated. The count is printed rather than buried.
+        """
+        sources = [
+            (item_master_df, "lead_time_days", "item_master"),
+            (planning_master_df, "planner_lead_time_days", "planning_master"),
+        ]
+        have = set(supplier_lt["sku"]) if len(supplier_lt) else set()
+        rows = []
+        for master, column, label in sources:
+            if master is None or len(master) == 0 or column not in master.columns:
+                continue
+            stated = (
+                master[["sku", column]]
+                .assign(**{column: pd.to_numeric(master[column], errors="coerce")})
+                .dropna(subset=["sku", column])
+                .drop_duplicates("sku")
+            )
+            for _, row in stated.iterrows():
+                sku = row["sku"]
+                if sku in have or sku not in set(skus) or float(row[column]) <= 0:
+                    continue
+                have.add(sku)
+                rows.append({
+                    "sku": sku,
+                    "supplier": (master.set_index("sku")["supplier"].get(sku)
+                                 if "supplier" in master.columns else None),
+                    "wma_lead_time_days": round(float(row[column]), 1),
+                    "lt_std_days": 0.0,
+                    "sample_count": 0,
+                    "lt_source": label,
+                })
+
+        if not rows:
+            if len(supplier_lt) and "lt_source" not in supplier_lt.columns:
+                supplier_lt = supplier_lt.assign(lt_source="measured")
+            return supplier_lt
+
+        if len(supplier_lt) and "lt_source" not in supplier_lt.columns:
+            supplier_lt = supplier_lt.assign(lt_source="measured")
+        filled = pd.DataFrame(rows)
+        by_source = filled["lt_source"].value_counts().to_dict()
+        print(f"      {len(filled)} SKUs had no receipt history — lead time taken from "
+              f"master data {by_source}")
+        print(f"      Those carry no lead-time variability, so their safety stock covers "
+              f"demand variability only and is understated.")
+        return pd.concat([supplier_lt, filled], ignore_index=True)
+
+    def _estimate_realization(self, open_so_df, inventory_df, as_of):
+        """
+        Backlog realization, honouring the configured override.
+
+        `backlog_realization` may be `measured` or a fixed rate. A fixed rate is a
+        legitimate choice — a planner who knows the collection problem is being fixed
+        should be able to say so — but it is a stated assumption, not a measurement,
+        and the report labels it as one.
+        """
+        setting = self.policy_cfg.get("backlog_realization", "measured")
+        if setting == "measured":
+            return self.realization_estimator.estimate(
+                open_so=open_so_df, inventory=inventory_df, as_of=as_of
+            )
+
+        rate = float(np.clip(float(setting), 0.0, 1.0))
+        return RealizationResult(
+            per_sku=pd.DataFrame(columns=["sku", "open_qty", "uncollected_qty",
+                                          "raw_rate", "realization_rate", "open_lines"]),
+            global_rate=rate,
+            measured=False,
+            reason=f"fixed at {rate:.0%} by config (backlog_realization), not measured",
+            as_of=as_of,
+        )
+
+    def _save_outputs(self, results: dict) -> None:
         ts_str = datetime.now().strftime("%Y%m%d_%H%M")
         out = self.output_dir
 
@@ -444,25 +619,9 @@ class InventoryPlanner:
         results["forecast_detail"].to_csv(out / f"forecast_detail_{ts_str}.csv", index=False)
         results["recommendations"].to_csv(out / f"purchase_recommendations_{ts_str}.csv", index=False)
 
-        # ── HTML Report with charts ───────────────────────────────────────────
-        print("\n  Building charts & HTML report...")
-        import json as _json
-        node_cfg = self.config_dir / "node_config.json"
-        location_id = _json.loads(node_cfg.read_text()).get("location_id", "DC-01") if node_cfg.exists() else "DC-01"
-        try:
-            cb = ChartBuilder()
-            charts = cb.build_all(results)
-            report_path = out / f"inventory_report_{ts_str}.html"
-            HTMLReportGenerator().generate(
-                results=results,
-                charts=charts,
-                quality_reports=results.get("_quality_reports", []),
-                output_path=report_path,
-                location_id=location_id,
-            )
-            print(f"  Open report: open {report_path}")
-        except Exception as e:
-            print(f"  Warning: HTML report failed ({e}) — CSV outputs still saved")
+        realization = results.get("backlog_realization")
+        if realization is not None and len(realization.per_sku):
+            realization.per_sku.to_csv(out / f"backlog_realization_{ts_str}.csv", index=False)
 
         # Save planning snapshot for next-month feedback comparison
         try:
@@ -486,6 +645,14 @@ class InventoryPlanner:
         if len(purchase_skus):
             total_qty = purchase_skus["suggested_po_qty"].sum()
             print(f"\n  Total suggested purchase qty : {total_qty:,.0f}")
+
+        if "demand_driver" in recommendations.columns:
+            basis = recommendations["demand_basis"].iloc[0] if len(recommendations) else "n/a"
+            drivers = recommendations["demand_driver"].value_counts().to_dict()
+            print(f"\n  Demand basis  : {basis}  {drivers}")
+            if basis == "forecast_consumption":
+                print("                  Forecast and backlog are two estimates of one "
+                      "demand, so the requirement is the larger — not the sum.")
 
         pushout_skus = recommendations[recommendations["recommended_action"] == "PUSH-OUT-OPEN-PO"]
         if len(pushout_skus):

@@ -107,7 +107,13 @@ class BaseReader(ABC):
         df = self._clean(df)
         quality = self._quality_report(df, path)
         df = self._post_process(df)
-        df["location_id"] = self.location_id
+        # Only stamp the configured node where the source did not carry a location of
+        # its own. Overwriting a real warehouse code destroys the one column that
+        # explains why a SKU appears more than once.
+        if "location_id" in df.columns:
+            df["location_id"] = df["location_id"].fillna(self.location_id)
+        else:
+            df["location_id"] = self.location_id
         return df, quality
 
     def _confirm_mapping(self, mapping: Dict[str, str], unmapped: List[str], df_cols: List[str]) -> Dict[str, str]:

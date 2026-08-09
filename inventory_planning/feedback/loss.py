@@ -86,6 +86,18 @@ class LossCalculator:
             "cumulative": cumulative,
         }
 
+        # Lead-time drift needs no actuals — it compares what successive runs planned
+        # on — but it belongs in this report because it explains a class of gap the
+        # loss numbers can only show as unexplained error.
+        drift = self.lead_time_drift()
+        agg["lead_time_drift"] = {
+            "months": drift.months,
+            "skus_tracked": drift.skus_tracked,
+            "moves": drift.frame().to_dict(orient="records"),
+            "source_changes": len(drift.source_changes),
+            "reason": drift.reason,
+        }
+
         # ── Attribution & suggestions ─────────────────────────────────────────
         attribution = self._attribute(detail_df, cumulative)
         agg["attribution"] = attribution
@@ -98,6 +110,29 @@ class LossCalculator:
 
         self._print_report(agg)
         return {"aggregate": agg, "detail": detail_df}
+
+    def lead_time_drift(self, relative_threshold: float = None,
+                        absolute_threshold: float = None):
+        """
+        How the lead times this pipeline plans on have moved across snapshots.
+
+        Callable on its own — it reads plan-time parameters, so unlike `compute` it
+        does not need actuals recorded, and it is worth a look the moment a second
+        month exists.
+        """
+        from .drift import (
+            DEFAULT_ABSOLUTE_THRESHOLD,
+            DEFAULT_RELATIVE_THRESHOLD,
+            LeadTimeDriftTracker,
+        )
+
+        tracker = LeadTimeDriftTracker(
+            relative_threshold=(relative_threshold if relative_threshold is not None
+                                else DEFAULT_RELATIVE_THRESHOLD),
+            absolute_threshold=(absolute_threshold if absolute_threshold is not None
+                                else DEFAULT_ABSOLUTE_THRESHOLD),
+        )
+        return tracker.track(self.history_dir)
 
     # ── Monthly loss computation ──────────────────────────────────────────────
 
@@ -378,6 +413,23 @@ class LossCalculator:
         overlap = agg["attribution"]["overlap_count"]
         if overlap:
             print(f"  ❗ Both patterns:        {overlap} SKUs — highest priority")
+
+        drift = agg.get("lead_time_drift") or {}
+        moves = drift.get("moves") or []
+        if moves:
+            longer = [m for m in moves if m["change_days"] > 0]
+            print(f"\n  Lead-time drift ({len(drift['months'])} snapshots): "
+                  f"{len(moves)} SKUs moved materially, {len(longer)} lengthening")
+            for move in sorted(moves, key=lambda m: -abs(m["change_days"]))[:5]:
+                supplier = f"  [{move['supplier']}]" if move.get("supplier") else ""
+                print(f"     {move['sku']:<18}{move['first_lt_days']:>5.0f}d -> "
+                      f"{move['latest_lt_days']:>5.0f}d  "
+                      f"{move['change_days']:+.0f}d / {move['change_pct']:+.0%}{supplier}")
+            print("     A supplier that moved is a supplier conversation — the plan "
+                  "absorbed it silently.")
+        elif drift.get("source_changes"):
+            print(f"\n  Lead-time drift: none, but {drift['source_changes']} SKUs changed "
+                  f"lead-time source (what the pipeline knew, not what the supplier did)")
 
         print("\n  Suggestions:")
         for s in agg["suggestions"]:

@@ -7,10 +7,25 @@ Snapshot is stored as:
 
 The JSON contains:
   - run metadata (date, model versions, config params)
-  - per-SKU: forecast_next_period, suggested_po_qty, safety_stock, days_of_supply, demand_pattern
+  - per-SKU: forecast_next_period, suggested_po_qty, safety_stock, days_of_supply,
+    demand_pattern, and the lead time the run planned on
   - path to the full CSV outputs for that run
 
 Next month, the user fills in actuals by calling FeedbackCollector.record_actuals().
+
+## Why lead time is in here
+
+Everything else recorded per SKU is an *output* to be scored against what happened.
+Lead time is different: it is an input, and it is the input most likely to have moved
+without anyone noticing. A supplier drifting from 45 to 62 days changes the reorder
+point, the safety stock and the exposure period all at once, and each monthly run
+simply recomputes it and carries on — the drift is invisible unless successive runs
+are compared.
+
+So the lead time actually used is recorded here alongside its sigma, its sample count
+and its source. `feedback.drift` reads them back. The number stored is the one the
+safety stock calculation consumed, not a re-derivation from PO history: a value the
+snapshot computes for itself can disagree with the plan it claims to describe.
 """
 
 import json
@@ -72,6 +87,11 @@ class SnapshotSaver:
                     "stocking_class": row.get("stocking_class"),
                 })
 
+        # Enrich with the lead time the run planned on
+        for sku, params in self._lead_time_by_sku(results).items():
+            if sku in skus:
+                skus[sku].update(params)
+
         snapshot = {
             "run_at": run_dt.isoformat(),
             "planning_month": month_label,
@@ -93,3 +113,62 @@ class SnapshotSaver:
         path = history_dir / f"snapshot_{ts_str}.json"
         path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
         return path
+
+    @staticmethod
+    def _lead_time_by_sku(results: dict) -> dict:
+        """
+        The lead time each SKU was planned on, with the evidence behind it.
+
+        Taken from the safety-stock frame rather than recomputed from PO history,
+        because that frame holds the value the calculation actually consumed —
+        including a lead time that came from an item master because no receipts
+        existed. Recomputing here would let the record disagree with the plan.
+
+        `sample_count`, `supplier` and `lt_source` are not on that frame, so they come
+        from the supplier lead-time table using the same choice the planning layer
+        makes: the supplier with the most history, not the fastest one.
+        """
+        ss = results.get("safety_stock")
+        if ss is None or len(ss) == 0 or "wma_lead_time_days" not in ss.columns:
+            return {}
+
+        evidence = {}
+        supplier_lt = results.get("supplier_lt")
+        if supplier_lt is not None and len(supplier_lt) and "sku" in supplier_lt.columns:
+            sort_col = next((c for c in ("order_count", "sample_count")
+                             if c in supplier_lt.columns), None)
+            chosen = (
+                supplier_lt.sort_values(sort_col, ascending=False)
+                if sort_col else supplier_lt
+            ).groupby("sku", as_index=False).first()
+            for _, row in chosen.iterrows():
+                evidence[row["sku"]] = {
+                    "supplier": row.get("supplier"),
+                    "lt_samples": _int_or_none(row.get("sample_count")),
+                    # `lt_source` is absent on runs with no master data; those lead
+                    # times are measured by construction.
+                    "lt_source": row.get("lt_source") or "measured",
+                }
+
+        out = {}
+        for _, row in ss.iterrows():
+            sku = row["sku"]
+            lead_time = _float_or_none(row.get("wma_lead_time_days"))
+            if lead_time is None:
+                continue
+            entry = {
+                "lead_time_days": lead_time,
+                "lt_sigma_days": _float_or_none(row.get("lt_std_days")),
+            }
+            entry.update(evidence.get(sku, {"supplier": None, "lt_samples": None,
+                                            "lt_source": "measured"}))
+            out[sku] = entry
+        return out
+
+
+def _float_or_none(value):
+    return float(value) if pd.notna(value) else None
+
+
+def _int_or_none(value):
+    return int(value) if pd.notna(value) else None

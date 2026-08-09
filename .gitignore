@@ -12,13 +12,16 @@ build/
 .venv/
 venv/
 
-# Outputs (timestamped runs — don't commit)
+# Outputs (every run is reproducible from its inputs — don't commit)
+#
+# These used to carry `!output/supplier_params.csv` negations, intending to version
+# the derived planning parameters. They never worked: git cannot re-include a file
+# once a parent directory is excluded, so the two files were never tracked. The need
+# they were reaching for — seeing when a SKU's lead time or stocking class moved — is
+# served properly by the monthly snapshots in output/history/, which `feedback.drift`
+# reads back.
 output/
 eval-workspace/
-
-# Keep these committed output files (persisted planning params)
-!output/supplier_params.csv
-!output/sku_planning_params.csv
 
 # OS
 .DS_Store

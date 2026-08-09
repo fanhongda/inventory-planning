@@ -462,6 +462,10 @@ output/<timestamp>/
 ├── inventory_projection_<ts>.csv
 ├── backlog_realization_<ts>.csv     ← per-SKU realization rate and the evidence
 ├── forecast_detail_<ts>.csv
-├── sku_planning_params.csv          ← persisted: stocking class, SS, ROP per SKU
-└── supplier_params.csv              ← persisted: WMA LT per SKU×supplier
+├── sku_planning_params.csv          stocking class, SS, ROP per SKU
+├── supplier_params.csv              WMA LT per SKU×supplier
+└── history/YYYY-MM/snapshot_<ts>.json
+                                     ← the durable record: plan + the lead time it
+                                       planned on. Read back by the feedback loop and
+                                       by feedback.drift for lead-time movement.
 ```

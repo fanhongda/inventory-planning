@@ -35,8 +35,13 @@ All logic is in `inventory_planning/` — do not rewrite it; orchestrate it.
 3. **Inventory projection** — should-be vs current position (on-hand + GIT + open PO)
 4. **6-month ARIMA/ETS forecast** per SKU
 5. **Purchase recommendations** — PURCHASE-REQUEST / ORDER-FOR-BACKLOG / PUSH-OUT-OPEN-PO / HOLD / NO-ACTION
-6. **HTML dashboard** with 9 embedded charts + sortable data tables
-7. **CSV outputs** — supplier_params, sku_planning_params, projection, forecast, recommendations
+6. **Backlog realization rate** — measured share of the open order book that actually ships
+   and, where an item master or planner worksheet is supplied, a source cross-check and a
+   per-SKU comparison against the parameters the planner set by hand
+7. **Parameter suggestions** — what the data says the policy parameters should be, as a
+   per-SKU CSV and as rule blocks that paste straight into `planning_parameters.md`
+8. **KPI review** — two-chapter HTML: what happened and who caused it, what is coming
+9. **CSV outputs** — supplier_params, sku_planning_params, projection, forecast, recommendations
 
 ---
 
@@ -50,16 +55,58 @@ every file automatically — do not ask the user to say which file is which.
 |---|---|---|---|
 | `demand_signal` | **yes** | pre-compiled demand time series **or** sales history | cannot run |
 | `position_signal` | **yes** | inventory snapshot | cannot run |
-| `lead_time_signal` | no | PO history | safety stock loses its lead-time variability term |
+| `lead_time_signal` | no | PO history **or** item master **or** planner worksheet | safety stock loses its lead-time variability term |
 | `inbound_signal` | no | open POs | position excludes goods in transit; no push-out advice |
-| `commitment_signal` | no | open sales orders | net requirement excludes backlog |
-| `cost_signal` | no | inventory **or** PO history | DIOH cannot be expressed in currency |
+| `commitment_signal` | no | open sales orders | net requirement runs on the forecast alone; the backlog realization rate cannot be measured |
+| `cost_signal` | no | inventory **or** PO history **or** item master | DIOH cannot be expressed in currency |
 | `order_pattern_signal` | no | PO history **or** open POs | EOQ conformance not assessed |
 | `service_signal` | no | open sales orders | on-time delivery modelled, not measured |
+| `item_dimension` | no | item master **or** planner worksheet | suggested quantities not rounded to a real MOQ; obsolete items still replenished |
+| `planner_baseline` | no | planner worksheet | cannot say whether the safety stock in use is above or below what the data justifies |
 
 **A pre-compiled SKU time series fully satisfies `demand_signal` on its own.** When a
 planner has already bucketed demand themselves, sales history is not needed — and the
 wide period layout is detected from the header, so nothing special has to be called.
+
+### The two master documents, and why they are treated differently
+
+Planners routinely keep an **ERP item master** (supplier, planned lead time, MOQ,
+order multiple, standard cost, lifecycle status) and their **own planning worksheet**
+(the safety stock, min/max, review period and lead time actually in use, usually
+alongside a few columns of usage history). Both are optional; both change what the run
+can say. Hand them over with everything else — ingest identifies them.
+
+They are not interchangeable, and the pipeline ranks them:
+
+```
+measured         derived from this run's transactions   — what happened
+item_master      a standing parameter in the ERP        — an intention
+planning_master  a value a person maintains by hand     — a decision
+config           a pipeline-wide default                — a guess
+```
+
+Higher authority wins, with one exception: a lead time "measured" from fewer than
+three receipts is not a distribution, so it yields to a stated value.
+
+What this buys, in the order a planner cares about:
+
+1. **Gaps get filled.** A SKU that has never been bought through this export gets a
+   real lead time instead of a zero — and therefore a real safety stock. Those rows
+   still carry no lead-time *variability*, so their safety stock is understated; the
+   run says so and gives the count.
+2. **Sources get cross-checked.** Where two sources disagree by more than 25%, both
+   values are reported with the gap. A master lead time that no longer resembles what
+   suppliers deliver is a finding in its own right — every MRP run in the ERP is
+   planning on it. Written to `source_crosscheck_<ts>.csv`.
+3. **The planner's parameters get compared.** The safety stock, review period and
+   service level in the worksheet are measured against what the data justifies, per
+   SKU, with the capital or exposure attached. This is the main reason to load it.
+
+**The planner's numbers are never consumed as inputs.** Safety stock is fully
+determined by demand variability, lead time and a service level, so a hand-set value
+is a position to be compared, never an input — a pipeline that consumed it would agree
+with whatever it was shown. Say this if the user asks why their safety stock did not
+"take".
 
 Accepts CSV or Excel (.xlsx / .xls / .xlsm).
 
@@ -293,7 +340,7 @@ Never assume silence is agreement — unrecorded actions stay unrecorded.
 
 After the pipeline completes, tell the user:
 
-1. **Open the HTML report**: `open <output_dir>/inventory_report_<timestamp>.html`
+1. **Open the KPI review**: `open <output_dir>/kpi_review_<timestamp>.html`
 2. **Summary headline**: show the PURCHASE RECOMMENDATIONS SUMMARY block
 3. **Top 5 actions** — most urgent purchase requests and biggest push-out candidates
 4. **Data quality warnings** — flag anything the user should investigate (e.g. missing incoterms, short history, SKUs with no LT data)
@@ -303,6 +350,9 @@ Use this summary template:
 ✅ Planning complete — <N> SKUs analysed
 
 📊 Report: <path_to_html>
+
+📐 Parameter suggestions: <path_to_suggested_rules_md>
+   (nothing is applied — these are proposals for the planner to review)
 
 🛒 Action summary:
   • Purchase requests  : <N> SKUs  (<total_qty> units)
@@ -404,9 +454,13 @@ All outputs carry `location_id`. When expanding to multi-echelon:
 
 ```
 output/<timestamp>/
-├── inventory_report_<ts>.html       ← self-contained HTML dashboard (open this)
+├── kpi_review_<ts>.html             ← self-contained review (open this)
+├── parameter_suggestions_<ts>.csv   ← suggested parameters vs those in force, per SKU
+├── suggested_rules_<ts>.md          ← the same as paste-able planning_parameters.md rules
+├── source_crosscheck_<ts>.csv       ← where two sources disagree, and by how much
 ├── purchase_recommendations_<ts>.csv
 ├── inventory_projection_<ts>.csv
+├── backlog_realization_<ts>.csv     ← per-SKU realization rate and the evidence
 ├── forecast_detail_<ts>.csv
 ├── sku_planning_params.csv          ← persisted: stocking class, SS, ROP per SKU
 └── supplier_params.csv              ← persisted: WMA LT per SKU×supplier

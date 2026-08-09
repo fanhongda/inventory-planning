@@ -1,12 +1,108 @@
 """
 Inventory snapshot reader.
 Handles incoterm-aware GIT counting: EXW/FOB/CIF → GIT is buyer's; DDP/DAP → don't count.
+
+Grain is the other thing this module owns. A warehouse export is one row per
+SKU × storage location — normal stock in 01, quarantine in 02 — and that is the
+honest grain to read at. But everything downstream of here plans a single node and
+joins on `sku` alone, so a SKU present in two locations fans out into two planning
+rows, each of which then matches the *same* open PO and the *same* backlog. The
+result is one SKU appearing twice with contradictory advice: pull in on one row,
+push out on the other. `consolidate_to_planning_grain` collapses the snapshot to one
+row per SKU before it reaches the analytics, and the projector refuses to run on a
+frame that has not been through it.
 """
 
 import json
 from pathlib import Path
 import pandas as pd
 from .base_reader import BaseReader
+
+# Quantities that are additive across storage locations. Anything not listed here is
+# a dimension and takes the first non-null value — notably `unit_cost`, which is a
+# master-data attribute of the SKU rather than of the bin it happens to sit in.
+_ADDITIVE_MEASURES = (
+    "qty_on_hand", "qty_in_transit", "qty_allocated", "qty_available",
+    "qty_on_order", "open_po_qty_inv", "inventory_value",
+)
+
+
+def consolidate_to_planning_grain(
+    inv_df: pd.DataFrame,
+    planning_location: str = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Collapse a SKU × storage-location snapshot to one row per SKU.
+
+    Quantities are summed across locations; every other column takes its first
+    non-null value. The location codes that were merged are kept in
+    `stock_locations` so the detail is visible rather than discarded — and so the
+    later multi-node work has something to build on.
+
+    Note what this does *not* do: it makes no distinction between sellable stock and
+    quality-quarantine stock. Everything in the snapshot counts toward the position.
+    Where an inspection or blocked location holds material amounts, the position is
+    overstated by exactly that much. Separating them needs a supply-chain topology
+    the pipeline does not have yet (see TODO.md).
+    """
+    if inv_df is None or len(inv_df) == 0 or "sku" not in inv_df.columns:
+        return inv_df
+
+    df = inv_df.copy()
+    has_location = "location_id" in df.columns
+
+    # Source codes per row. On a frame that has already been through here, location_id
+    # is the planning node and `stock_locations` is the only remaining record of where
+    # the stock actually was, so it wins where it says anything — consolidating twice
+    # must not quietly rewrite the provenance to "DC-01". Where it is blank, the row
+    # has not been consolidated before and location_id is the real code.
+    fallback = (df["location_id"].fillna("").astype(str) if has_location
+                else pd.Series("", index=df.index))
+    if "stock_locations" in df.columns:
+        prior = df["stock_locations"].fillna("").astype(str)
+        codes = prior.where(prior.str.strip() != "", fallback)
+    else:
+        codes = fallback
+    df = df.drop(columns=["stock_locations"], errors="ignore")
+
+    def _union(values) -> str:
+        seen = {c.strip() for v in values for c in str(v).split(",") if c.strip()}
+        return ",".join(sorted(seen))
+
+    if not df["sku"].duplicated().any():
+        # Already one row per SKU. Still stamp the provenance column so downstream
+        # consumers can rely on it existing.
+        df["stock_locations"] = codes.values
+        return df
+
+    locations = (
+        df.assign(_codes=codes.values)
+        .groupby("sku")["_codes"]
+        .agg(_union)
+        .rename("stock_locations")
+    )
+
+    agg = {}
+    for col in df.columns:
+        if col == "sku":
+            continue
+        agg[col] = "sum" if col in _ADDITIVE_MEASURES else "first"
+
+    before = len(df)
+    out = df.groupby("sku", as_index=False, dropna=False).agg(agg)
+    out = out.merge(locations, on="sku", how="left")
+    if has_location and planning_location:
+        out["location_id"] = planning_location
+
+    if verbose:
+        multi = int((out["stock_locations"].str.count(",") > 0).sum())
+        print(f"  Consolidated inventory to one row per SKU: {before:,} -> {len(out):,} rows"
+              + (f" ({multi} SKUs held in more than one location)" if multi else ""))
+        if multi:
+            print("     Quarantine / inspection locations are summed into the available "
+                  "position — see TODO.md, supply-chain topology.")
+    return out
 
 
 class InventoryReader(BaseReader):
@@ -26,17 +122,11 @@ class InventoryReader(BaseReader):
             if n_zero_filled:
                 print(f"  Note: {n_zero_filled} SKUs with blank/zero on-hand treated as 0")
 
-        # Aggregate duplicate SKUs (same SKU across multiple bins/locations sums up)
-        agg_cols = {"qty_on_hand": "sum"}
-        if "qty_in_transit" in df.columns:
-            agg_cols["qty_in_transit"] = "sum"
-        if "open_po_qty_inv" in df.columns:
-            agg_cols["open_po_qty_inv"] = "sum"
-        grp_cols = ["sku"]
-        if "location_id" in df.columns:
-            grp_cols.append("location_id")
-        df = df.groupby(grp_cols, as_index=False).agg(agg_cols)
-        return df
+        # Aggregate duplicate SKUs across bins/locations. Grouping by sku+location_id
+        # here used to leave one row per warehouse, and `BaseReader.read` then stamped
+        # the configured node over `location_id` — producing rows with an identical key
+        # that every downstream join duplicated.
+        return consolidate_to_planning_grain(df, planning_location=self.location_id)
 
     def effective_inventory(self, inv_df: pd.DataFrame, open_po_df: pd.DataFrame,
                             supplier_params: pd.DataFrame = None) -> pd.DataFrame:
@@ -53,8 +143,14 @@ class InventoryReader(BaseReader):
 
         Returns per-SKU: qty_on_hand, qty_in_transit (adjusted), total_open_po_qty,
                          effective_position
+
+        The snapshot is consolidated to one row per SKU first. Without it a SKU held in
+        two locations gets the full open PO quantity merged onto each of its rows and
+        the position is counted twice.
         """
-        df = inv_df.copy()
+        df = consolidate_to_planning_grain(
+            inv_df, planning_location=self.location_id, verbose=False
+        ).copy()
 
         # Determine incoterm per SKU from supplier_params if available
         if supplier_params is not None and "incoterm" in supplier_params.columns:
@@ -96,6 +192,6 @@ class InventoryReader(BaseReader):
 
         df["effective_position"] = df["qty_on_hand"] + df["qty_in_transit_adj"] + df["total_open_po_qty"]
 
-        cols = ["sku", "location_id", "qty_on_hand", "qty_in_transit",
+        cols = ["sku", "location_id", "stock_locations", "qty_on_hand", "qty_in_transit",
                 "qty_in_transit_adj", "incoterm", "total_open_po_qty", "effective_position"]
         return df[[c for c in cols if c in df.columns]]

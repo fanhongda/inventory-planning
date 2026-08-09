@@ -66,7 +66,11 @@ CAPABILITIES: Dict[str, Capability] = {
         name="lead_time_signal",
         description="Realised replenishment lead time and its variability",
         required=False,
-        suppliers=["po_history"],
+        # Ordered by authority, not convenience. A lead time computed from receipts is
+        # evidence; one typed into a master is an intention. The master values are here
+        # because for a SKU with no receipt history they are the only thing standing
+        # between the plan and a config-wide guess.
+        suppliers=["po_history", "item_master", "planning_master"],
         fallback="config default lead time, zero lead-time variance",
         degrades=[
             "Safety stock loses its lead-time variability term and will be understated",
@@ -102,7 +106,7 @@ CAPABILITIES: Dict[str, Capability] = {
         name="cost_signal",
         description="Unit cost per SKU — converts quantities into money",
         required=False,
-        suppliers=["inventory", "po_history"],
+        suppliers=["inventory", "po_history", "item_master", "planning_master"],
         fallback="config default unit cost",
         degrades=[
             "Days-on-hand cannot be expressed in currency",
@@ -128,6 +132,42 @@ CAPABILITIES: Dict[str, Capability] = {
         fallback="on-time delivery estimated from projected stock position only",
         degrades=[
             "On-time delivery is modelled, not measured — the KPI cannot be calibrated to actuals",
+        ],
+    ),
+    "planner_baseline": Capability(
+        name="planner_baseline",
+        description=(
+            "The parameters a planner has actually set — safety stock, min/max, review "
+            "period — as the benchmark the computed ones are compared against"
+        ),
+        required=False,
+        suppliers=["planning_master"],
+        fallback="computed parameters are reported without a baseline to compare to",
+        degrades=[
+            "Cannot say whether the safety stock in use is above or below what the "
+            "measured lead time and forecast error justify",
+            "Cannot cross-check the planner's demand and lead-time figures against the "
+            "transaction history, so a disagreement in what the two are counting stays hidden",
+            "Parameter suggestions are absolute rather than expressed as a change from "
+            "what is in force",
+        ],
+    ),
+    "item_dimension": Capability(
+        name="item_dimension",
+        description=(
+            "Master attributes per SKU — nominated supplier, MOQ, order multiple, "
+            "product family, lifecycle status"
+        ),
+        required=False,
+        suppliers=["item_master", "planning_master"],
+        fallback="MOQ and order multiple come from config defaults; family is inferred "
+                 "from the SKU prefix",
+        degrades=[
+            "Suggested order quantities are not rounded to a real MOQ or pack size",
+            "Obsolete and phase-out items cannot be excluded, so dead stock is "
+            "replenished against its own history",
+            "Family-scoped parameter rules rest on the SKU numbering scheme rather than "
+            "on master data",
         ],
     ),
     "customer_dimension": Capability(

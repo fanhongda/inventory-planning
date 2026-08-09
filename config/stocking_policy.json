@@ -30,5 +30,13 @@
   "cv_intermittent_threshold": 0.5,
   "cv_erratic_threshold": 1.0,
   "excess_dos_threshold_days": 90,
-  "service_level_metric": "CSL"
+  "service_level_metric": "CSL",
+
+  "_demand_basis_note": "How next period's requirement combines the forecast with the open order book. forecast_consumption = max(forecast, backlog_due x realization) — the forecast is fitted on shipments, which came from backlog, so adding the two counts the same demand twice. max_forecast_backlog = same without the realization discount. forecast_plus_backlog = the old additive behaviour.",
+  "demand_basis": "forecast_consumption",
+
+  "_backlog_note": "backlog_horizon_days scopes the order book to the lines due inside the planning cycle. backlog_realization = measured (derive the discount from uncollected past-due lines), or a fixed number between 0 and 1. backlog_realization_floor stops a collection problem from zeroing out purchasing entirely.",
+  "backlog_horizon_days": 30,
+  "backlog_realization": "measured",
+  "backlog_realization_floor": 0.25
 }

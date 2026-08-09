@@ -37,6 +37,19 @@ class InventoryProjector:
         surplus   = effective_position - should_be
         EXCESS    = DOS > excess_dos_threshold_days
         """
+        # A left merge against a frame with repeated SKUs silently multiplies rows, and
+        # the duplicates then carry the same open PO and the same backlog — which is how
+        # one SKU ends up recommended for pull-in and push-out at the same time. The
+        # consolidation belongs upstream; failing loudly here keeps it from being skipped.
+        dupes = effective_inventory["sku"][effective_inventory["sku"].duplicated()].unique()
+        if len(dupes):
+            raise ValueError(
+                f"effective_inventory has {len(dupes)} SKU(s) on more than one row "
+                f"(e.g. {', '.join(map(str, dupes[:3]))}). Planning is single-node: run "
+                f"readers.inventory_reader.consolidate_to_planning_grain first, or every "
+                f"quantity joined on sku will be counted once per location."
+            )
+
         df = safety_stock_df.merge(
             effective_inventory[["sku", "qty_on_hand", "qty_in_transit_adj",
                                   "total_open_po_qty", "effective_position"]],

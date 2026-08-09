@@ -1,0 +1,137 @@
+doc_type: item_master
+description: >
+  Item master data from the ERP — one row per SKU, carrying the standing attributes
+  and planning parameters the system of record holds: nominated supplier, planned
+  lead time, MOQ, order multiple, standard cost, incoterm, item status.
+
+  Its role here is to fill gaps, not to override measurement. A lead time computed
+  from actual PO receipts is evidence; a lead time in the item master is an intention
+  someone typed in, possibly years ago. Where both exist the measured value wins and
+  the two are cross-checked, because a master lead time that no longer resembles what
+  suppliers deliver is itself a finding — every MRP run in the ERP is using it.
+
+  Where a SKU has no receipt history at all, the master value is the only lead time
+  available and is far better than a config-wide default. That is the case this
+  contract exists for.
+grain: sku
+natural_key: [sku]
+capabilities: [lead_time_signal, cost_signal, item_dimension]
+
+# Item master looks like an inventory snapshot on headers alone — both are one row
+# per SKU with descriptive columns. The difference is that a master carries planning
+# parameters and no stock position. Requiring a planning parameter to be present, and
+# on most rows, keeps a stock report with a stray `MOQ` column from landing here.
+discriminator: "not_null(lead_time_days) or not_null(min_order_qty) or not_null(order_multiple)"
+
+fields:
+
+  sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: upper_strip
+    aliases: [sku, item, item code, item no, item number, material, material number,
+              product code, part no, part number, article, stock code, item id]
+
+  description:
+    type: string
+    role: dimension
+    description: Item description, carried into every report for readability
+    aliases: [description, item description, material description, product name,
+              item name, name, desc, long description, short text]
+
+  supplier:
+    type: string
+    role: dimension
+    description: >
+      Nominated / primary supplier. Where PO history exists the supplier actually used
+      wins, since a nomination that nobody buys from does not set the lead time.
+    aliases: [supplier, supplier name, supplier id, supplier code, vendor, vendor name,
+              vendor code, vendor no, primary supplier, preferred supplier, source,
+              manufacturer, default vendor]
+
+  lead_time_days:
+    type: decimal
+    unit: days
+    role: measure
+    description: >
+      Planned replenishment lead time as maintained in the ERP. Used when no receipt
+      history supports a measured value, and cross-checked against the measured value
+      when both exist.
+    aliases: [lead time, lead time days, lt, lt days, planned delivery time,
+              planned deliv. time, plnd delry time, delivery lead time,
+              replenishment lead time, purchasing lead time, standard lead time,
+              gr processing time]
+    assertions:
+      - expr: "lead_time_days > 0"
+        severity: warn
+        description: A zero or negative planned lead time cannot be used for planning
+
+  min_order_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Supplier minimum order quantity — a hard constraint on any suggested buy
+    aliases: [moq, min order qty, minimum order quantity, minimum order qty,
+              min qty, minimum lot size, min lot size, minimum quantity, order minimum]
+
+  order_multiple:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: Pack size / rounding value — suggested quantities must be a multiple of it
+    aliases: [order multiple, rounding value, lot size increment, pack size,
+              pack qty, case qty, multiple, increment, batch size, standard pack]
+
+  unit_cost:
+    type: decimal
+    unit: currency_per_base_uom
+    role: measure
+    description: Standard or moving-average cost, for valuing stock and sizing EOQ
+    aliases: [unit cost, standard cost, std cost, moving average price, map,
+              item cost, cost, unit price, valuation price, purchase price,
+              standard price]
+    assertions:
+      - expr: "unit_cost >= 0"
+        severity: error
+
+  incoterm:
+    type: string
+    role: dimension
+    description: Decides whether goods in transit sit on the buyer's books
+    aliases: [incoterm, inco term, inco terms, delivery term, trade term,
+              shipping terms, terms of delivery]
+
+  product_family:
+    type: string
+    role: dimension
+    description: >
+      Explicit grouping from master data. Preferred over the family inferred from the
+      SKU prefix, which is only as good as the numbering scheme.
+    aliases: [product family, family, product group, material group, item group,
+              commodity, commodity code, category, product line, segment]
+
+  item_status:
+    type: string
+    role: dimension
+    description: >
+      Lifecycle flag — active, phase-out, obsolete, blocked. A discontinued item that
+      still shows demand history should not be replenished against that history.
+    aliases: [status, item status, material status, lifecycle status, life cycle,
+              active, obsolete flag, discontinued, mrp status, plant status]
+
+  planner_code:
+    type: string
+    role: dimension
+    description: Who owns this item — used to route recommendations to a person
+    aliases: [planner, planner code, mrp controller, buyer, buyer code,
+              purchasing group, responsible, owner]
+
+  uom_raw:
+    type: string
+    role: dimension
+    aliases: [uom, unit, unit of measure, base unit, stock unit]
+
+assertions:
+  - expr: "not_null(sku)"
+    severity: error

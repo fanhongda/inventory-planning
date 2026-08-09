@@ -3,16 +3,14 @@ inventory-planning — Distribution Centre Inventory Planning
 Single-stage, multi-echelon ready.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .orchestrator import InventoryPlanner
 from .readers.timeseries_reader import TimeSeriesReader
-from .reporting.charts import ChartBuilder
-from .reporting.html_report import HTMLReportGenerator
+from .reporting.kpi_report import KPIReport
 
 __all__ = [
     "InventoryPlanner",
     "TimeSeriesReader",
-    "ChartBuilder",
-    "HTMLReportGenerator",
+    "KPIReport",
 ]

@@ -101,6 +101,7 @@ when the deviation cannot be explained by execution failure or supply constraint
 | Source cross-check | Measured vs ERP master vs planner worksheet | every material disagreement, with both values |
 | Service attribution | OTD measured and split four ways | who owns each failure |
 | Feedback loop | Cumulative gap attribution across months | OPERATOR_DEVIATION / SUPPLY_GAP / MODEL_BIAS |
+| Lead-time drift | Successive snapshots compared; drift separated from source change | which suppliers moved, and by how much |
 
 ---
 
@@ -473,11 +474,43 @@ result = LossCalculator("output/history/2026-06/snapshot_20260603_2335.json").co
   ⚠  OPERATOR DEVIATION:   4 SKUs — model recommendation maintained
   🔴 SUPPLY RISK:          2 SKUs — escalate to supply chain review
 
+  Lead-time drift (3 snapshots): 1 SKUs moved materially, 1 lengthening
+     SKU-A                45d ->    66d  +21d / +47%  [ACME]
+     A supplier that moved is a supplier conversation — the plan absorbed it silently.
+
   ► [OPERATOR_DEVIATION] SKU=XYZ-001
     Maintain system recommendation unchanged.
     Review with operations: storage constraints, budget freeze, or manual override?
     → No model parameter change.
 ```
+
+### Lead-time drift
+
+Each snapshot also records the lead time the run planned on, with its sigma, sample
+count and source. This is the one input most likely to move without anyone noticing:
+every run measures it afresh from recent receipts and builds an internally consistent
+plan around the new number, so a supplier sliding from 45 days to 62 over four months
+never triggers anything — the reorder point, safety stock and exposure period all move
+with it.
+
+`feedback.drift` compares successive snapshots and reports the movement. It needs no
+actuals, so it is readable the moment a second month exists:
+
+```python
+from inventory_planning.feedback.loss import LossCalculator
+
+print(LossCalculator(snapshot_path).lead_time_drift().summary())
+```
+
+Two things it deliberately keeps apart. **Drift** is the measured lead time itself
+moving — a supplier conversation. A **source change** is last month's figure coming
+from an item master and this month's being measured, or the reverse: nothing happened
+at the supplier, only what the pipeline knew about it. Reporting the second as drift
+would manufacture a supplier problem out of a data improvement.
+
+A move must clear both a relative and an absolute floor (20% and 5 days by default) to
+be reported. A relative threshold alone flags 2 days becoming 4; an absolute one alone
+misses 90 days becoming 110, which is the more expensive event.
 
 ---
 
@@ -516,8 +549,9 @@ inventory_planning/
 │   ├── backlog_realization.py what share of the open order book actually ships
 │   └── purchase_recommender.py  forecast consumption → net requirement
 ├── feedback/
-│   ├── snapshot.py            auto-saves planning state after each run
+│   ├── snapshot.py            auto-saves planning state + the lead time planned on
 │   ├── collector.py           records actuals against prior snapshot
+│   ├── drift.py               lead-time movement across months; drift vs source change
 │   └── loss.py                cumulative gap analysis + deviation attribution
 ├── readers/                   legacy per-document readers (superseded by ingest/)
 └── reporting/
@@ -554,7 +588,7 @@ location, and upstream/downstream relationships between nodes — not a location
 python -m pytest tests/ -q
 ```
 
-236 tests, no network, no fixtures beyond `sample_data/`.
+259 tests, no network, no fixtures beyond `sample_data/`.
 
 ## Requirements
 

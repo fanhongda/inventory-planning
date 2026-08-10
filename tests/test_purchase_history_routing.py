@@ -35,6 +35,22 @@ def registry():
     return AdapterRegistry()
 
 
+def _as_text(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Render a fixture the way the real intake sees one: every cell a string, every
+    blank a genuine null.
+
+    `.astype(str)` alone is not equivalent, and the difference is version-dependent.
+    Under pandas 2.x a NaT becomes the literal string "NaT", which is not null — so a
+    content test asking `is_null(receive_date)` reads every row as received and the
+    document routes to the wrong contract. Under pandas 3 the same call preserves NaN
+    and the test passes. `load_sheets` reads Excel with `dtype=str`, which yields NaN
+    for a blank cell on every version, so that is what a fixture has to reproduce.
+    """
+    text = frame.astype(str)
+    return text.replace({"NaT": np.nan, "nan": np.nan, "None": np.nan, "": np.nan})
+
+
 def _purchase_records(with_gr_date: bool, closed_share: float = 0.85, n: int = 300):
     """An SAP purchase-record extract: mostly closed lines, a few recent open ones."""
     rng = np.random.default_rng(5)
@@ -54,13 +70,13 @@ def _purchase_records(with_gr_date: bool, closed_share: float = 0.85, n: int = 3
     })
     if with_gr_date:
         frame["GR Date"] = np.where(closed, po_date + pd.Timedelta(days=40), pd.NaT)
-    return frame.astype(str)
+    return _as_text(frame)
 
 
 def _open_po_extract(n: int = 120):
     """A genuine open-PO extract: nothing received, a delivery schedule ahead."""
     rng = np.random.default_rng(6)
-    return pd.DataFrame({
+    return _as_text(pd.DataFrame({
         "Material": [f"M-{i % 60:04d}" for i in range(n)],
         "Vendor": rng.choice(["ACME", "GLOBEX"], n),
         "PO No.": [f"46{i:06d}" for i in range(n)],
@@ -69,7 +85,7 @@ def _open_po_extract(n: int = 120):
         "Planned Del Date": pd.to_datetime("2026-09-01") + pd.to_timedelta(
             rng.integers(0, 90, n), "D"
         ),
-    }).astype(str)
+    }))
 
 
 class TestPurchaseHistoryIsNotInboundSupply:
@@ -245,7 +261,7 @@ class TestRealSapColumnShapes:
         received = rng.random(n) < 0.52
         closed = rng.random(n) < 0.85
         po_date = pd.to_datetime("2020-01-01") + pd.to_timedelta(rng.integers(0, 2000, n), "D")
-        return pd.DataFrame({
+        return _as_text(pd.DataFrame({
             "Company code": "PL30",
             "Vendor Name": rng.choice(["Sentinel Safety", "Aurora Industrial Gases"], n),
             "PO Number": [f"44000{i % 99999:05d}" for i in range(n)],
@@ -257,7 +273,7 @@ class TestRealSapColumnShapes:
             "Open Quantity": np.where(closed, 0, rng.integers(1, 200, n)),
             "Status": np.where(closed, "C", "O"),
             "GR Date": np.where(received, po_date + pd.Timedelta(days=40), pd.NaT),
-        }).astype(str)
+        }))
 
     @staticmethod
     def _open_po(n: int = 400):
@@ -265,7 +281,7 @@ class TestRealSapColumnShapes:
         rng = np.random.default_rng(22)
         closed = rng.random(n) < 0.80
         po_date = pd.to_datetime("2023-01-01") + pd.to_timedelta(rng.integers(0, 900, n), "D")
-        return pd.DataFrame({
+        return _as_text(pd.DataFrame({
             "Company code": "PL30", "Vendor Name": "Aurora Industrial Gases Limited",
             "PO Number": [f"45082{i % 99999:05d}" for i in range(n)],
             "PO Date": po_date,
@@ -276,7 +292,7 @@ class TestRealSapColumnShapes:
             "Status": np.where(closed, "C", "O"),
             "GR Document": "", "GR Date": pd.NaT,
             "ETA Date": po_date + pd.Timedelta(days=317),
-        }).astype(str)
+        }))
 
     def test_purchase_history_routes_to_po_history(self, registry):
         route = registry.route(self._purchase_history(), "Purchase History 10th Aug 2026.XLSX")
@@ -320,3 +336,50 @@ class TestRealSapColumnShapes:
         self._purchase_history().to_excel(tmp_path / "Purchase History.xlsx", index=False)
         result = Intake(verbose=False).load_files(sorted(tmp_path.iterdir()))
         assert result.plan.source_of("lead_time_signal") == "po_history"
+
+
+class TestFixturesMatchWhatIntakeSees:
+    """
+    A fixture that differs from a real read proves nothing about a real read.
+
+    These three tests passed on pandas 3 and failed on pandas 2 because
+    `pd.DataFrame({...}).astype(str)` turns a NaT into the literal string "NaT" on the
+    older version and preserves NaN on the newer one. A content test asking
+    `is_null(receive_date)` then read every row as received, and the open-PO extract
+    routed to po_history — on the reporter's machine only.
+
+    `load_sheets` reads Excel with `dtype=str`, which yields NaN for a blank cell on
+    every version. That is the contract a fixture has to honour, so it is asserted
+    rather than assumed.
+    """
+
+    @pytest.mark.parametrize("build", [
+        lambda: _purchase_records(with_gr_date=True),
+        lambda: _purchase_records(with_gr_date=False),
+        TestRealSapColumnShapes._open_po,
+        TestRealSapColumnShapes._purchase_history,
+    ])
+    def test_a_blank_cell_is_null_not_the_word_naught(self, build):
+        frame = build()
+        for column in frame.columns:
+            rendered = frame[column].astype(str)
+            offenders = {"NaT", "nan", "None", "NaN"} & set(rendered)
+            assert not offenders, (
+                f"{column} carries {offenders} as text; a real read would give NaN, so "
+                f"any is_null() test in a contract sees the opposite of the truth"
+            )
+
+    def test_the_open_extract_has_no_receipts_at_all(self):
+        """The property the routing verdict turns on, pinned so it cannot drift."""
+        assert TestRealSapColumnShapes._open_po()["GR Date"].isna().all()
+
+    def test_the_history_is_part_received_and_mostly_closed(self):
+        """
+        Both proportions matter: receipts alone (~52%) are below the confidence floor,
+        and it is the closed share (~85%) that has to carry the decision.
+        """
+        frame = TestRealSapColumnShapes._purchase_history()
+        received = frame["GR Date"].notna().mean()
+        closed = (pd.to_numeric(frame["Open Quantity"], errors="coerce") == 0).mean()
+        assert 0.40 < received < 0.65, f"receipts at {received:.0%} — floor no longer probed"
+        assert closed > 0.75, f"closed at {closed:.0%} — no longer the deciding signal"

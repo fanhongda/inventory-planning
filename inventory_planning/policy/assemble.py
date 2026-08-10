@@ -255,7 +255,12 @@ def _merge_masters(
             candidate = candidate if candidate is not None else plan_cols[plan_key]
         if candidate is None:
             continue
-        df[column] = df[column].fillna(candidate) if column in df.columns else candidate
+        # `.where` rather than `.fillna`: filling an object column downcasts, and
+        # pandas 2 emits a FutureWarning about it on every run.
+        if column in df.columns:
+            df[column] = df[column].where(df[column].notna(), candidate)
+        else:
+            df[column] = candidate
 
     # The planner's own decisions, carried through untouched for comparison.
     for column in PLANNER_BENCHMARK_COLUMNS:

@@ -98,7 +98,7 @@ fields:
     type: string
     role: identifier
     required: true
-    normalize: upper_strip
+    normalize: material_number
     description: Item identifier, joined to item master
     aliases: [sku, item, item code, item no, item number, material, material number,
               product code, part no, part number, article, article no, stock code,

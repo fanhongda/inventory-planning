@@ -14,7 +14,7 @@ fields:
     type: string
     role: identifier
     required: true
-    normalize: upper_strip
+    normalize: material_number
     aliases: [sku, item, item code, item no, item number, material, material number,
               product code, part no, part number, article, stock code]
 

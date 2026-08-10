@@ -35,6 +35,19 @@ def registry():
     return AdapterRegistry()
 
 
+def _blank_unless(dates: pd.Series, keep) -> pd.Series:
+    """
+    Dates where `keep`, NaT elsewhere — without going through `np.where`.
+
+    `np.where(cond, datetimes, pd.NaT)` silently collapses a datetime column to raw
+    int64 nanoseconds on pandas 2 while preserving the dtype on pandas 3. The fixture
+    then carried values like "1697414400000000000", no receipt date parsed, and the
+    lead-time capability was withheld — on one version only. `Series.where` keeps the
+    dtype on both.
+    """
+    return pd.Series(dates).where(pd.Series(keep, index=pd.Series(dates).index))
+
+
 def _as_text(frame: pd.DataFrame) -> pd.DataFrame:
     """
     Render a fixture the way the real intake sees one: every cell a string, every
@@ -48,7 +61,7 @@ def _as_text(frame: pd.DataFrame) -> pd.DataFrame:
     for a blank cell on every version, so that is what a fixture has to reproduce.
     """
     text = frame.astype(str)
-    return text.replace({"NaT": np.nan, "nan": np.nan, "None": np.nan, "": np.nan})
+    return text.mask(text.isin(["NaT", "nan", "None", "NaN", "<NA>", ""]))
 
 
 def _purchase_records(with_gr_date: bool, closed_share: float = 0.85, n: int = 300):
@@ -69,7 +82,7 @@ def _purchase_records(with_gr_date: bool, closed_share: float = 0.85, n: int = 3
         "Net Value": rng.integers(100, 9000, n),
     })
     if with_gr_date:
-        frame["GR Date"] = np.where(closed, po_date + pd.Timedelta(days=40), pd.NaT)
+        frame["GR Date"] = _blank_unless(po_date + pd.Timedelta(days=40), closed)
     return _as_text(frame)
 
 
@@ -190,7 +203,7 @@ class TestOverlappingPoNumbers:
             "Document Date": order_date,
             "Order Quantity": ordered,
             "Quantity Received": received,
-            "GR Date": np.where(closed, order_date + pd.Timedelta(days=45), pd.NaT),
+            "GR Date": _blank_unless(order_date + pd.Timedelta(days=45), closed),
         }).to_excel(tmp_path / "Purchase History.xlsx", index=False)
 
         pd.DataFrame({
@@ -272,7 +285,7 @@ class TestRealSapColumnShapes:
             "Net Price": np.round(rng.random(n) * 100, 2),
             "Open Quantity": np.where(closed, 0, rng.integers(1, 200, n)),
             "Status": np.where(closed, "C", "O"),
-            "GR Date": np.where(received, po_date + pd.Timedelta(days=40), pd.NaT),
+            "GR Date": _blank_unless(po_date + pd.Timedelta(days=40), received),
         }))
 
     @staticmethod
@@ -362,11 +375,15 @@ class TestFixturesMatchWhatIntakeSees:
     def test_a_blank_cell_is_null_not_the_word_naught(self, build):
         frame = build()
         for column in frame.columns:
-            rendered = frame[column].astype(str)
-            offenders = {"NaT", "nan", "None", "NaN"} & set(rendered)
+            # Only the cells that are *not* null can be offenders. Rendering the whole
+            # column with astype(str) is itself version-dependent — pandas 2 turns a
+            # genuine NaN into the text "nan" — so checking that would fail a correct
+            # fixture on one version and pass a broken one on the other.
+            present = frame[column].dropna()
+            offenders = {"NaT", "nan", "None", "NaN", "<NA>"} & set(present.astype(str))
             assert not offenders, (
-                f"{column} carries {offenders} as text; a real read would give NaN, so "
-                f"any is_null() test in a contract sees the opposite of the truth"
+                f"{column} carries {offenders} as text where a real read would give "
+                f"NaN, so any is_null() test in a contract sees the opposite of the truth"
             )
 
     def test_the_open_extract_has_no_receipts_at_all(self):

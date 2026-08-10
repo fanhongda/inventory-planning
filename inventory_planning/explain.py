@@ -159,7 +159,7 @@ def _discriminator_note(contract: DocContract, registry: AdapterRegistry,
     share, source = max(results)
     tail = f"; also tried {', '.join(unusable)}" if unusable else ""
     other = "".join(
-        f", {s} for `{src}`" for s, src in sorted(results, reverse=True)[1:]
+        f", {s:.0%} for `{src}`" for s, src in sorted(results, reverse=True)[1:]
     )
     return f"content test `{source}` holds for {share:.0%} of rows{other}{tail}"
 

@@ -42,8 +42,9 @@ fields:
     role: identifier
     required: true
     normalize: material_number
-    aliases: [sku, item, item code, item no, item number, material, material number,
-              product code, part no, part number, article, stock code, item id]
+    aliases: [sku, material, material number, part number, part no, product code,
+              item code, item no, item number, item id, article, article no,
+              stock code, product_id, item_id, item]
 
   description:
     type: string

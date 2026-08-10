@@ -21,8 +21,9 @@ fields:
     role: identifier
     required: true
     normalize: material_number
-    aliases: [sku, item, item code, item no, item number, material, material number,
-              product code, part no, part number, article, stock code]
+    aliases: [sku, material, material number, part number, part no, product code,
+              item code, item no, item number, item id, article, article no,
+              stock code, product_id, item_id, item]
 
   customer:
     type: string
@@ -30,6 +31,17 @@ fields:
     description: Enables ranking shortage risk by customer exposure, not just SKU count
     aliases: [customer, customer name, customer code, customer no, sold to, sold-to,
               sold to party, account, client, ship to, buyer]
+
+  so_line_number:
+    type: string
+    role: identifier
+    description: >
+      Line within the sales order. Present so `Item` has a home: SAP uses it for the
+      line number while other systems use it for the material, and with nowhere else
+      to go it was claimed by `sku` — keying the entire backlog on 10, 20, 30 and
+      matching no demand at all.
+    aliases: [line, line no, line number, so line, sales order line, item, item no.,
+              position, pos, line item, seq, sequence]
 
   so_number:
     type: string

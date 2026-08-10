@@ -8,7 +8,15 @@ grain: po_receipt_line
 
 # PO history is *received* supply. The receipt date is what separates it from an
 # open PO, whose defining property is that nothing has arrived yet.
-discriminator: "not_null(receive_date)"
+# Tried in order, first applicable one decides.
+#   a goods receipt means the line is history, whatever else the export is called
+#   failing that, a line with nothing left open is a closed order, not inbound supply
+# The second exists because SAP purchase-record extracts routinely omit the receipt
+# date while still being overwhelmingly closed orders, and without it such a file is
+# indistinguishable from an open-PO extract and gets counted as inbound supply.
+discriminator:
+  - "not_null(receive_date)"
+  - "open_qty == 0"
 natural_key: [po_number, sku, receive_date]
 capabilities: [lead_time_signal, order_pattern_signal, cost_signal]
 
@@ -106,6 +114,33 @@ fields:
       - expr: "po_qty > 0"
         severity: warn
         description: Zero-quantity lines distort the order-size distribution
+
+  delivered_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: >
+      Quantity actually received against the line. On a receipt-less extract this is
+      what makes the closed-ness test possible: ordered minus received says whether
+      anything is still outstanding, which is the difference between purchase history
+      and inbound supply.
+    aliases: [delivered qty, delivered quantity, received qty, received quantity,
+              quantity received, qty delivered, qty received, goods receipt qty,
+              gr qty, receipt qty]
+
+  open_qty:
+    type: decimal
+    unit: base_uom
+    role: measure
+    description: >
+      Outstanding balance. Present here — on a *history* contract — solely so the
+      content test can ask whether the lines are closed. An SAP purchase-record export
+      with no goods-receipt date is otherwise indistinguishable from an open-PO
+      extract, and gets counted as inbound supply.
+    aliases: [open qty, open quantity, remaining qty, outstanding qty,
+              balance qty, balance quantity, still to be delivered]
+    derivable_from:
+      - "po_qty - coalesce(delivered_qty, 0)"
 
   po_amount:
     type: decimal

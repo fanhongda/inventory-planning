@@ -187,6 +187,9 @@ class IntakeResult:
     documents: Dict[str, LoadedDocument] = dc_field(default_factory=dict)
     plan: IntakePlan = dc_field(default_factory=IntakePlan)
     failures: List[Tuple[str, str]] = dc_field(default_factory=list)
+    # Observations worth stating that are not problems. Kept apart from `failures`
+    # so the run does not cry wolf about things the planner already knows.
+    notes: List[str] = dc_field(default_factory=list)
 
     def frame(self, doc_type: str) -> Optional[pd.DataFrame]:
         doc = self.documents.get(doc_type)
@@ -231,6 +234,10 @@ class IntakeResult:
                              f"({doc.route.confidence:.0%})")
             lines.append("      python -m inventory_planning.explain <file>   "
                          "shows what each contract scored and why")
+
+        for note in self.notes:
+            lines.append("")
+            lines.append(note)
 
         lines.append("")
         lines.append(self.plan.summary())
@@ -342,10 +349,51 @@ class Intake:
                 withheld[doc_type] = missing
 
         result.plan = self.resolver.resolve(loaded, unrecognised, withheld=withheld)
+        self._note_po_overlap(result)
 
         if self.verbose:
             print(result.summary())
         return result
+
+    @staticmethod
+    def _note_po_overlap(result: IntakeResult) -> None:
+        """
+        Report PO numbers appearing in both the open-PO and purchase-history extracts.
+
+        This overlap is expected and correct, not a fault to repair. A PO that is not
+        fully closed is still open supply *and* an order that was placed, so pulling
+        both reports from the ERP returns it twice — once in each, by design.
+
+        Nothing is deduplicated, because the two feed disjoint calculations: the open
+        extract contributes an outstanding balance to the inventory position, the
+        history contributes an order event and a receipt to lead time and ordering
+        behaviour. The same line counted once in each is not the same quantity counted
+        twice.
+
+        It is stated anyway because the alternative — a planner noticing the overlap
+        and wondering whether the run double-counted — costs more than one line of
+        output. Which is also why it is a note and not a warning.
+        """
+        open_po, history = result.documents.get("open_po"), result.documents.get("po_history")
+        if not open_po or not history:
+            return
+        if "po_number" not in open_po.frame.columns or "po_number" not in history.frame.columns:
+            return
+
+        open_pos = set(open_po.frame["po_number"].dropna().astype(str))
+        hist_pos = set(history.frame["po_number"].dropna().astype(str))
+        shared = open_pos & hist_pos
+        if not shared:
+            return
+
+        result.notes.append(
+            f"  ⓘ {len(shared):,} PO number(s) appear in both open_po and po_history "
+            f"({len(shared) / max(len(open_pos), 1):.0%} of the open extract).\n"
+            f"    Expected for partially-received orders, and left as-is: the open "
+            f"extract supplies the outstanding balance, the history supplies the order\n"
+            f"    and receipt behind lead time and ordering behaviour. Different "
+            f"measures, so nothing is double-counted."
+        )
 
     def _unsupplied_capabilities(self, doc: LoadedDocument, doc_type: str) -> set:
         """

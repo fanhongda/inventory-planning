@@ -69,7 +69,8 @@ fields:
     role: timestamp
     description: Date the customer placed the order
     aliases: [order date, so date, sales order date, created date, creation date,
-              doc date, document date, order dt, booking date]
+              doc date, document date, order dt, booking date,
+              orddate date, orddate, ord date, order entry date]
 
   ship_date:
     type: date
@@ -92,7 +93,9 @@ fields:
       The date the time series is bucketed on. Derived by preference — ship date is
       the true consumption signal; order date is the fallback when the export has no
       shipment detail.
-    aliases: [demand date, transaction date, posting date]
+    aliases: [demand date, transaction date, posting date,
+              invoice date, invdate date, invdate, invoiced date, billing date,
+              billed date, bill date, invoice dt]
     derivable_from:
       - "ship_date"
       - "order_date"

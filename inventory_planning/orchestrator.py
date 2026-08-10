@@ -371,6 +371,29 @@ class InventoryPlanner:
                 f"Cannot run planning — missing required input(s): {missing}.\n"
                 f"{plan.summary()}"
             )
+
+        # A capability can be satisfied by a document that is structurally broken: the
+        # file is present and routed, so the plan reads green, but a field the
+        # analytics index by name never arrived. Nothing downstream guards against
+        # that, so the run does not degrade — it raises KeyError several layers from
+        # the cause, naming a column rather than a file. Stop here, where the file and
+        # the missing field can both be named.
+        unusable = self._intake.unusable() if self._intake is not None else []
+        if unusable:
+            detail = "\n".join(
+                f"    {doc.doc_type:<16} {doc.source_name}\n"
+                f"      missing: {', '.join(fields)}"
+                for doc, fields in unusable
+            )
+            raise ValueError(
+                "Cannot run planning — a required field never arrived. The document "
+                "routed correctly and its other columns mapped, but this one matched "
+                "no alias and could not be derived:\n"
+                f"{detail}\n\n"
+                "    Run `python -m inventory_planning.explain <file>` to see which "
+                "source columns went unmatched, then add the right one as an alias to "
+                "the contract."
+            )
         # Degradations are recorded rather than raised: the run is still meaningful,
         # but the report must be able to say which numbers rest on a fallback.
         self._quality_log.append({

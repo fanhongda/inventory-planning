@@ -584,7 +584,17 @@ class AdapterRegistry:
 
         for canonical, spec in contract.fields.items():
             aliases = [canonical] + spec.aliases
-            alias_rank = {normalize_header(a): i for i, a in enumerate(aliases)}
+            # First occurrence wins, exactly as `token_rank` below does. A dict
+            # comprehension here keeps the *last*, and the two disagreeing is a real
+            # bug rather than a nicety: `po_date` normalizes to the same string as its
+            # own first alias `po date`, so the exact header `PO Date` was recorded at
+            # rank 1 and lost the +0.30 canonical bonus — while `PO del date`, matching
+            # the same alias only as a token subset, kept rank 0 and won it. An exact
+            # match was beaten by a fuzzy one, and lead time was then computed from the
+            # delivery date. 75 fields across the contracts had the same hole.
+            alias_rank: Dict[str, int] = {}
+            for i, alias in enumerate(aliases):
+                alias_rank.setdefault(normalize_header(alias), i)
             # Token sets collapse word-order and separator variants onto one entry, so
             # `QUANTITY_ORDERED`, `Ordered Quantity` and `quantity_ordered` all reach
             # the same alias without three separate list entries. Enumerating those

@@ -470,7 +470,7 @@ class TestAmbiguousRouting:
 class TestIntakeMultiSheet:
     def test_reports_unreadable_files_without_aborting(self, tmp_path, planner_timeseries):
         planner_timeseries.to_excel(tmp_path / "demand.xlsx", index=False)
-        (tmp_path / "notes.txt").write_text("not a data file")
+        (tmp_path / "notes.txt").write_text("not a data file", encoding="utf-8")
         result = Intake(verbose=False).load_files(sorted(tmp_path.iterdir()))
         assert "demand_timeseries" in result.documents
         assert any("notes.txt" == name for name, _ in result.failures)

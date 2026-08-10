@@ -30,7 +30,7 @@ class SafetyStockCalculator:
         if config_dir is not None:
             si_path = Path(config_dir) / "supplier_incoterm.json"
             if si_path.exists():
-                data = json.loads(si_path.read_text())
+                data = json.loads(si_path.read_text(encoding="utf-8"))
                 # supplier_incoterm.json maps supplier_id → incoterm; no preferred supplier list yet.
                 # When a sku-level preferred supplier config is added, load it here.
 

@@ -413,6 +413,37 @@ What this run cannot tell you:
 
 ---
 
+## When a file routes to the wrong contract
+
+Routing is automatic, and the cost of that is a failure mode with no obvious handle: a
+file lands on the wrong contract, every number downstream is computed correctly from
+the wrong premise, and the run reports `OK`. The intake summary now flags a thin margin,
+but when it happens:
+
+```bash
+python -m inventory_planning.explain "path/to/folder"
+```
+
+It prints, per contract, the score it got, which required fields could not be mapped
+and to what the mapped ones went, which identifying fields are absent, whether the
+content discriminator could even be evaluated, and which source columns matched
+nothing. The last two are usually the answer — a document loses either because a column
+it needs is named something the aliases do not know, or because the column exists but
+holds something unexpected.
+
+The fix is a data change: add the alias to the contract, or freeze an adapter for that
+export. Not a code change.
+
+**A contract must state what makes it itself.** `identifying_any` lists field groups of
+which at least one must be present. It exists because a contract whose only required
+field is `sku` matches every file with an item column, scores full marks on required
+coverage, and outranks the document that genuinely fits — which is how a sales-history
+export gets filed as an item master, taking the demand signal with it. An item master
+earns the name by carrying a planning parameter; a file with none is a list of item
+numbers, whatever else is on it.
+
+---
+
 ## Output
 
 ```
@@ -520,6 +551,7 @@ misses 90 days becoming 110, which is the more expensive event.
 inventory_planning/
 ├── orchestrator.py            run_planning → run_policy_analysis → run_kpi_review
 ├── ingest_bridge.py           canonical frames → analytics column expectations
+├── explain.py                 why a file routed where it did — per-contract scoring
 ├── ingest/                    ← contract-driven intake (no imports from this package)
 │   ├── contracts/*.yaml       canonical fields: type, grain, derivable_from, assertions
 │   ├── adapters/*/*.yaml      how one ERP export satisfies a contract (frozen, versioned)
@@ -588,9 +620,12 @@ location, and upstream/downstream relationships between nodes — not a location
 python -m pytest tests/ -q
 ```
 
-259 tests, no network, no fixtures beyond `sample_data/`.
+285 tests, no network, no fixtures beyond `sample_data/`.
 
 ## Requirements
 
-- Python ≥ 3.9
+- Python ≥ 3.9 — Windows, macOS and Linux. All text I/O states `encoding="utf-8"`
+  explicitly rather than inheriting the platform default, and a test enforces it:
+  `config/planning_parameters.md` is written in Chinese, so a locale-dependent read
+  fails outright on a Western Windows install (cp1252).
 - pandas, numpy, scipy, statsmodels, openpyxl, pyyaml

@@ -168,7 +168,7 @@ class PlanningParameters:
                 f"segmentation boundaries and policy overrides — the pipeline cannot "
                 f"assume them."
             )
-        text = self.path.read_text()
+        text = self.path.read_text(encoding="utf-8")
 
         for heading, body in self._sections(text, level=2):
             key = self._section_key(heading)

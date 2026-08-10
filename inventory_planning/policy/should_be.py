@@ -151,7 +151,7 @@ class ShouldBeCalculator:
     def __init__(self, config_dir: Path = None):
         self.config_dir = Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
         rules_path = self.config_dir / "incoterm_rules.json"
-        data = json.loads(rules_path.read_text()) if rules_path.exists() else {}
+        data = json.loads(rules_path.read_text(encoding="utf-8")) if rules_path.exists() else {}
         self.incoterm_rules: Dict[str, Any] = data.get("rules", {})
         self.default_incoterm: str = data.get("default_incoterm", "FOB")
 

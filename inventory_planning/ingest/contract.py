@@ -187,13 +187,23 @@ class DocContract:
     # history — has byte-identical columns, so no header-based rule can separate them;
     # only what is *in* the rows can.
     discriminator: Optional[str] = None
+    # Groups of fields of which at least one must be present for the document to be
+    # this document at all. `required` cannot express it: an item master's identity
+    # rests on carrying *some* planning parameter — a lead time or an MOQ or an order
+    # multiple — and no single one of them can be made mandatory.
+    #
+    # Without this a contract whose only required field is `sku` matches every file
+    # that has an item column, scores full marks on required coverage, and outranks
+    # the document that genuinely fits. That is how a sales-history export gets filed
+    # as an item master, taking the demand signal with it.
+    identifying_any: List[List[str]] = dc_field(default_factory=list)
     source_path: Optional[Path] = None
 
     # ── Loading ──────────────────────────────────────────────────────────────
 
     @classmethod
     def load(cls, path: Path) -> "DocContract":
-        raw = yaml.safe_load(Path(path).read_text())
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.parse(raw, source_path=Path(path))
 
     @classmethod
@@ -214,6 +224,15 @@ class DocContract:
         if discriminator:
             Expression(str(discriminator))
 
+        identifying_any = [list(group) for group in (raw.get("identifying_any", []) or [])]
+        for group in identifying_any:
+            unknown = [f for f in group if f not in fields]
+            if unknown:
+                raise ValueError(
+                    f"{raw['doc_type']}: identifying_any names field(s) the contract "
+                    f"does not define: {unknown}"
+                )
+
         return cls(
             doc_type=raw["doc_type"],
             description=raw.get("description", ""),
@@ -225,6 +244,7 @@ class DocContract:
             capabilities=list(raw.get("capabilities", []) or []),
             default_filters=default_filters,
             discriminator=str(discriminator) if discriminator else None,
+            identifying_any=identifying_any,
             source_path=source_path,
         )
 

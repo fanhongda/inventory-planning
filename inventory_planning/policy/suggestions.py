@@ -305,7 +305,7 @@ class SuggestionResult:
 
         text = "\n".join(header) + "\n".join(blocks) + self._per_sku_appendix()
         if path is not None:
-            Path(path).write_text(text)
+            Path(path).write_text(text, encoding="utf-8")
         return text
 
     def _sample_skus(self, rule_id: str, n: int = 3) -> List[str]:

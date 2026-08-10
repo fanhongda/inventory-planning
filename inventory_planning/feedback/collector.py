@@ -27,7 +27,7 @@ class FeedbackCollector:
 
     def __init__(self, snapshot_path: str | Path):
         self.path = Path(snapshot_path)
-        with open(self.path) as f:
+        with open(self.path, encoding="utf-8") as f:
             self.snapshot = json.load(f)
 
     def record_actuals(
@@ -68,4 +68,5 @@ class FeedbackCollector:
         return df.groupby("sku")[value_col].sum().to_dict()
 
     def _write(self) -> None:
-        self.path.write_text(json.dumps(self.snapshot, indent=2, ensure_ascii=False))
+        self.path.write_text(json.dumps(self.snapshot, indent=2, ensure_ascii=False),
+                             encoding="utf-8")

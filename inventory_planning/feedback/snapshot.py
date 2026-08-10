@@ -111,7 +111,7 @@ class SnapshotSaver:
         }
 
         path = history_dir / f"snapshot_{ts_str}.json"
-        path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
+        path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
         return path
 
     @staticmethod

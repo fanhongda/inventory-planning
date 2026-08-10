@@ -406,7 +406,7 @@ class ContractTester:
         if not path.exists():
             return None
         try:
-            store = json.loads(path.read_text())
+            store = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return None
         return store.get(doc_type)
@@ -418,11 +418,11 @@ class ContractTester:
         store: Dict[str, Any] = {}
         if path.exists():
             try:
-                store = json.loads(path.read_text())
+                store = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 store = {}
         store[doc_type] = baseline
-        path.write_text(json.dumps(store, indent=2, default=str))
+        path.write_text(json.dumps(store, indent=2, default=str), encoding="utf-8")
 
 
 def _jsonable(value: Any) -> Any:

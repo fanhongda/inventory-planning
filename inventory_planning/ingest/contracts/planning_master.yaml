@@ -30,6 +30,12 @@ discriminator: >
   not_null(planner_safety_stock) or not_null(planner_reorder_point)
   or not_null(planner_max_qty) or not_null(planner_review_period_days)
 
+# See item_master: `sku` alone would let this contract claim any file with an item
+# column. A planner worksheet is defined by carrying a parameter the planner set.
+identifying_any:
+  - [planner_safety_stock, planner_reorder_point, planner_min_qty, planner_max_qty,
+     planner_review_period_days, planner_service_level]
+
 fields:
 
   sku:

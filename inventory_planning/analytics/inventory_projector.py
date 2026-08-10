@@ -27,7 +27,7 @@ class InventoryProjector:
         if config_dir is not None:
             cfg_path = Path(config_dir) / "stocking_policy.json"
             if cfg_path.exists():
-                cfg = json.loads(cfg_path.read_text())
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
                 self.excess_dos_threshold = cfg.get("excess_dos_threshold_days", 90)
 
     def project(self, safety_stock_df: pd.DataFrame, effective_inventory: pd.DataFrame,

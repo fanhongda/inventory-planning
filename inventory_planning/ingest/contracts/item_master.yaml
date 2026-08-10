@@ -23,6 +23,18 @@ capabilities: [lead_time_signal, cost_signal, item_dimension]
 # on most rows, keeps a stock report with a stray `MOQ` column from landing here.
 discriminator: "not_null(lead_time_days) or not_null(min_order_qty) or not_null(order_multiple)"
 
+# `sku` is the only strictly required field, because masters differ in what they
+# carry. That alone would make this contract match every file with an item column and
+# outrank the document that genuinely fits — which is exactly how a sales-history
+# export ends up filed here, taking the demand signal with it. A master earns the name
+# by carrying at least one planning parameter; a file with none of these is a list of
+# item numbers, whatever else is on it.
+# Only genuine planning parameters count. `incoterm` and `item_status` were here at
+# first and had to come out: a PO history carries an incoterm column, which was enough
+# to qualify it as a master and left it winning on a thin margin.
+identifying_any:
+  - [lead_time_days, min_order_qty, order_multiple]
+
 fields:
 
   sku:

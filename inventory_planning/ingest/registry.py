@@ -295,14 +295,22 @@ class AdapterRegistry:
             # underivable here made "nothing is open, so this is history" unusable on
             # exactly the files that need it.
             available = set(column_map)
+            # Sources are read as text throughout, deliberately — pandas' inference is
+            # where a European decimal or a leading-zero part number gets mangled. But
+            # a content test asking `open_qty > 0` then compares str to int and raises,
+            # and the test is silently skipped. On a real SAP extract that removed the
+            # one signal able to tell an open PO from a purchase history.
+            renamed = self._numeric_for_tests(renamed, contract, available)
             renamed, derived = self._derive_for_discriminator(renamed, contract, available)
             available |= derived
 
-            # Tests are tried in declaration order and the first *applicable* one
-            # decides. A contract can therefore state its strongest signal and a
-            # weaker fallback — "has a goods receipt", else "nothing left open" —
-            # instead of one expression that is skipped whenever any column it names
-            # is absent.
+            # Every applicable test is evaluated and the strongest result stands.
+            # A contract's tests are alternative readings of one claim — for a
+            # purchase history, "the line was received" and "nothing is left
+            # outstanding" both say it is history — and which of them an export can
+            # support varies by ERP. Taking merely the first applicable one judged a
+            # 52%-received extract on that alone, when 85% of its lines were closed
+            # and said so plainly.
             for source in (contract.discriminators or [contract.discriminator]):
                 expr = Expression(source)
                 # The referenced column must genuinely exist in the source.
@@ -318,14 +326,15 @@ class AdapterRegistry:
                     continue
                 if not isinstance(mask, pd.Series):
                     continue
-                shares[doc_type] = float(mask.fillna(False).astype(bool).mean())
-                break
+                share = float(mask.fillna(False).astype(bool).mean())
+                shares[doc_type] = max(shares.get(doc_type, 0.0), share)
 
         if not shares:
             return None
 
         ordered = sorted(shares.items(), key=lambda kv: -kv[1])
         winner, top = ordered[0]
+
         if top < 0.80:
             return None
 
@@ -341,6 +350,26 @@ class AdapterRegistry:
         if top - second < 0.30:
             return None
         return winner, top, runner_up, second
+
+    @staticmethod
+    def _numeric_for_tests(frame, contract: DocContract, available: set):
+        """
+        Coerce the numeric fields a content test may touch, for evaluation only.
+
+        Nothing here is kept: the adapter does the real parsing with the source's own
+        locale rules. This exists solely so a comparison in a discriminator sees
+        numbers instead of the strings every file is read as.
+        """
+        numeric = {}
+        for name in available:
+            spec = contract.field(name)
+            if spec is None or not spec.is_numeric or name not in frame.columns:
+                continue
+            numeric[name] = pd.to_numeric(
+                frame[name].astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce",
+            )
+        return frame.assign(**numeric) if numeric else frame
 
     @staticmethod
     def _derive_for_discriminator(frame, contract: DocContract, available: set):

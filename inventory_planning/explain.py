@@ -129,18 +129,39 @@ def _discriminator_note(contract: DocContract, registry: AdapterRegistry,
     """
     if not contract.discriminator:
         return "no content test"
+
     column_map = registry._assign_columns(profile, contract, include_empty=True)
-    expr = Expression(contract.discriminator)
-    missing = expr.columns - set(column_map)
-    if missing:
-        return f"content test NOT APPLICABLE — needs {sorted(missing)}"
-    try:
-        renamed = df.rename(columns={v: k for k, v in column_map.items()})
-        mask = expr.evaluate(renamed)
-        share = float(pd.Series(mask).fillna(False).astype(bool).mean())
-    except (ExpressionError, TypeError, ValueError) as exc:
-        return f"content test errored: {exc}"
-    return f"content test holds for {share:.0%} of rows"
+    renamed = df.rename(columns={v: k for k, v in column_map.items()})
+    available = set(column_map)
+    renamed = registry._numeric_for_tests(renamed, contract, available)
+    renamed, derived = registry._derive_for_discriminator(renamed, contract, available)
+    available |= derived
+
+    # Mirror the router exactly: every applicable test, strongest result stands.
+    # Showing only the first one reported 52% beside a verdict reached on 85%, which
+    # is worse than showing nothing — the tool exists to explain the decision.
+    results, unusable = [], []
+    for source in (contract.discriminators or [contract.discriminator]):
+        expr = Expression(source)
+        missing = expr.columns - available
+        if missing:
+            unusable.append(f"{source} (needs {sorted(missing)})")
+            continue
+        try:
+            mask = expr.evaluate(renamed)
+            results.append((float(pd.Series(mask).fillna(False).astype(bool).mean()), source))
+        except (ExpressionError, TypeError, ValueError) as exc:
+            unusable.append(f"{source} (errored: {exc})")
+
+    if not results:
+        return "content test NOT APPLICABLE — " + "; ".join(unusable)
+
+    share, source = max(results)
+    tail = f"; also tried {', '.join(unusable)}" if unusable else ""
+    other = "".join(
+        f", {s} for `{src}`" for s, src in sorted(results, reverse=True)[1:]
+    )
+    return f"content test `{source}` holds for {share:.0%} of rows{other}{tail}"
 
 
 def explain_paths(paths: List[Path]) -> str:

@@ -17,6 +17,7 @@ Two shapes have to work, because both occur:
                                 the receipt date entirely
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -220,3 +221,102 @@ class TestOverlappingPoNumbers:
         frame["PO No."] = [f"99{i:06d}" for i in range(len(frame))]
         frame.to_excel(tmp_path / "open PO.xlsx", index=False)
         assert self._load(tmp_path).notes == []
+
+
+class TestRealSapColumnShapes:
+    """
+    The column sets from a live SAP run, which the synthetic fixtures above did not
+    reproduce. Three defects only showed up here:
+
+      every frame is read as text, so `open_qty > 0` raised TypeError and the test was
+      silently skipped -- removing the one signal able to separate the two documents
+
+      the first applicable test decided, so a 52%-received extract was judged on that
+      alone when 85% of its lines were closed and said so
+
+      `open_qty > 0` was open_po's first test, and an open *sales* order satisfies it
+      too, so a sales-order export began routing to open_po
+    """
+
+    @staticmethod
+    def _purchase_history(n: int = 800):
+        """Received on 52% of lines, closed on 85% — the reported proportions."""
+        rng = np.random.default_rng(21)
+        received = rng.random(n) < 0.52
+        closed = rng.random(n) < 0.85
+        po_date = pd.to_datetime("2020-01-01") + pd.to_timedelta(rng.integers(0, 2000, n), "D")
+        return pd.DataFrame({
+            "Company code": "IN30",
+            "Vendor Name": rng.choice(["Macron Safety", "Bhuruka Gases"], n),
+            "PO Number": [f"44000{i % 99999:05d}" for i in range(n)],
+            "PO Date": po_date,
+            "Material": [f"0000000000054{i % 9999:04d}" for i in range(n)],
+            "PO quantity": rng.integers(1, 500, n),
+            "PO del date": po_date + pd.Timedelta(days=45),
+            "Net Price": np.round(rng.random(n) * 100, 2),
+            "Open Quantity": np.where(closed, 0, rng.integers(1, 200, n)),
+            "Status": np.where(closed, "C", "O"),
+            "GR Date": np.where(received, po_date + pd.Timedelta(days=40), pd.NaT),
+        }).astype(str)
+
+    @staticmethod
+    def _open_po(n: int = 400):
+        """GR Date blank throughout — the mark of an open-PO extract."""
+        rng = np.random.default_rng(22)
+        closed = rng.random(n) < 0.80
+        po_date = pd.to_datetime("2023-01-01") + pd.to_timedelta(rng.integers(0, 900, n), "D")
+        return pd.DataFrame({
+            "Company code": "IN30", "Vendor Name": "Bhuruka Gases Limited",
+            "PO Number": [f"45082{i % 99999:05d}" for i in range(n)],
+            "PO Date": po_date,
+            "Material": [f"60168{i % 999:03d}" for i in range(n)],
+            "PO quantity": rng.integers(1, 100, n),
+            "PO del date": po_date + pd.Timedelta(days=14),
+            "Open Quantity": np.where(closed, 0, rng.integers(1, 50, n)),
+            "Status": np.where(closed, "C", "O"),
+            "GR Document": "", "GR Date": pd.NaT,
+            "ETA Date": po_date + pd.Timedelta(days=317),
+        }).astype(str)
+
+    def test_purchase_history_routes_to_po_history(self, registry):
+        route = registry.route(self._purchase_history(), "Purchase History 10th Aug 2026.XLSX")
+        assert route.doc_type == "po_history"
+
+    def test_it_is_decided_by_closed_ness_not_by_the_receipt_share(self, registry):
+        """
+        Receipts cover 52% of rows, below the confidence floor. Closed lines cover 85%
+        and are what carries the verdict.
+        """
+        route = registry.route(self._purchase_history(), "ph.XLSX")
+        assert "content decided" in route.reason
+        # The verdict must rest on the closed-line share (~85%), not the receipt
+        # share (~52%) — which is below the confidence floor and would decide nothing.
+        share = int(re.search(r"holds for (\d+)% of rows", route.reason).group(1))
+        assert share > 70, f"decided on {share}%, so the receipt share won again"
+
+    def test_the_open_extract_still_routes_to_open_po(self, registry):
+        assert registry.route(self._open_po(), "FSP 1030 Jul open PO.xlsx").doc_type == "open_po"
+
+    def test_a_numeric_test_survives_text_columns(self, registry):
+        """`open_qty > 0` on string data raised TypeError and was skipped silently."""
+        route = registry.route(self._purchase_history(), "ph.XLSX")
+        assert "errored" not in route.reason
+
+    def test_both_keep_their_own_type_together(self, tmp_path):
+        from inventory_planning.ingest.intake import Intake
+
+        self._purchase_history().to_excel(tmp_path / "Purchase History.xlsx", index=False)
+        self._open_po().to_excel(tmp_path / "FSP open PO.xlsx", index=False)
+        result = Intake(verbose=False).load_files(sorted(tmp_path.iterdir()))
+        assert set(result.documents) == {"po_history", "open_po"}
+
+    def test_lead_time_is_measured_not_assumed(self, tmp_path):
+        """
+        The point of getting this right: with the history correctly identified, lead
+        time comes from receipts instead of falling back to the item master.
+        """
+        from inventory_planning.ingest.intake import Intake
+
+        self._purchase_history().to_excel(tmp_path / "Purchase History.xlsx", index=False)
+        result = Intake(verbose=False).load_files(sorted(tmp_path.iterdir()))
+        assert result.plan.source_of("lead_time_signal") == "po_history"

@@ -212,7 +212,7 @@ class LeverAnalysis:
             "  " + "-" * 58,
             f"    baseline should-be: ${base:,.0f}",
             "",
-            f"    {'lever':<38}{'stock freed':>13}{'net/yr':>12}",
+            f"    {'lever':<38}{'stock freed':>13}{'net/yr':>15}",
         ]
         for result in self.ranked:
             label = result.spec.label[:37]
@@ -232,7 +232,7 @@ class LeverAnalysis:
                 flag = f"  ? {result.spec.cost_kind} cost not in data"
 
             lines.append(
-                f"    {label:<38}${result.total_saving:>11,.0f}{net:>12}{flag}"
+                f"    {label:<38}${result.total_saving:>11,.0f}{net:>15}{flag}"
             )
 
         best = self.best_lever_per_sku()

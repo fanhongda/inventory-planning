@@ -134,6 +134,30 @@ class ParsingRules:
         )
 
 
+def _normalize_material(series: pd.Series) -> pd.Series:
+    """
+    Uppercase, strip, and remove the leading zeros SAP pads material numbers with.
+
+    MATNR is stored zero-padded to 18 characters, and whether a report exports the
+    padded or the unpadded form is a property of the report, not of the material. One
+    extract says `000000000007100017` and the next says `7100017` for the same item, so
+    every join between them silently matches nothing — which is not an error anywhere,
+    just an empty result: no lead time, no unit cost, no safety stock, and a should-be
+    inventory of zero across the whole catalogue.
+
+    Only an all-digit value is unpadded. `4190-6002`, `ULFMCV224151` and
+    `SERVICE_BSINES_SUP` keep their exact form, because a leading zero in a
+    non-numeric code can be significant.
+    """
+    if series.dtype != object and not pd.api.types.is_string_dtype(series):
+        return series
+    cleaned = series.astype("string").str.strip().str.upper()
+    numeric = cleaned.str.fullmatch(r"0*\d+").fillna(False)
+    # `.str.lstrip("0")` would turn "000" into "", so restore a bare zero.
+    unpadded = cleaned.str.lstrip("0").replace("", "0")
+    return cleaned.where(~numeric, unpadded)
+
+
 @dataclass
 class Adapter:
     """A frozen, versioned mapping from one source format to one contract."""
@@ -360,6 +384,10 @@ class Adapter:
                     series = series.str.lower().str.strip() if series.dtype == object else series
                 elif spec.normalize == "strip":
                     series = series.str.strip() if series.dtype == object else series
+                elif spec.normalize == "material_number":
+                    series = _normalize_material(series)
+                    log.append(TransformStep(col, "normalized",
+                                             "material number (leading zeros removed)"))
                 df[col] = series
 
         return df

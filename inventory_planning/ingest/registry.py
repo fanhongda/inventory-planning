@@ -531,6 +531,35 @@ class AdapterRegistry:
         """
         declared = contract.grain
         key_fields = [k for k in contract.natural_key if k in column_map]
+
+        # A natural key that loses its time dimension stops being a key. Where the
+        # contract names a timestamp among its key fields and *that* column is absent,
+        # any other mapped timestamp stands in for it — two lines for one SKU on
+        # different dates are different rows, not a duplicate to be summed away.
+        #
+        # Without this, a sales history exporting an invoice date but no order number
+        # and no ship date keys on `sku` alone: 540 transaction lines "collapse" to 30,
+        # the rollup sums the quantities, `demand_date` takes the first value, and the
+        # entire demand history becomes a single period. Nothing errors — the forecast
+        # simply has one point per SKU to work from.
+        if not any(contract.field(k) and contract.field(k).role == "timestamp"
+                   for k in key_fields):
+            wanted = [k for k in contract.natural_key
+                      if contract.field(k) and contract.field(k).role == "timestamp"]
+            if wanted:
+                stand_in = next(
+                    (name for name, spec in contract.fields.items()
+                     if spec.role == "timestamp" and name in column_map),
+                    None,
+                )
+                if stand_in:
+                    key_fields = key_fields + [stand_in]
+                    notes.append(
+                        f"Natural key {contract.natural_key} needs a timestamp and "
+                        f"{wanted} did not map; using {stand_in} so the grain keeps its "
+                        f"time dimension."
+                    )
+
         if raw is None or not key_fields or len(raw) == 0:
             return declared, None
 

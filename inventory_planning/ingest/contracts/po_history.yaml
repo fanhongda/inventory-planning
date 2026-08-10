@@ -12,6 +12,16 @@ discriminator: "not_null(receive_date)"
 natural_key: [po_number, sku, receive_date]
 capabilities: [lead_time_signal, order_pattern_signal, cost_signal]
 
+# A capability is only real if the field behind it arrived. An SAP purchase-record
+# extract with no goods-receipt date is a perfectly good record of *what was ordered,
+# how often and how much* — the ordering-pattern signal — but it cannot say how long
+# anything took. Claiming lead_time_signal from it would let the run report a measured
+# lead time it never measured, and quietly suppress the item-master fallback that
+# should have covered for it.
+capability_requires:
+  lead_time_signal: [lead_time_days]
+  cost_signal: [unit_cost]
+
 fields:
 
   sku:
@@ -60,11 +70,15 @@ fields:
     type: decimal
     unit: days
     role: measure
-    required: true
     description: >
       Realised lead time. Derived from the two dates when both exist, otherwise taken
       from a pre-computed column — some ERP extracts ship the LT and not the receipt
       date, and previously that path needed a special case in the reader.
+
+      Not required. A purchase-record extract with neither a receipt date nor a
+      pre-computed LT is still a valid record of ordering behaviour, and making this
+      mandatory rejected exactly that file — which then got misrouted to open_po and
+      concatenated into the inbound supply, inflating the position.
     aliases: [lead time, lead time days, lt, lt days, actual lead time,
               delivery lead time, procurement lead time, cycle time]
     derivable_from:
@@ -85,7 +99,8 @@ fields:
     description: >
       Quantity ordered. Doubles as the order-size sample for EOQ conformance —
       the distribution of these values reveals whether any lot-sizing policy exists.
-    aliases: [po qty, po quantity, order qty, ordered qty, ordered quantity,
+    aliases: [po qty, po quantity, order quantity, purchase order quantity,
+              order qty, ordered qty, ordered quantity,
               quantity, qty, received qty, receipt qty, delivered qty]
     assertions:
       - expr: "po_qty > 0"

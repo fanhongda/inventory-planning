@@ -218,6 +218,8 @@ class IntakePlan:
     resolved: Dict[str, ResolvedCapability] = dc_field(default_factory=dict)
     documents: Dict[str, str] = dc_field(default_factory=dict)   # doc_type -> source name
     unrecognised: List[str] = dc_field(default_factory=list)
+    # (doc_type, capability) a document declares but cannot supply from this extract.
+    withheld: List[tuple] = dc_field(default_factory=list)
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
@@ -278,6 +280,13 @@ class IntakePlan:
                        f"fallback: {entry.capability.fallback}"
                 lines.append(f"    {mark} {name:<20} {tail}")
 
+        if self.withheld:
+            lines.append("")
+            lines.append("  Declared but not supplied by this extract:")
+            for doc_type, cap_name in self.withheld:
+                lines.append(f"    {doc_type} carries no data for {cap_name} — "
+                             f"the field behind it is empty in this file")
+
         if self.degradations:
             lines.append("")
             lines.append("  What this run cannot tell you:")
@@ -314,7 +323,12 @@ class IntakePlan:
 class CapabilityResolver:
     """Turns a set of identified documents into an IntakePlan."""
 
-    def resolve(self, documents: Dict[str, str], unrecognised: List[str] = None) -> IntakePlan:
+    def resolve(
+        self,
+        documents: Dict[str, str],
+        unrecognised: List[str] = None,
+        withheld: Dict[str, Set[str]] = None,
+    ) -> IntakePlan:
         """
         `documents` maps doc_type -> source name, as produced by routing.
 
@@ -322,18 +336,33 @@ class CapabilityResolver:
         capability declares — so demand_timeseries outranks sales_history, because a
         planner who pre-aggregated the demand has already made that judgement and the
         pipeline should not silently prefer its own bucketing over theirs.
+
+        `withheld` maps doc_type -> capabilities that document declares but cannot
+        actually supply, because the fields behind them arrived empty. A purchase
+        history with no goods-receipt date is the case this exists for: it is a real
+        record of ordering behaviour and no record of lead time at all. Counting it as
+        a lead-time source would report a measured lead time that was never measured,
+        and suppress the item-master fallback that should have covered for it.
         """
+        withheld = withheld or {}
         plan = IntakePlan(documents=dict(documents), unrecognised=list(unrecognised or []))
-        present: Set[str] = set(documents)
 
         for name, cap in CAPABILITIES.items():
-            supplier = next((s for s in cap.suppliers if s in present), None)
+            supplier = next(
+                (s for s in cap.suppliers
+                 if s in documents and name not in withheld.get(s, set())),
+                None,
+            )
             plan.resolved[name] = ResolvedCapability(
                 capability=cap,
                 satisfied=supplier is not None,
                 supplied_by=supplier,
                 source_name=documents.get(supplier) if supplier else None,
             )
+
+        for doc_type, caps in sorted(withheld.items()):
+            for cap_name in sorted(caps):
+                plan.withheld.append((doc_type, cap_name))
         return plan
 
     @staticmethod

@@ -6,15 +6,16 @@ description: >
   is different in every system.
 grain: po_line
 
-# Mirror of po_history's, in the same order. An open PO is one with quantity still
-# outstanding; failing that, one with no receipt against it.
+# The document this can be confused with is po_history, and the axis between them is
+# whether the line has been received.
 #
-# This was `is_null(receive_date) or open_qty > 0`, a single expression that needed
-# both columns to be evaluable at all — and whose `or` read a fully-received line as
-# open whenever any quantity remained elsewhere.
-discriminator:
-  - "open_qty > 0"
-  - "is_null(receive_date)"
+# Two earlier attempts failed. `is_null(receive_date) or open_qty > 0` was one
+# expression needing both columns to be evaluable at all, and its `or` read a
+# fully-received line as open. Splitting it and putting `open_qty > 0` first was
+# worse: an open *sales* order also has quantity outstanding, so it read as evidence
+# of being a purchase order when it is evidence of nothing of the kind, and a
+# sales-order export started routing here.
+discriminator: "is_null(receive_date)"
 natural_key: [po_number, sku]
 capabilities: [inbound_signal, order_pattern_signal]
 

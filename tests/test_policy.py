@@ -90,7 +90,8 @@ class TestPlanningParameters:
             "## Conventions\n```yaml\ncycle_stock_basis: peak\n"
             "safety_stock_exposure: review_plus_lt\npipeline_basis: none\n```\n"
             "## Rules\n### R-001 · no reason\n```yaml\nscope: abc_class == \"A\"\n"
-            "set:\n  review_period_days: 7\n```\n"
+            "set:\n  review_period_days: 7\n```\n",
+            encoding="utf-8",
         )
         with pytest.raises(ValueError, match="rationale"):
             PlanningParameters(tmp_path / "p.md")
@@ -405,7 +406,7 @@ class TestDecisionLog:
         path = tmp_path / "d.jsonl"
         log = DecisionLog(path)
         log.record(Decision.create("run-1", "stop_buying", "Stop", ACCEPTED, sku="A-1"))
-        with path.open("a") as fh:
+        with path.open("a", encoding="utf-8") as fh:
             fh.write("{truncated write\n")
         log.record(Decision.create("run-2", "stop_buying", "Stop", ACCEPTED, sku="A-2"))
         assert len(log.load()) == 2

@@ -163,7 +163,7 @@ class Adapter:
     @classmethod
     def load(cls, path: Path) -> "Adapter":
         path = Path(path)
-        raw = yaml.safe_load(path.read_text())
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         return cls.parse(raw, source_path=path)
 
     @classmethod

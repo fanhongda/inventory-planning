@@ -95,7 +95,7 @@ class AdapterRegistry:
         folder = self.adapters_dir / f"{adapter.tenant}__{adapter.system}"
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"{adapter.doc_type}.v{adapter.version}.yaml"
-        path.write_text(adapter.to_yaml())
+        path.write_text(adapter.to_yaml(), encoding="utf-8")
         adapter.source_path = path
         if adapter not in self._adapters:
             self._adapters.append(adapter)
@@ -208,10 +208,24 @@ class AdapterRegistry:
             breadth = len(hit_fields) / max(len(contract.fields), 1)
             # Required coverage dominates; breadth only breaks ties between documents
             # that share an identifier vocabulary (every doc has `sku`).
-            scores[doc_type] = 0.75 * req_score + 0.25 * breadth
+            score = 0.75 * req_score + 0.25 * breadth
+
+            # A contract that declares what makes it itself, and finds none of it, is
+            # not a weak match — it is the wrong document. Without this a contract
+            # requiring only `sku` scores a full 0.75 on any file with an item column
+            # and outranks the one that genuinely fits.
+            missing_identity = [
+                group for group in contract.identifying_any
+                if not (set(group) & hit_fields)
+            ]
+            if missing_identity:
+                score = 0.0
+
+            scores[doc_type] = score
             details[doc_type] = (
                 f"{len(covered_required)}/{len(required)} required, "
                 f"{len(hit_fields)}/{len(contract.fields)} fields"
+                + (f"; carries none of {missing_identity[0]}" if missing_identity else "")
             )
 
         if not scores:

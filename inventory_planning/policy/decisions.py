@@ -152,7 +152,7 @@ class DecisionLog:
 
     def record(self, decision: Decision) -> Decision:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a") as fh:
+        with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(asdict(decision), ensure_ascii=False) + "\n")
         return decision
 
@@ -167,7 +167,7 @@ class DecisionLog:
         if not self.path.exists():
             return pd.DataFrame(columns=[f.name for f in Decision.__dataclass_fields__.values()])
         rows = []
-        for line in self.path.read_text().splitlines():
+        for line in self.path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue

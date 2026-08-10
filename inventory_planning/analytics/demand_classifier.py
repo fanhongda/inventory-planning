@@ -19,7 +19,7 @@ import numpy as np
 class DemandClassifier:
 
     def __init__(self, config_dir: Path):
-        cfg = json.loads((config_dir / "stocking_policy.json").read_text())
+        cfg = json.loads((config_dir / "stocking_policy.json").read_text(encoding="utf-8"))
         self.tiers = cfg["stocking_tiers"]
         self.cycles_per_year = cfg["cycles_per_year"]
         self.rolling_cycles = cfg["demand_rolling_cycles"]

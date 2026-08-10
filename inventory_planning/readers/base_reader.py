@@ -86,7 +86,7 @@ class BaseReader(ABC):
     def _load_node_config(self) -> str:
         cfg = self.config_dir / "node_config.json"
         if cfg.exists():
-            return json.loads(cfg.read_text()).get("location_id", "DC-01")
+            return json.loads(cfg.read_text(encoding="utf-8")).get("location_id", "DC-01")
         return "DC-01"
 
     def read(self, path: Union[str, Path], interactive: bool = True) -> Tuple[pd.DataFrame, Dict]:

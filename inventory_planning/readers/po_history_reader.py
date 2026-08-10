@@ -17,7 +17,7 @@ class POHistoryReader(BaseReader):
     def _load_supplier_incoterms(self) -> dict:
         cfg = self.config_dir / "supplier_incoterm.json"
         if cfg.exists():
-            data = json.loads(cfg.read_text())
+            data = json.loads(cfg.read_text(encoding="utf-8"))
             return data.get("suppliers", {}), data.get("default", "FOB")
         return {}, "FOB"
 

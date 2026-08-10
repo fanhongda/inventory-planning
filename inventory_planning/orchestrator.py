@@ -52,7 +52,7 @@ class InventoryPlanner:
         self.ts_reader      = TimeSeriesReader(self.config_dir)
 
         # Analytics
-        policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text())
+        policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text(encoding="utf-8"))
         self.policy_cfg    = policy_cfg
         self.backlog_horizon_days = int(policy_cfg.get("backlog_horizon_days", 30))
         self.classifier    = DemandClassifier(self.config_dir)
@@ -625,7 +625,7 @@ class InventoryPlanner:
 
         # Save planning snapshot for next-month feedback comparison
         try:
-            policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text())
+            policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text(encoding="utf-8"))
             snapshot_path = SnapshotSaver().save(results, policy_cfg, out)
             print(f"  Snapshot saved:   {snapshot_path.name}")
         except Exception as e:

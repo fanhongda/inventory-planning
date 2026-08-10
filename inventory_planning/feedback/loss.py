@@ -42,7 +42,7 @@ class LossCalculator:
 
     def __init__(self, snapshot_path: str | Path):
         self.path = Path(snapshot_path)
-        with open(self.path) as f:
+        with open(self.path, encoding="utf-8") as f:
             self.snapshot = json.load(f)
         # history dir = parent of this snapshot's month folder
         self.history_dir = self.path.parent.parent
@@ -106,7 +106,8 @@ class LossCalculator:
         # Write back
         self.snapshot["loss"] = agg
         self.snapshot["loss_detail"] = detail_df.to_dict(orient="records")
-        self.path.write_text(json.dumps(self.snapshot, indent=2, ensure_ascii=False))
+        self.path.write_text(json.dumps(self.snapshot, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
 
         self._print_report(agg)
         return {"aggregate": agg, "detail": detail_df}
@@ -200,7 +201,7 @@ class LossCalculator:
             if month_label >= current_month:   # exclude current month
                 continue
             for snap_file in sorted(month_dir.glob("snapshot_*.json")):
-                with open(snap_file) as f:
+                with open(snap_file, encoding="utf-8") as f:
                     snap = json.load(f)
                 if snap.get("actuals"):   # only snapshots with actuals recorded
                     df = self._compute_monthly_loss(snap)

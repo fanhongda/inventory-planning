@@ -54,7 +54,7 @@ class IngestBridge:
     def _load_location_id(self) -> str:
         cfg = self.config_dir / "node_config.json"
         if cfg.exists():
-            return json.loads(cfg.read_text()).get("location_id", "DC-01")
+            return json.loads(cfg.read_text(encoding="utf-8")).get("location_id", "DC-01")
         return "DC-01"
 
     # ── Public API ───────────────────────────────────────────────────────────

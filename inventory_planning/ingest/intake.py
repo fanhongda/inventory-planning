@@ -195,6 +195,24 @@ class IntakeResult:
             )
         for name, reason in self.failures:
             lines.append(f"  {'(failed)':<20} {'':>7}        {reason}  <- {name}")
+
+        # A misroute passes every contract test — the numbers are computed correctly
+        # from the wrong premise — so `OK` on the line above is not evidence that the
+        # file is what the router thinks. Where the margin was thin, say so here rather
+        # than only inside the routing reason nobody reads.
+        uncertain = [
+            doc for doc in self.documents.values()
+            if doc.route.confidence < 0.75 or "close call" in (doc.route.reason or "")
+        ]
+        if uncertain:
+            lines.append("")
+            lines.append("  ⚠ Routed on a thin margin — confirm before trusting the run:")
+            for doc in sorted(uncertain, key=lambda d: d.route.confidence):
+                lines.append(f"      {doc.source_name} -> {doc.doc_type} "
+                             f"({doc.route.confidence:.0%})")
+            lines.append("      python -m inventory_planning.explain <file>   "
+                         "shows what each contract scored and why")
+
         lines.append("")
         lines.append(self.plan.summary())
 

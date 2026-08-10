@@ -248,7 +248,7 @@ class LeadTimeDriftTracker:
         for month_dir in sorted(p for p in history_dir.iterdir() if p.is_dir()):
             for snap_file in sorted(month_dir.glob("snapshot_*.json"), reverse=True):
                 try:
-                    snap = json.loads(snap_file.read_text())
+                    snap = json.loads(snap_file.read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, OSError):
                     continue
                 entries = {

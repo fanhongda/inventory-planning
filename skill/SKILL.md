@@ -110,6 +110,13 @@ with whatever it was shown. Say this if the user asks why their safety stock did
 
 Accepts CSV or Excel (.xlsx / .xls / .xlsm).
 
+**If the intake summary shows a file on the wrong doc_type**, or prints `⚠ Routed on a
+thin margin`, run `python -m inventory_planning.explain <file-or-folder>` and relay the
+per-contract breakdown. A misroute passes every contract test — the arithmetic is
+correct on the wrong premise — so `OK` in the summary is not evidence the file is what
+the router thinks. Check the routing line before anything else; a PO history filed as
+an open PO silently removes the measured lead time.
+
 ---
 
 ## Step-by-step execution

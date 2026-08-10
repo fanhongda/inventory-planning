@@ -111,8 +111,8 @@ class InventoryReader(BaseReader):
     def __init__(self, config_dir=None):
         super().__init__(config_dir)
         cfg = self.config_dir / "incoterm_rules.json"
-        self.incoterm_rules = json.loads(cfg.read_text())["rules"]
-        self.default_incoterm = json.loads(cfg.read_text()).get("default_incoterm", "FOB")
+        self.incoterm_rules = json.loads(cfg.read_text(encoding="utf-8"))["rules"]
+        self.default_incoterm = json.loads(cfg.read_text(encoding="utf-8")).get("default_incoterm", "FOB")
 
     def _post_process(self, df: pd.DataFrame) -> pd.DataFrame:
         # Blank on-hand = zero stock (not truly missing — ERP omits 0s)

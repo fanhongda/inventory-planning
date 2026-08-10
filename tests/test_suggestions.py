@@ -176,7 +176,7 @@ class TestRulesMarkdown:
         The whole point of the format. Generated rules are pasted into the parameter
         file, so they must survive a round trip through its parser unchanged.
         """
-        source = (CONFIG_DIR / "planning_parameters.md").read_text()
+        source = (CONFIG_DIR / "planning_parameters.md").read_text(encoding="utf-8")
         # Keep the conventions/defaults the parser requires, drop the rules in force,
         # and append the suggested ones in their place.
         head = source.split("## 覆盖规则")[0]
@@ -185,7 +185,7 @@ class TestRulesMarkdown:
         suggested_blocks = suggested_blocks.split("## 逐 SKU 数值")[0]
 
         merged = tmp_path / "merged.md"
-        merged.write_text(head + "## 覆盖规则 (Rules)\n" + suggested_blocks)
+        merged.write_text(head + "## 覆盖规则 (Rules)\n" + suggested_blocks, encoding="utf-8")
 
         reloaded = PlanningParameters(merged)
         assert [r.rule_id for r in reloaded.rules] == [r.rule_id for r in SUGGESTION_RULES]
@@ -196,13 +196,13 @@ class TestRulesMarkdown:
 
     def test_reparsed_rules_select_the_same_skus(self, suggestions, resolved, tmp_path):
         """Parsing must preserve meaning, not just syntax."""
-        source = (CONFIG_DIR / "planning_parameters.md").read_text()
+        source = (CONFIG_DIR / "planning_parameters.md").read_text(encoding="utf-8")
         head = source.split("## 覆盖规则")[0]
         blocks = (suggestions.to_rules_markdown()
                   .split("## 建议规则 (Suggested rules)")[1]
                   .split("## 逐 SKU 数值")[0])
         merged = tmp_path / "merged.md"
-        merged.write_text(head + "## 覆盖规则 (Rules)\n" + blocks)
+        merged.write_text(head + "## 覆盖规则 (Rules)\n" + blocks, encoding="utf-8")
 
         reparsed = PlanningParameters(merged).resolve(resolved.frame)
         rebuilt = reparsed.frame.set_index("sku")
@@ -213,7 +213,7 @@ class TestRulesMarkdown:
     def test_file_is_written_and_names_the_hit_counts(self, suggestions, tmp_path):
         path = tmp_path / "suggested_rules.md"
         suggestions.to_rules_markdown(path)
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         assert "Nothing here is in force" in text
         assert "Matched **1 SKUs**" in text
 

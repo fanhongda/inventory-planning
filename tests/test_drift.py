@@ -43,7 +43,7 @@ def _snapshot(tmp_path, month: str, entries: dict, run: str = "01_0900") -> Path
         },
     }
     path = folder / f"snapshot_{month.replace('-', '')}{run}.json"
-    path.write_text(json.dumps(payload))
+    path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
 
@@ -92,7 +92,7 @@ class TestSnapshotRecordsLeadTime:
 
     def _saved(self, results, tmp_path):
         path = SnapshotSaver().save(results, {}, tmp_path / "output")
-        return json.loads(path.read_text())["skus"]
+        return json.loads(path.read_text(encoding="utf-8"))["skus"]
 
     def test_lead_time_is_recorded(self, results, tmp_path):
         assert self._saved(results, tmp_path)["A-1"]["lead_time_days"] == 45.0
@@ -229,7 +229,8 @@ class TestDriftDetection:
         folder = tmp_path / "history" / "2026-04"
         folder.mkdir(parents=True)
         (folder / "snapshot_20260401_0900.json").write_text(
-            json.dumps({"planning_month": "2026-04", "skus": {"S1": {"safety_stock": 10}}})
+            json.dumps({"planning_month": "2026-04", "skus": {"S1": {"safety_stock": 10}}}),
+            encoding="utf-8",
         )
         _snapshot(tmp_path, "2026-05", {"S1": (45.0, "measured", 8)})
         _snapshot(tmp_path, "2026-08", {"S1": (62.0, "measured", 8)})
@@ -241,7 +242,7 @@ class TestDriftDetection:
     def test_malformed_snapshot_does_not_abort_the_read(self, tmp_path):
         folder = tmp_path / "history" / "2026-04"
         folder.mkdir(parents=True)
-        (folder / "snapshot_20260401_0900.json").write_text("{ not json")
+        (folder / "snapshot_20260401_0900.json").write_text("{ not json", encoding="utf-8")
         _snapshot(tmp_path, "2026-05", {"S1": (45.0, "measured", 8)})
         _snapshot(tmp_path, "2026-08", {"S1": (62.0, "measured", 8)})
         assert len(LeadTimeDriftTracker().track(tmp_path / "history").moves) == 1

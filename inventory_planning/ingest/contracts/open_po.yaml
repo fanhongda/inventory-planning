@@ -6,8 +6,15 @@ description: >
   is different in every system.
 grain: po_line
 
-# An open PO has not been received. Mirror of po_history's discriminator.
-discriminator: "is_null(receive_date) or open_qty > 0"
+# Mirror of po_history's, in the same order. An open PO is one with quantity still
+# outstanding; failing that, one with no receipt against it.
+#
+# This was `is_null(receive_date) or open_qty > 0`, a single expression that needed
+# both columns to be evaluable at all — and whose `or` read a fully-received line as
+# open whenever any quantity remained elsewhere.
+discriminator:
+  - "open_qty > 0"
+  - "is_null(receive_date)"
 natural_key: [po_number, sku]
 capabilities: [inbound_signal, order_pattern_signal]
 

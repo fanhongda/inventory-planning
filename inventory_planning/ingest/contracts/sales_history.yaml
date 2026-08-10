@@ -9,6 +9,14 @@ grain: sales_order_line
 # Sales history is what actually shipped. The mirror of open_so's discriminator, for
 # the case where both documents come from the same ERP report under different filters.
 discriminator: "not_null(ship_date)"
+
+# A sales history has to have a customer side to it. Without one of these it is a
+# record of *movement*, and inbound movement looks identical: an SAP goods-receipt
+# report carries a material, a posting date and a quantity, which satisfies every
+# required field here and scored 85% against this contract while the purchase
+# history it actually was scored 68%.
+identifying_any:
+  - [customer, so_number, ship_date, customer_request_date, amount, unit_price]
 natural_key: [so_number, sku, ship_date]
 capabilities: [demand_signal, customer_dimension, revenue_dimension]
 

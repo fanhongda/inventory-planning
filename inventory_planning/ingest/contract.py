@@ -187,6 +187,9 @@ class DocContract:
     # history — has byte-identical columns, so no header-based rule can separate them;
     # only what is *in* the rows can.
     discriminator: Optional[str] = None
+    # Every content test in declaration order; `discriminator` is the first of them,
+    # kept as a scalar for callers that only ask whether the contract has one.
+    discriminators: List[str] = dc_field(default_factory=list)
     # Groups of fields of which at least one must be present for the document to be
     # this document at all. `required` cannot express it: an item master's identity
     # rests on carrying *some* planning parameter — a lead time or an MOQ or an order
@@ -223,9 +226,20 @@ class DocContract:
         for filt in default_filters:
             Expression(filt)   # validate at load
 
-        discriminator = raw.get("discriminator")
-        if discriminator:
-            Expression(str(discriminator))
+        # One or several content tests, tried in order. A single expression cannot
+        # cover both shapes of the same document: an expression is only evaluable when
+        # *every* column it names is present, so `not_null(receive_date) or
+        # open_qty == 0` is skipped entirely by a file carrying just one of them.
+        # A list lets the strongest available signal decide instead of none.
+        raw_disc = raw.get("discriminator")
+        discriminators = (
+            [] if raw_disc is None
+            else [str(d) for d in raw_disc] if isinstance(raw_disc, list)
+            else [str(raw_disc)]
+        )
+        for expr_src in discriminators:
+            Expression(expr_src)
+        discriminator = discriminators[0] if discriminators else None
 
         capability_requires = {
             cap: list(fields or [])
@@ -259,6 +273,7 @@ class DocContract:
             capabilities=list(raw.get("capabilities", []) or []),
             default_filters=default_filters,
             discriminator=str(discriminator) if discriminator else None,
+            discriminators=discriminators,
             identifying_any=identifying_any,
             capability_requires=capability_requires,
             source_path=source_path,

@@ -287,23 +287,39 @@ class AdapterRegistry:
             # order, yet the normal mapping skips empty columns — so without this the
             # one signal that settles the question is the one thing invisible to it.
             column_map = self._assign_columns(profile, contract, include_empty=True)
-            expr = Expression(contract.discriminator)
-
-            # The referenced column must genuinely exist in the source. Substituting
-            # NaN for an absent column makes `is_null(...)` vacuously true, and a
-            # sales export would then score 100% as an open PO purely by having no
-            # receipt-date column at all — absence of evidence read as evidence.
-            if not expr.columns <= set(column_map):
-                continue
-
             renamed = df.rename(columns={v: k for k, v in column_map.items()})
-            try:
-                mask = expr.evaluate(renamed)
-            except (ExpressionError, TypeError, ValueError):
-                continue
-            if not isinstance(mask, pd.Series):
-                continue
-            shares[doc_type] = float(mask.fillna(False).astype(bool).mean())
+            # The most decisive content signals are usually on a field the export does
+            # not carry directly. `open_qty` is the case in point: a purchase extract
+            # showing ordered and received quantities says plainly that its lines are
+            # closed, but only once the outstanding balance is worked out. Leaving it
+            # underivable here made "nothing is open, so this is history" unusable on
+            # exactly the files that need it.
+            available = set(column_map)
+            renamed, derived = self._derive_for_discriminator(renamed, contract, available)
+            available |= derived
+
+            # Tests are tried in declaration order and the first *applicable* one
+            # decides. A contract can therefore state its strongest signal and a
+            # weaker fallback — "has a goods receipt", else "nothing left open" —
+            # instead of one expression that is skipped whenever any column it names
+            # is absent.
+            for source in (contract.discriminators or [contract.discriminator]):
+                expr = Expression(source)
+                # The referenced column must genuinely exist in the source.
+                # Substituting NaN for an absent column makes `is_null(...)` vacuously
+                # true, and a sales export would then score 100% as an open PO purely
+                # by having no receipt-date column at all — absence of evidence read
+                # as evidence.
+                if not expr.columns <= available:
+                    continue
+                try:
+                    mask = expr.evaluate(renamed)
+                except (ExpressionError, TypeError, ValueError):
+                    continue
+                if not isinstance(mask, pd.Series):
+                    continue
+                shares[doc_type] = float(mask.fillna(False).astype(bool).mean())
+                break
 
         if not shares:
             return None
@@ -325,6 +341,50 @@ class AdapterRegistry:
         if top - second < 0.30:
             return None
         return winner, top, runner_up, second
+
+    @staticmethod
+    def _derive_for_discriminator(frame, contract: DocContract, available: set):
+        """
+        Compute the derivable fields a content test needs, before evaluating it.
+
+        Only fields whose derivation inputs are all present are attempted, and a
+        failure is silent — this is a classification aid, not the transform, and the
+        adapter derives properly once the document type is settled.
+        """
+        wanted = {
+            f for source in (contract.discriminators or [contract.discriminator])
+            if source
+            for f in Expression(source).columns
+        } - available
+        derived = set()
+        for name in wanted:
+            spec = contract.field(name)
+            if spec is None or not spec.derivable_from:
+                continue
+            for source in spec.derivable_from:
+                expr = Expression(source)
+                if not expr.columns <= available:
+                    continue
+                # A single-column derivation is a fallback assumption, not a
+                # measurement: `open_qty` from `order_qty` alone just asserts that
+                # nothing was delivered. Fine when transforming a document already
+                # known to be an open PO, but as a content test it manufactures the
+                # very evidence it is being asked for — every order book would read
+                # as fully open.
+                if len(expr.columns) < 2:
+                    continue
+                try:
+                    numeric = frame[list(expr.columns)].apply(
+                        pd.to_numeric, errors="coerce"
+                    )
+                    value = expr.evaluate(frame.assign(**numeric))
+                except (ExpressionError, TypeError, ValueError, KeyError):
+                    continue
+                if isinstance(value, pd.Series):
+                    frame = frame.assign(**{name: value})
+                    derived.add(name)
+                    break
+        return frame, derived
 
     @staticmethod
     def _derivable_now(contract: DocContract, field_name: str, hit_fields: set) -> bool:

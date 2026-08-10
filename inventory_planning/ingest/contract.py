@@ -197,6 +197,9 @@ class DocContract:
     # the document that genuinely fits. That is how a sales-history export gets filed
     # as an item master, taking the demand signal with it.
     identifying_any: List[List[str]] = dc_field(default_factory=list)
+    # capability -> the fields that must actually carry data for the document to
+    # supply it. A contract lists what it *can* provide; this says when it does.
+    capability_requires: Dict[str, List[str]] = dc_field(default_factory=dict)
     source_path: Optional[Path] = None
 
     # ── Loading ──────────────────────────────────────────────────────────────
@@ -224,6 +227,18 @@ class DocContract:
         if discriminator:
             Expression(str(discriminator))
 
+        capability_requires = {
+            cap: list(fields or [])
+            for cap, fields in (raw.get("capability_requires", {}) or {}).items()
+        }
+        for cap, needed in capability_requires.items():
+            unknown = [f for f in needed if f not in fields]
+            if unknown:
+                raise ValueError(
+                    f"{raw['doc_type']}: capability_requires[{cap}] names field(s) the "
+                    f"contract does not define: {unknown}"
+                )
+
         identifying_any = [list(group) for group in (raw.get("identifying_any", []) or [])]
         for group in identifying_any:
             unknown = [f for f in group if f not in fields]
@@ -245,6 +260,7 @@ class DocContract:
             default_filters=default_filters,
             discriminator=str(discriminator) if discriminator else None,
             identifying_any=identifying_any,
+            capability_requires=capability_requires,
             source_path=source_path,
         )
 

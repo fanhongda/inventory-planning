@@ -37,6 +37,25 @@ def _unnamed_share(columns) -> float:
     return unnamed / len(columns)
 
 
+# Share of source headers two files must have in common before they can be treated as
+# partitions of one export. Set low enough to tolerate an extra column in one country's
+# tab, high enough that two different reports never qualify.
+_PARTITION_HEADER_SIMILARITY = 0.75
+
+
+def _same_layout(a: "LoadedDocument", b: "LoadedDocument") -> bool:
+    """Whether two frames came out of the same report, judged on their raw headers."""
+    pa, pb = a.route.profile, b.route.profile
+    if pa.header_hash and pa.header_hash == pb.header_hash:
+        return True
+    tokens_a = {c.name for c in pa.columns}
+    tokens_b = {c.name for c in pb.columns}
+    if not tokens_a or not tokens_b:
+        return False
+    overlap = len(tokens_a & tokens_b) / min(len(tokens_a), len(tokens_b))
+    return overlap >= _PARTITION_HEADER_SIMILARITY
+
+
 def is_tabular(df: pd.DataFrame) -> Tuple[bool, str]:
     """
     Whether a sheet is a data table at all.
@@ -313,16 +332,47 @@ class Intake:
                 claims.setdefault(doc.doc_type, []).append(doc)
 
         loaded: Dict[str, str] = {}
+        withheld: Dict[str, set] = {}
         for doc_type, docs in claims.items():
             chosen = self._resolve_claims(doc_type, docs, result)
             result.documents[doc_type] = chosen
             loaded[doc_type] = chosen.source_name
+            missing = self._unsupplied_capabilities(chosen, doc_type)
+            if missing:
+                withheld[doc_type] = missing
 
-        result.plan = self.resolver.resolve(loaded, unrecognised)
+        result.plan = self.resolver.resolve(loaded, unrecognised, withheld=withheld)
 
         if self.verbose:
             print(result.summary())
         return result
+
+    def _unsupplied_capabilities(self, doc: LoadedDocument, doc_type: str) -> set:
+        """
+        Capabilities the contract declares but this particular extract cannot back.
+
+        The contract says what a document type *can* provide; only the frame says what
+        arrived. An SAP purchase-record export with no goods-receipt date declares
+        `lead_time_signal` by virtue of being a po_history, and has not one lead time
+        in it. Left unchecked the plan reports the capability satisfied, the analytics
+        find nothing, and the item-master fallback that should have covered for it is
+        never consulted.
+        """
+        contract = self.contracts.get(doc_type)
+        if not contract.capability_requires:
+            return set()
+
+        missing = set()
+        for capability, needed in contract.capability_requires.items():
+            if capability not in contract.capabilities:
+                continue
+            has_data = any(
+                field in doc.frame.columns and doc.frame[field].notna().any()
+                for field in needed
+            )
+            if not has_data:
+                missing.add(capability)
+        return missing
 
     # ── Reconciling several claims on one document type ──────────────────────
 
@@ -349,16 +399,40 @@ class Intake:
         if len(groups) == 1 and len(groups[0]) > 1:
             return self._concatenate(groups[0], contract, result)
 
-        # Mixed or wholly duplicate: keep the fullest group, report the rest.
-        groups.sort(key=lambda g: -sum(d.row_count for d in g))
+        # Several groups: only one can be this document. Rank on how well each was
+        # identified before how big it is — a file routed here at 60% losing to one
+        # routed at 88% is the right outcome even when the weaker one has more rows,
+        # and row count alone would let a mis-identified extract displace the real
+        # thing purely by being longer.
+        def rank(group: List[LoadedDocument]):
+            return (max(d.route.confidence for d in group),
+                    sum(d.row_count for d in group))
+
+        groups.sort(key=rank, reverse=True)
         winner = self._concatenate(groups[0], contract, result) if len(groups[0]) > 1 else groups[0][0]
+
         for group in groups[1:]:
             for doc in group:
-                result.failures.append((
-                    doc.source_name,
-                    f"duplicate {doc_type} ({doc.row_count:,} rows); kept "
-                    f"{winner.source_name} ({winner.row_count:,} rows)"
-                ))
+                # Two files claiming one document type are not necessarily the same
+                # document twice. Where the layouts differ they are two different
+                # reports, at least one of which is routed wrongly — a materially
+                # different problem from a sample sitting beside a full export, and one
+                # the planner has to resolve rather than merely be told about.
+                same_shape = _same_layout(doc, winner)
+                if same_shape:
+                    detail = (f"duplicate {doc_type} ({doc.row_count:,} rows); kept "
+                              f"{winner.source_name} ({winner.row_count:,} rows)")
+                else:
+                    detail = (
+                        f"DROPPED — a different report also claimed {doc_type} and was "
+                        f"identified more confidently ({winner.source_name}, "
+                        f"{winner.route.confidence:.0%} vs {doc.route.confidence:.0%}). "
+                        f"Their columns differ, so they are two documents, not two parts "
+                        f"of one. Run `python -m inventory_planning.explain` on this file, "
+                        f"or force it with load_all(..., hints={{'{doc.source_name}': "
+                        f"'<doc_type>'}})"
+                    )
+                result.failures.append((doc.source_name, detail))
         return winner
 
     def _group_partitions(
@@ -391,11 +465,22 @@ class Intake:
         in two places, not the same row twice — so overlap would call a genuine
         partition a duplicate and silently drop a country.
 
-        Only across separate files, where provenance says nothing, does key overlap
-        decide: a sample and a full export share their keys, partitions do not.
+        Across separate files two things must hold. The layouts must match, and only
+        then does key overlap decide: a sample and a full export share their keys,
+        partitions do not.
+
+        The layout test is what stops two *different documents* being welded together.
+        A purchase-order history and an open-PO extract that both land on `open_po`
+        have barely-overlapping PO numbers, so key overlap alone reads them as a clean
+        partition and concatenates them — silently doubling the inbound quantity and
+        flattering the stock position into never needing to buy. Genuine partitions of
+        one export are produced by one report and carry the same columns; two different
+        reports do not.
         """
         if a.source_path == b.source_path and a.sheet_name != b.sheet_name:
             return True
+        if not _same_layout(a, b):
+            return False
         if not key or not len(a.frame) or not len(b.frame):
             return False
 

@@ -668,6 +668,25 @@ class AdapterRegistry:
                 continue
             column_map[canonical] = col_name
             taken_cols.add(col_name)
+
+        # A required field must not be starved by an optional one. Giving `Item` a home
+        # as a line number is right when `Material` is also present and wrong when it is
+        # the only identifier the file has — there the optional field takes the column
+        # and `sku` ends up unmapped, which is worse than the ambiguity it was added to
+        # resolve. Ranking required fields first instead would reintroduce the original
+        # bug, since `sku` would simply claim its highest-scoring candidate again.
+        for canonical, spec in contract.fields.items():
+            if not spec.required or canonical in column_map:
+                continue
+            for _score, field, col_name in candidates:
+                if field != canonical:
+                    continue
+                holder = next((f for f, c in column_map.items() if c == col_name), None)
+                if holder is None or contract.fields[holder].required:
+                    continue
+                del column_map[holder]
+                column_map[canonical] = col_name
+                break
         return column_map
 
     @staticmethod

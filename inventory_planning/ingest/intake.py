@@ -138,6 +138,41 @@ def load_file(path: Union[str, Path]) -> pd.DataFrame:
     raise ValueError(f"No tabular sheet found in {Path(path).name}")
 
 
+
+# At most this many columns per document are kept as possible item keys, and a column
+# needs at least this many distinct values to qualify. Both exist to bound the memory
+# a 127,000-row export would otherwise cost.
+_MAX_KEY_CANDIDATES = 12
+_MIN_KEY_DISTINCT = 10
+
+
+def _key_candidates(raw: pd.DataFrame, profile: TableProfile) -> Dict[str, set]:
+    """
+    Source columns that could be an item identifier, as normalized value sets.
+
+    Kept so that a document whose `sku` joins to nothing can be told which of its
+    other columns *would* have joined. That is the difference between a report full
+    of zeroes and a one-line answer: one planner master keyed on a local code in
+    `Material` while carrying the ERP number in `Alternate material`, and nothing in
+    the run could say so.
+    """
+    from .adapter import _normalize_material
+
+    ranked = sorted(
+        (c for c in profile.columns
+         if not c.is_period_column and c.distinct >= _MIN_KEY_DISTINCT),
+        key=lambda c: -c.distinct_rate,
+    )[:_MAX_KEY_CANDIDATES]
+
+    out: Dict[str, set] = {}
+    for col in ranked:
+        if col.name not in raw.columns:
+            continue
+        values = _normalize_material(raw[col.name].dropna().astype(str))
+        out[col.name] = set(values.dropna())
+    return out
+
+
 @dataclass
 class LoadedDocument:
     """One file, fully processed."""
@@ -150,6 +185,10 @@ class LoadedDocument:
     transform_log: List[TransformStep]
     test_report: ContractTestReport
     sheet_name: str = ""
+    # Normalized values of the source columns that could plausibly be an item key,
+    # kept so a document whose SKU joins to nothing can be told which of its other
+    # columns would have joined. Sets of strings, capped — not the frames.
+    key_candidates: Dict[str, set] = dc_field(default_factory=dict)
 
     @property
     def adapter(self) -> Adapter:
@@ -376,10 +415,72 @@ class Intake:
 
         result.plan = self.resolver.resolve(loaded, unrecognised, withheld=withheld)
         self._note_po_overlap(result)
+        self._check_sku_agreement(result)
 
         if self.verbose:
             print(result.summary())
         return result
+
+
+    # Below this share of its SKUs meeting any other document, a file is not joining.
+    _SKU_AGREEMENT_FLOOR = 0.20
+
+    @classmethod
+    def _check_sku_agreement(cls, result: IntakeResult) -> None:
+        """
+        Warn when a document's SKUs meet nothing else, and name the column that would.
+
+        Every join in the pipeline is on `sku`, and a key that matches nothing fails
+        in total silence: the merges return empty, safety stock falls to zero, annual
+        value is zero so every item lands in one ABC class, and the report is full of
+        confident zeroes with no error anywhere. Three separate causes produced exactly
+        that on one real dataset — a padded material number, a line number mapped as
+        the item, and a master keyed on a local code — and none of them was visible
+        until someone read the output and disbelieved it.
+
+        The suggestion is the useful half. Knowing that `sku` matches nothing is a
+        puzzle; knowing that `Alternate material` would have matched 82% is an answer.
+        """
+        keyed = {dt: doc for dt, doc in result.documents.items()
+                 if "sku" in doc.frame.columns and len(doc.frame)}
+        if len(keyed) < 2:
+            return
+
+        skus = {dt: set(doc.frame["sku"].dropna().astype(str)) for dt, doc in keyed.items()}
+        for doc_type, own in skus.items():
+            if len(own) < _MIN_KEY_DISTINCT:
+                continue
+            others = set().union(*(s for dt, s in skus.items() if dt != doc_type))
+            if not others:
+                continue
+            share = len(own & others) / len(own)
+            if share >= cls._SKU_AGREEMENT_FLOOR:
+                continue
+
+            doc = keyed[doc_type]
+            mapped = doc.route.adapter.column_map.get("sku", "?")
+            better = [
+                (len(values & others) / max(len(values), 1), name)
+                for name, values in doc.key_candidates.items()
+                if len(values) >= _MIN_KEY_DISTINCT
+            ]
+            best = max(better, default=(0.0, None))
+            lines = [
+                f"  ⚠ {doc_type} keys on something the other documents do not use.",
+                f"      {doc.source_name}: sku <- {mapped!r}, and only "
+                f"{share:.0%} of its {len(own):,} SKUs appear in any other file.",
+            ]
+            if best[1] and best[0] > max(share + 0.2, cls._SKU_AGREEMENT_FLOOR):
+                lines.append(
+                    f"      Column {best[1]!r} would match {best[0]:.0%}. If that is the "
+                    f"identifier the rest of the business uses, map sku to it in an "
+                    f"adapter for this export."
+                )
+            lines.append(
+                "      Every join downstream is on sku, so until this agrees the "
+                "numbers derived from it will be empty rather than wrong."
+            )
+            result.notes.append("\n".join(lines))
 
     @staticmethod
     def _note_po_overlap(result: IntakeResult) -> None:
@@ -645,6 +746,7 @@ class Intake:
             transform_log=log,
             test_report=report,
             sheet_name=sheet_name,
+            key_candidates=_key_candidates(raw, route.profile),
         )
 
     # ── Wide-format handling ─────────────────────────────────────────────────

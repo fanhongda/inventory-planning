@@ -18,6 +18,7 @@ LLM-drafted adapter reviewable instead of merely plausible.
 
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
@@ -132,6 +133,19 @@ class ParsingRules:
             na_values=list(raw.get("na_values", []) or
                            ["", "-", "N/A", "n/a", "NULL", "#N/A"]),
         )
+
+
+# A date is ISO when it starts `YYYY-MM-DD`. Checked on a sample rather than the whole
+# column: the question is which parser to use, and a column does not mix conventions.
+_ISO_PREFIX = re.compile(r"^\s*\d{4}-\d{2}-\d{2}")
+
+
+def _looks_iso(series: pd.Series, sample: int = 200) -> bool:
+    """Whether a text date column is in unambiguous ISO order."""
+    values = series.dropna().astype(str).head(sample)
+    if values.empty:
+        return False
+    return bool(values.str.match(_ISO_PREFIX).mean() > 0.95)
 
 
 def _normalize_material(series: pd.Series) -> pd.Series:
@@ -372,9 +386,18 @@ class Adapter:
                     warnings.simplefilter("ignore", UserWarning)
                     if p.date_format:
                         df[col] = pd.to_datetime(series, format=p.date_format, errors="coerce")
+                    elif _looks_iso(series):
+                        # An ISO date is unambiguous, and dayfirst actively destroys it:
+                        # pandas reads `2020-10-25` as year-day-month, month 25 is
+                        # invalid, and the value becomes NaT. Every date whose day
+                        # exceeds 12 dies that way — 60% of a column — which is how a
+                        # purchase history with no null dates at all arrived reporting
+                        # 59.9% null and lost 86% of its rows to "implausible lead time".
+                        df[col] = pd.to_datetime(series, errors="coerce", format="ISO8601")
                     else:
                         df[col] = pd.to_datetime(series, errors="coerce", dayfirst=p.dayfirst)
-                fmt = p.date_format or ("dayfirst" if p.dayfirst else "inferred")
+                fmt = (p.date_format or ("ISO8601" if _looks_iso(series)
+                                         else "dayfirst" if p.dayfirst else "inferred"))
                 log.append(TransformStep(col, "parsed", f"date ({fmt})"))
 
             else:

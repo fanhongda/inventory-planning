@@ -206,6 +206,32 @@ class IntakeResult:
     def blocking_failures(self) -> List[LoadedDocument]:
         return [d for d in self.documents.values() if not d.passed]
 
+    def unusable(self) -> List[Tuple[LoadedDocument, List[str]]]:
+        """
+        Documents missing a field the analytics will index by name, with the fields.
+
+        Not every failed test should stop a run. A semantic assertion — 8% of lead
+        times negative, a handful of negative quantities — is a data-quality finding
+        that the report is designed to carry, and stopping on it would make the
+        pipeline unusable on real exports. A *structurally* absent required field is
+        different in kind: nothing downstream guards against it, so the run does not
+        degrade, it raises `KeyError` several layers away from the cause.
+
+        That is what happened to a sales history whose date column matched no alias:
+        the contract test said so plainly, nothing consulted it, and the traceback
+        surfaced in `to_time_series` with no mention of the file it came from.
+        """
+        out = []
+        for doc in self.documents.values():
+            absent = [
+                r.name.split(":", 1)[1]
+                for r in doc.test_report.results
+                if not r.passed and r.name.startswith("required_field:")
+            ]
+            if absent:
+                out.append((doc, absent))
+        return out
+
     def summary(self) -> str:
         lines = ["", "=" * 62, "  DATA INTAKE", "=" * 62, ""]
         for doc in sorted(self.documents.values(), key=lambda d: d.doc_type):

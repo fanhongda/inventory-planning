@@ -28,8 +28,12 @@ kpi     = planner.run_kpi_review(policy, sales_df=inputs['sales_df'],
 reintroduce per-document loader calls. The legacy `load_sales_history()` style still
 works but requires the caller to know the answer already.
 
-Outputs land in `output_dir`: `kpi_review_*.html` is the two-chapter review,
-`inventory_report_*.html` is the older forecast-oriented report, plus CSVs.
+Outputs land in `output_dir`: `kpi_review_*.html` is the review, plus CSVs
+(`purchase_recommendations_*`, `parameter_suggestions_*`, `inventory_projection_*`,
+`forecast_detail_*`, `supplier_params`, `sku_planning_params`) and
+`suggested_rules_*.md`. There is no longer an `inventory_report_*.html` — the older
+forecast-oriented report was removed, and three skill evals went on asserting its
+existence for months afterwards.
 
 The review covers, in order: service (OTD split four ways, plus OTD by month), inventory
 against policy, ordering behaviour, replenishment cadence, forward risk, then the work

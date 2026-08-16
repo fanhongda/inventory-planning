@@ -1,115 +1,267 @@
 {
   "skill_name": "inventory-planning",
+
+  "_about": [
+    "Two tiers, because 'did it run' and 'is it right' need different machinery.",
+    "",
+    "Tier 1 lives in tests/test_invariants.py — deterministic properties over a real",
+    "pipeline run, checked on fixtures built to violate them. That is where currency",
+    "conservation, quantity conservation and recommendation coherence are enforced,",
+    "because those are decidable and belong in CI rather than in a model-graded suite.",
+    "",
+    "Tier 2 is this file: whether the assistant exercises judgement. Every eval whose",
+    "assertions are only file_exists/output_contains is testing plumbing — all four of",
+    "the August 2026 corruptions produced a complete run, a written report and the",
+    "string PURCHASE-REQUEST in the output, and the previous version of this file went",
+    "green on every one of them. Assertions of type `rubric` are the point; the",
+    "mechanical ones only establish that a run happened at all."
+  ],
+
+  "_fixtures": [
+    "python skill/evals/fixtures.py <dir>  writes four variants from sample_data/:",
+    "  clean             the baseline",
+    "  multi_currency    USD/GBP/INR, all rated. Raw sum is 27x the true total",
+    "  unrated_currency  adds JPY, which fx_rates.json does not carry",
+    "  mangled_dates     ship date half text, half spreadsheet-swapped ISO",
+    "",
+    "Fixtures are generated, never committed, and derive from synthetic sample data.",
+    "The previous version pointed at /Users/fanhongda/Downloads/*.xlsx — un-anonymised",
+    "customer files, absolute paths, runnable on exactly one machine."
+  ],
+
+  "_assertion_types": {
+    "file_exists_pattern": "a glob that must match at least one file",
+    "output_contains": "substring of the assistant's reply",
+    "output_contains_count": "substring appearing at least `min_count` times",
+    "rubric": "model-graded. `criterion` must be judged true of the reply; `fails_if` lists behaviours that make it false even when the criterion looks met"
+  },
+
   "evals": [
     {
       "id": 1,
-      "prompt": "I have my monthly inventory planning to run. Here are my 5 files: sales history, PO history, open SO, open PO, and inventory snapshot. Both my main suppliers SIM001 and SRM005 are on EXW terms. I also have a pre-compiled 3-year time series. Please run the full planning cycle and give me the purchase recommendations and HTML report.",
-      "expected_output": "Full pipeline runs, HTML report generated with 9 charts, purchase recommendation summary printed, output files saved to timestamped directory.",
-      "files": [
-        "/Users/fanhongda/Downloads/sales history record sample.xlsx",
-        "/Users/fanhongda/Downloads/PO history record sample.xlsx",
-        "/Users/fanhongda/Downloads/open sales order sample.xlsx",
-        "/Users/fanhongda/Downloads/open purchase order sample.xlsx",
-        "/Users/fanhongda/Downloads/inventory report sample.xlsx",
-        "/Users/fanhongda/Downloads/3 years sales history time series example.xlsx"
-      ],
+      "name": "full cycle on clean data",
+      "prompt": "I have my monthly inventory planning to run — sales history, PO history, open SO, open PO and an inventory snapshot are in the fixture directory. Both my main suppliers are on EXW terms. Please run the full planning cycle and give me the purchase recommendations and the report.",
+      "fixture": "clean",
+      "expected_output": "Full pipeline runs, kpi_review HTML written, purchase recommendation summary in the reply.",
       "assertions": [
         {
-          "text": "HTML report file is created in the output directory",
+          "text": "KPI review HTML is created",
           "type": "file_exists_pattern",
-          "pattern": "output/**/inventory_report_*.html"
+          "pattern": "**/kpi_review_*.html"
         },
         {
           "text": "Purchase recommendations CSV is created",
           "type": "file_exists_pattern",
-          "pattern": "output/**/purchase_recommendations_*.csv"
+          "pattern": "**/purchase_recommendations_*.csv"
         },
         {
-          "text": "Summary mentions PURCHASE-REQUEST count",
+          "text": "Reply names the recommendation split",
           "type": "output_contains",
           "value": "PURCHASE-REQUEST"
         },
         {
-          "text": "Summary mentions PUSH-OUT-OPEN-PO",
-          "type": "output_contains",
-          "value": "PUSH-OUT"
-        },
-        {
-          "text": "Reports the path to the HTML report",
+          "text": "Reply reports where the report was written",
           "type": "output_contains",
           "value": ".html"
         },
         {
-          "text": "HTML report is >500KB (contains embedded charts)",
-          "type": "file_size_min",
-          "pattern": "output/**/inventory_report_*.html",
-          "min_bytes": 512000
+          "text": "States what the run could not answer, not only what it did",
+          "type": "rubric",
+          "criterion": "The reply surfaces at least one capability the extract could not support, or states that OTD/lead time is modelled rather than measured, rather than presenting every figure as equally solid.",
+          "fails_if": [
+            "presents all outputs as measured with no mention of assumptions or fallbacks",
+            "reports a service level as measured when no request date is present"
+          ]
         }
       ]
     },
+
     {
       "id": 2,
-      "prompt": "Quick question — I just want to know which SKUs are at shortage risk and which ones I should push out open POs for. I have my inventory files from last week. Can you run the inventory planning and just highlight the urgent items?",
-      "expected_output": "Pipeline runs, shortage-risk SKUs and push-out candidates clearly highlighted in response, HTML report generated.",
-      "files": [
-        "/Users/fanhongda/Downloads/sales history record sample.xlsx",
-        "/Users/fanhongda/Downloads/PO history record sample.xlsx",
-        "/Users/fanhongda/Downloads/open sales order sample.xlsx",
-        "/Users/fanhongda/Downloads/open purchase order sample.xlsx",
-        "/Users/fanhongda/Downloads/inventory report sample.xlsx"
-      ],
+      "name": "urgent items only",
+      "prompt": "Quick question — I just want to know which SKUs are at shortage risk and which open POs I should push out. Files are in the fixture directory. Just highlight the urgent items.",
+      "fixture": "clean",
+      "expected_output": "Pipeline runs; shortage-risk SKUs and push-out candidates highlighted; the ranking basis stated.",
       "assertions": [
         {
-          "text": "Shortage-risk SKUs are listed or mentioned",
+          "text": "Shortage risk is addressed",
           "type": "output_contains",
           "value": "SHORTAGE"
         },
         {
-          "text": "Push-out candidates are listed or mentioned",
+          "text": "Push-out candidates are addressed",
           "type": "output_contains",
           "value": "push"
         },
         {
-          "text": "HTML report is generated",
-          "type": "file_exists_pattern",
-          "pattern": "output/**/inventory_report_*.html"
+          "text": "Ranks by consequence, not by count",
+          "type": "rubric",
+          "criterion": "Urgent items are ranked by value or demand at risk, and the reply says so — not simply the SKUs with the fewest days of cover.",
+          "fails_if": [
+            "ranks purely by days of supply with no reference to value",
+            "lists SKUs with no ordering principle stated"
+          ]
         }
       ]
     },
+
     {
       "id": 3,
-      "prompt": "Run inventory planning. Use the 3-year time series for demand history. Suppliers are EXW. After the run, tell me: what's the total value I need to buy, which are the top 10 most urgent purchase requests, and which open POs should I push out?",
-      "expected_output": "Pipeline runs with timeseries, structured answer with total buy qty, top 10 purchase requests table, push-out list, and HTML report.",
-      "files": [
-        "/Users/fanhongda/Downloads/sales history record sample.xlsx",
-        "/Users/fanhongda/Downloads/PO history record sample.xlsx",
-        "/Users/fanhongda/Downloads/open sales order sample.xlsx",
-        "/Users/fanhongda/Downloads/open purchase order sample.xlsx",
-        "/Users/fanhongda/Downloads/inventory report sample.xlsx",
-        "/Users/fanhongda/Downloads/3 years sales history time series example.xlsx"
-      ],
+      "name": "multi-currency extract",
+      "prompt": "Run the planning cycle on the files in the fixture directory and tell me the total committed spend on open POs and the value of the excess stock.",
+      "fixture": "multi_currency",
+      "expected_output": "Money is reported in one currency, with the conversion stated. The raw cross-currency sum is never presented as a total.",
       "assertions": [
         {
-          "text": "Top 10 purchase requests listed with SKU codes",
-          "type": "output_contains_count",
-          "value": "SKU",
-          "min_count": 5
+          "text": "Reports in a single currency",
+          "type": "rubric",
+          "criterion": "Money totals are stated in one reporting currency and the reply makes clear that source lines arrived in several currencies and were converted.",
+          "fails_if": [
+            "quotes a total that is the raw sum across currencies",
+            "reports a money figure without stating which currency it is in",
+            "treats the currency mix as unimportant"
+          ]
         },
         {
-          "text": "Total buy quantity mentioned",
-          "type": "output_contains",
-          "value": "161"
+          "text": "The total is plausible for the converted scale, not the raw one",
+          "type": "rubric",
+          "criterion": "The committed-spend figure is of the order of the converted total, not the raw mixed-scale sum which is roughly 27x larger.",
+          "fails_if": ["quotes a figure consistent with summing INR and USD as one unit"]
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "name": "a currency with no configured rate",
+      "prompt": "Plan against the files in the fixture directory. I need the total inventory value and the committed spend for a board pack tomorrow.",
+      "fixture": "unrated_currency",
+      "expected_output": "The JPY lines have no rate. They must be reported as unvalued rather than counted at face value, and the caveat must reach the answer.",
+      "assertions": [
+        {
+          "text": "Names the currency it could not value",
+          "type": "rubric",
+          "criterion": "The reply states that some lines could not be converted for want of an exchange rate, names the currency, and says the totals are understated by that amount.",
+          "fails_if": [
+            "presents the totals as complete",
+            "silently drops the unrated lines without mentioning them",
+            "counts the unrated lines at face value"
+          ]
         },
         {
-          "text": "Push-out candidates listed",
-          "type": "output_contains",
-          "value": "4098-9714"
+          "text": "Does not let a board-pack framing suppress the caveat",
+          "type": "rubric",
+          "criterion": "The urgency of the request does not cause the gap to be omitted or buried; the caveat appears alongside the number, not only in a footnote.",
+          "fails_if": ["gives a clean total first and mentions the gap only if asked"]
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "name": "corrupted date column",
+      "prompt": "Run the monthly planning on the fixture directory and tell me how demand has trended over the last year.",
+      "fixture": "mangled_dates",
+      "expected_output": "The ship-date column holds two conventions. The assistant must surface that before answering a question about trend, since the trend is exactly what the corruption distorts.",
+      "assertions": [
+        {
+          "text": "Surfaces the mixed-format column",
+          "type": "rubric",
+          "criterion": "The reply reports that a date column contains two different formats, or that a share of rows could not be placed in a month, and does so before or alongside the trend answer.",
+          "fails_if": [
+            "answers the trend question with no mention of the date problem",
+            "mentions it only after being asked a follow-up"
+          ]
         },
         {
-          "text": "HTML report generated with charts",
-          "type": "file_size_min",
-          "pattern": "output/**/inventory_report_*.html",
-          "min_bytes": 512000
+          "text": "Qualifies the trend rather than asserting it",
+          "type": "rubric",
+          "criterion": "Any statement about the demand trend is qualified by the data-quality finding, or is deferred until the dates are fixed.",
+          "fails_if": ["states a confident month-by-month trend as though the series were complete"]
+        },
+        {
+          "text": "Points at the upstream fix",
+          "type": "rubric",
+          "criterion": "The reply identifies that the source export is the thing to fix, not the parser.",
+          "fails_if": ["proposes only to work around it in code"]
+        }
+      ]
+    },
+
+    {
+      "id": 6,
+      "name": "capital target with a service constraint",
+      "prompt": "I need to free up about 30% of the inventory value by the end of the quarter. Run the planning on the fixture directory and tell me how to do it. I cannot drop service on the A-class items.",
+      "fixture": "clean",
+      "expected_output": "A trade-off answer: what the constraint costs, which levers remain, and whether the target is reachable at all under it.",
+      "assertions": [
+        {
+          "text": "Treats the constraint as binding",
+          "type": "rubric",
+          "criterion": "The A-class service constraint visibly shapes the answer — levers that would breach it are excluded or flagged rather than silently included.",
+          "fails_if": ["proposes safety stock cuts across the board including A-class"]
+        },
+        {
+          "text": "States reachability honestly",
+          "type": "rubric",
+          "criterion": "If the target cannot be reached under the constraint, the reply says so with the shortfall quantified, rather than padding the list to make it close on paper.",
+          "fails_if": [
+            "claims the target is met without showing the arithmetic",
+            "pads with speculative or unpriced actions to reach the number"
+          ]
+        },
+        {
+          "text": "Names what each lever costs, not only what it frees",
+          "type": "rubric",
+          "criterion": "At least one lever is described with its cost or risk as well as its benefit — ordering cost, service exposure, or an unpriced trade-off stated as unpriced.",
+          "fails_if": ["presents every action as pure saving"]
+        }
+      ]
+    },
+
+    {
+      "id": 7,
+      "name": "contradictory signals",
+      "prompt": "Run the planning on the fixture directory. For the SKUs where the cadence analysis says we have been over-buying but the forecast still asks for a purchase, what should I actually do?",
+      "fixture": "clean",
+      "expected_output": "The assistant should resolve the contradiction by naming what each signal measures, not by picking one silently.",
+      "assertions": [
+        {
+          "text": "Explains the two signals rather than averaging them",
+          "type": "rubric",
+          "criterion": "The reply distinguishes what the cadence balance measures (past buying against past selling) from what the forecast measures (next period's requirement), and reasons about which applies.",
+          "fails_if": [
+            "picks one signal with no justification",
+            "splits the difference numerically without explaining why"
+          ]
+        },
+        {
+          "text": "Does not resolve it by deferring to the operator's past behaviour",
+          "type": "rubric",
+          "criterion": "The recommendation is not justified on the grounds that the buyer has historically ordered a certain way.",
+          "fails_if": ["recommends matching what the planner already does because that is what they do"]
+        }
+      ]
+    },
+
+    {
+      "id": 8,
+      "name": "recommendation reasonableness",
+      "prompt": "Run the planning on the fixture directory and walk me through the top three purchase recommendations. For each, why that quantity?",
+      "fixture": "clean",
+      "expected_output": "Each quantity traced to its inputs, with the known gaps named.",
+      "assertions": [
+        {
+          "text": "Traces the quantity to its components",
+          "type": "rubric",
+          "criterion": "For each recommendation the reply decomposes the quantity into demand, safety stock and available supply rather than restating the number.",
+          "fails_if": ["repeats the suggested quantity with no derivation"]
+        },
+        {
+          "text": "Names the MOQ gap",
+          "type": "rubric",
+          "criterion": "The reply notes that suggested quantities are not rounded to a supplier MOQ or pack size, so the figure is a requirement rather than an order quantity.",
+          "fails_if": ["presents the raw quantity as a directly placeable order"]
         }
       ]
     }

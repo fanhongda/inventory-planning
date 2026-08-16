@@ -358,3 +358,165 @@ class TestKPIReport:
         html = KPIReport().render(service=service, output_path=tmp_path / "r.html")
         assert "<img src=x" not in html
         assert "&lt;img" in html
+
+
+# ── Charts and the sections built on them ────────────────────────────────────
+
+class TestMonthlyOTD:
+    """
+    A single OTD figure hides when it changed, which is the question that decides
+    whether anything needs fixing. 82% flat and 82% after a collapse are the same
+    number describing different situations.
+    """
+
+    @staticmethod
+    def _year_of_shipments(on_time_by_month):
+        rows = []
+        for k, (n_on_time, n_late) in enumerate(on_time_by_month):
+            month = pd.Timestamp("2025-01-01") + pd.DateOffset(months=k)
+            for i in range(n_on_time + n_late):
+                late = i >= n_on_time
+                rows.append({
+                    "sku": f"A-{i % 3}", "customer": "Acme", "qty": 10.0, "amount": 100.0,
+                    "order_date": month - pd.Timedelta(days=30),
+                    "customer_request_date": month + pd.Timedelta(days=10),
+                    "ship_date": month + pd.Timedelta(days=20 if late else 5),
+                })
+        return pd.DataFrame(rows)
+
+    def test_the_rate_is_computed_per_month(self):
+        sales = self._year_of_shipments([(8, 2), (5, 5), (10, 0)])
+        monthly = ServiceAnalyzer().analyze(sales_history=sales, as_of=date(2025, 5, 1)).monthly_otd()
+        assert list(monthly["lines"]) == [10, 10, 10]
+        assert list(monthly["otd_line_rate"].round(2)) == [0.8, 0.5, 1.0]
+
+    def test_it_decomposes_the_headline(self):
+        """The chart and the tile must not be two different definitions of OTD."""
+        sales = self._year_of_shipments([(8, 2), (5, 5), (10, 0)])
+        result = ServiceAnalyzer().analyze(sales_history=sales, as_of=date(2025, 5, 1))
+        monthly = result.monthly_otd()
+        assert monthly["on_time_lines"].sum() / monthly["lines"].sum() == pytest.approx(
+            result.otd_line_rate
+        )
+
+    def test_a_silent_month_is_a_gap_not_a_zero(self):
+        sales = pd.concat([
+            self._year_of_shipments([(5, 0)]),
+            self._year_of_shipments([(0, 0)] * 2 + [(5, 0)]),
+        ], ignore_index=True)
+        monthly = ServiceAnalyzer().analyze(sales_history=sales, as_of=date(2025, 6, 1)).monthly_otd()
+        quiet = monthly[monthly["lines"] == 0]
+        assert len(quiet), "the empty month must still appear"
+        assert quiet["otd_line_rate"].isna().all(), "no deliveries is not a rate of zero"
+
+    def test_a_thin_month_is_marked_rather_than_dropped(self):
+        """A rate over three deliveries is not a measurement, but hiding it leaves a
+        gap the reader misreads as zero."""
+        sales = self._year_of_shipments([(20, 0), (2, 0)])
+        monthly = ServiceAnalyzer().analyze(sales_history=sales, as_of=date(2025, 4, 1)).monthly_otd()
+        assert list(monthly["thin"]) == [False, True]
+
+    def test_the_measured_window_is_reported(self, shipped):
+        result = ServiceAnalyzer().analyze(sales_history=shipped, as_of=AS_OF)
+        first, last = result.measured_window
+        assert str(first) == "2025-05" or str(first) == "2026-05"
+        assert last >= first
+
+    def test_an_unmeasurable_extract_says_so_rather_than_drawing_an_empty_axis(self, tmp_path):
+        no_request_date = pd.DataFrame({
+            "sku": ["A-1"], "qty": [10.0], "amount": [100.0],
+            "order_date": pd.to_datetime(["2026-05-01"]),
+            "ship_date": pd.to_datetime(["2026-05-10"]),
+        })
+        service = ServiceAnalyzer().analyze(sales_history=no_request_date, as_of=AS_OF)
+        html = KPIReport().render(service=service, output_path=tmp_path / "r.html")
+        assert "Not measurable from this extract" in html
+        assert "no delivery has an outcome to score" in html
+
+
+class TestChartsStayWithinTheHouseRules:
+
+    def _report(self, tmp_path):
+        sales = TestMonthlyOTD._year_of_shipments([(8, 2), (5, 5), (10, 0)])
+        service = ServiceAnalyzer().analyze(sales_history=sales, as_of=date(2025, 5, 1))
+        return KPIReport().render(service=service, service_target=0.95,
+                                  output_path=tmp_path / "r.html")
+
+    def test_charts_are_inline_svg_with_no_script(self, tmp_path):
+        """The report opens from a share with no assets; a plotting library is not
+        available and would not be appropriate if it were."""
+        html = self._report(tmp_path)
+        assert "<svg" in html
+        for token in ("<script", "http://", "https://", "@import"):
+            assert token not in html
+
+    def test_gridlines_are_solid(self, tmp_path):
+        """Dashing reads as 'projection' or 'threshold' when it is just a grid."""
+        html = self._report(tmp_path)
+        assert "stroke-dasharray" not in html
+
+    def test_the_target_line_is_drawn_and_labelled(self, tmp_path):
+        assert "target 95%" in self._report(tmp_path)
+
+    def test_the_chart_does_not_label_every_point(self, tmp_path):
+        """
+        A value beside every dot is chaos and goes unread — only the newest month and
+        the worst one are labelled. Counted as bare value labels, so the target line
+        and the volume panel's own caption do not read as data labels.
+        """
+        import re
+
+        html = self._report(tmp_path)
+        chart = html.split("<svg")[1].split("</svg>")[0]
+        labels = re.findall(r"<text class='lbl'[^>]*>(.*?)</text>", chart)
+        values = [t for t in labels if re.fullmatch(r"\d+%", t)]
+        markers = chart.count("<circle")
+        assert markers == 3, "one marker per month"
+        assert len(values) <= 2, f"expected at most two value labels, got {values}"
+
+
+class TestCadencePatterns:
+
+    def test_the_curve_is_kept_for_the_report_to_draw(self):
+        from inventory_planning.policy.cadence import CadenceAnalyzer
+        from test_cadence import FLAT, MONTHS, attributes, po_history, sales_history
+
+        result = CadenceAnalyzer().analyze(
+            po_history=po_history(A=[150] * 12), sales_history=sales_history(A=FLAT),
+            sku_attributes=attributes("A"), as_of=date(2026, 7, 31),
+        )
+        curve = result.curve("A")
+        assert curve is not None and len(curve) == 12
+        # The cumulative is what the verdict was read off; it has to agree with it.
+        assert curve["cumulative"].iloc[-1] == pytest.approx(
+            float(result.frame.iloc[0]["closing_balance"])
+        )
+        assert list(curve.columns) == ["period", "po_qty", "demand_qty", "net", "cumulative"]
+
+    def test_an_unknown_sku_has_no_curve(self):
+        from inventory_planning.policy.cadence import CadenceAnalyzer
+        from test_cadence import FLAT, attributes, po_history, sales_history
+
+        result = CadenceAnalyzer().analyze(
+            po_history=po_history(A=[150] * 12), sales_history=sales_history(A=FLAT),
+            sku_attributes=attributes("A"), as_of=date(2026, 7, 31),
+        )
+        assert result.curve("NOT-A-SKU") is None
+
+
+class TestCellRendering:
+
+    def test_infinite_cover_reads_as_no_demand(self):
+        """`inf` through the numeric formatter is an em dash, indistinguishable from
+        a missing value — and 'never clears' is a finding, not an absence."""
+        assert "no demand" in KPIReport._cell(np.inf, "cover")
+
+    def test_an_unknown_stocking_policy_is_blank_not_guessed(self):
+        """MTO and MTS carry opposite expectations about whether stock should have
+        been on the shelf; defaulting one rewrites the finding."""
+        cell = KPIReport._cell(np.nan, "policy")
+        assert "MTO" not in cell and "MTS" not in cell
+
+    def test_a_known_policy_is_shown_as_text_not_a_status_colour(self):
+        cell = KPIReport._cell("MTS", "policy")
+        assert "MTS" in cell and "chip" not in cell

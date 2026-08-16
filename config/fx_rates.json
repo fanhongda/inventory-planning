@@ -1,0 +1,53 @@
+{
+  "reporting_currency": "USD",
+
+  "_what_this_is": [
+    "Rates INTO the reporting currency: reporting_value = transaction_value * rate.",
+    "So GBP 1.3229 means one pound is 1.3229 US dollars.",
+    "",
+    "A currency that is not listed here is NOT assumed to be 1.0. Its money columns are",
+    "blanked and the run reports how many lines that cost, because a missing rate that",
+    "silently becomes 1.0 turns INR 126,550 into USD 126,550 and nothing downstream can",
+    "tell that it happened.",
+    "",
+    "Where an export carries its own exchange-rate column, that rate wins over this file.",
+    "It is the rate the transaction actually settled at; this table is the fallback."
+  ],
+
+  "_effective_dating": [
+    "Each entry applies from its effective_from date until the next entry for that",
+    "currency. Purchase history spans years, so one flat rate over the whole window",
+    "would render a currency move as a procurement trend. A line raised before the",
+    "earliest entry takes that earliest entry — approximate, but better than unvalued.",
+    "",
+    "Add a new dated entry each planning cycle rather than editing the last one, so a",
+    "re-run of an old extract still reproduces the numbers it originally reported."
+  ],
+
+  "_maintenance": [
+    "The seed rates below were read off the IN30 July 2026 open-PO export, which carries",
+    "both the transaction value and SAP's own converted value — their ratio is the rate",
+    "SAP booked. They are a starting point, not a treasury feed: replace them with the",
+    "planning rates your finance team publishes, and date each revision."
+  ],
+
+  "rates": {
+    "USD": 1.0,
+
+    "GBP": [
+      { "effective_from": "2018-01-01", "rate": 1.3229, "source": "seed — SAP booked rate, IN30 Jul 2026 open PO export" }
+    ],
+
+    "EUR": [
+      { "effective_from": "2018-01-01", "rate": 1.1392, "source": "seed — SAP booked rate, IN30 Jul 2026 open PO export" }
+    ],
+
+    "INR": [
+      { "effective_from": "2018-01-01", "rate": 0.010563, "source": "seed — SAP booked rate, IN30 Jul 2026 open PO export" }
+    ],
+
+    "AUD": [
+      { "effective_from": "2018-01-01", "rate": 0.6878, "source": "seed — SAP booked rate, IN30 Jul 2026 open PO export (2 lines only)" }
+    ]
+  }
+}

@@ -167,6 +167,29 @@ fields:
       - expr: "unit_cost >= 0"
         severity: error
 
+  currency:
+    type: string
+    role: dimension
+    normalize: upper_strip
+    description: >
+      Transaction currency of the money columns on this line. A purchase organisation
+      spanning several countries raises each order in the supplier's currency, so
+      without this field the value columns are a mixture of scales and adding them up
+      produces a number that looks like money and is not.
+    aliases: [currency, currency code, curr, crcy, doc currency, document currency,
+              trans currency, transaction currency, order currency, po currency,
+              local currency, waers]
+
+  fx_rate:
+    type: decimal
+    role: measure
+    description: >
+      Exchange rate into the reporting currency that the source itself booked for this
+      line. When present it outranks the configured rate table, because it is the rate
+      the transaction actually settled at rather than a planning average.
+    aliases: [exchange rate, exch rate, fx rate, conversion rate, conv rate,
+              currency rate, ukurs]
+
   freight_cost:
     type: decimal
     unit: currency

@@ -57,6 +57,7 @@ def build_sku_attributes(
     params: PlanningParameters = None,
     item_master: pd.DataFrame = None,
     planning_master: pd.DataFrame = None,
+    po_history: pd.DataFrame = None,
 ) -> Tuple[pd.DataFrame, CrossCheckResult]:
     """
     One row per SKU, carrying demand statistics, supply parameters, cost and
@@ -130,6 +131,17 @@ def build_sku_attributes(
     if "unit_cost" not in df.columns:
         df["unit_cost"] = np.nan
 
+    # What the item was last actually paid for. `crosscheck` ranks a value derived from
+    # transactions above any stated one, and a purchase price is the cleanest example
+    # of the category — it is not an intention or a decision, it is what left the bank.
+    #
+    # It is also, on most extracts, the only cost there is. An inventory snapshot often
+    # carries quantity and nothing else, and a planner worksheet is keyed on whatever
+    # code that planner uses. Without this the whole report values every SKU at zero:
+    # ABC collapses to one class, excess and value-at-risk print as $0, and the
+    # efficient frontier ranks actions by a column of zeroes.
+    df = _fill_cost_from_purchases(df, po_history)
+
     # ── Master data: fill the gaps, cross-check the overlaps ─────────────────
     df, crosscheck = _merge_masters(df, item_master, planning_master)
 
@@ -177,6 +189,53 @@ def build_sku_attributes(
 
 
 # ── Master data ──────────────────────────────────────────────────────────────
+
+
+def _fill_cost_from_purchases(
+    df: pd.DataFrame, po_history: pd.DataFrame = None
+) -> pd.DataFrame:
+    """
+    Fill an unknown unit cost with the price recently paid for the item.
+
+    Fills only — a cost already carried from the inventory valuation stays. The two
+    are different claims (what the stock is held at, versus what the next one costs)
+    and the valuation is the right basis for what is currently on the shelf.
+
+    The median of the last two years of purchases, not the mean and not the latest.
+    The latest is one line and inherits whatever was odd about that order; the mean is
+    dragged by the sample-order-of-one and the freight-inclusive line. Both were
+    visible on the real extract, where line prices for one SKU spanned two orders of
+    magnitude.
+
+    Assumes `po_history` has already been restated into the reporting currency — see
+    `inventory_planning.fx`. A price left in transaction currency does more damage
+    here than anywhere else, because ABC classification ranks on it.
+    """
+    if po_history is None or not len(po_history):
+        return df
+    if "unit_cost" not in po_history.columns or "sku" not in po_history.columns:
+        return df
+
+    recent = po_history
+    if "po_date" in po_history.columns:
+        stamps = pd.to_datetime(po_history["po_date"], errors="coerce")
+        latest = stamps.max()
+        if pd.notna(latest):
+            windowed = po_history[stamps >= latest - pd.DateOffset(months=24)]
+            # An extract whose recent window is empty falls back to all of it rather
+            # than to nothing; an old price beats no price.
+            recent = windowed if len(windowed) else po_history
+
+    cost = pd.to_numeric(recent["unit_cost"], errors="coerce")
+    priced = recent.loc[cost.notna() & (cost > 0), ["sku"]].assign(unit_cost=cost)
+    if priced.empty:
+        return df
+
+    measured = priced.groupby("sku")["unit_cost"].median()
+    df["unit_cost"] = pd.to_numeric(df["unit_cost"], errors="coerce").fillna(
+        df["sku"].map(measured)
+    )
+    return df
 
 
 def _merge_masters(
@@ -248,6 +307,12 @@ def _merge_masters(
         ("product_family", ("product_family", None)),
         ("item_status", ("item_status", None)),
         ("planner_code", ("planner_code", None)),
+        # The ERP's own make-to-stock / make-to-order flag. Filled, never arbitrated:
+        # it is a policy someone set, not a quantity to be reconciled against the
+        # pipeline's inferred `stocking_class`. Where the two disagree — an MTS item
+        # whose demand only occurred twice all year — that disagreement is the
+        # finding, and merging them would erase it.
+        ("stocking_policy", ("stocking_policy", "stocking_policy")),
     ):
         item_key, plan_key = sources
         candidate = item_cols.get(item_key)

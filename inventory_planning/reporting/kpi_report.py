@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -42,6 +43,17 @@ SERVICE_STATE_STYLE = {
     "open_past_due_available": ("var(--accent-violet)", "◆", "Past due — stock available"),
     "open_not_yet_due": ("var(--muted-fill)", "·", "Open, not yet due"),
     "unjudgeable": ("var(--muted-fill)", "?", "No request date"),
+}
+
+# Short forms for the small-multiple headers. The full sentence belongs in the table
+# and the section note; repeated once per card it becomes wallpaper.
+_VERDICT_SHORT = {
+    "controlled": "in control",
+    "chasing": "chasing demand",
+    "losing_control": "positive bias",
+    "oscillating": "over-correcting",
+    "under_ordered": "under-ordered",
+    "unearned_frequency": "over-ordering",
 }
 
 COMPONENT_STYLE = [
@@ -158,6 +170,35 @@ td.wrap { white-space: normal; min-width: 190px; font-variant-numeric: normal; }
 .callout.warn { border-left-color: var(--status-warning); }
 .callout.crit { border-left-color: var(--status-critical); }
 .empty { color: var(--text-muted); font-size: 14px; font-style: italic; padding: 6px 0; }
+
+/* Charts. Inline SVG only — the report is a single self-contained file that has to
+   open from a network share with no assets and no script, so a plotting library is
+   not available and would not be appropriate if it were. */
+.chart { width: 100%; height: auto; display: block; overflow: visible; }
+.chart text { font-family: inherit; }
+.chart .tick { fill: var(--text-muted); font-size: 11px; }
+.chart .axis { stroke: var(--grid); stroke-width: 1; }
+.chart .base { stroke: var(--baseline); stroke-width: 1; }
+.chart .lbl { fill: var(--text-secondary); font-size: 11px; font-weight: 600; }
+/* The mark carries the colour; the ring is surface-coloured so a dot stays readable
+   where it sits on the line or on a neighbour. */
+.chart .dot { stroke: var(--surface-1); stroke-width: 2; }
+.chart .dot-thin { fill: var(--surface-1); stroke-width: 2; }
+.chart .vol { fill: var(--muted-fill); }
+.chart-note { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; }
+
+/* Small multiples. One shape per SKU, same scale rules, read by comparison. */
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 20px 26px; }
+/* A grid item's default min-width is its content, which keeps auto-fit from ever
+   reaching two columns once a long header sits inside it. */
+.mini { min-width: 0; }
+.mini-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.mini-head .sku { font-weight: 600; font-size: 14px; }
+.mini-head .mini-val { margin-left: auto; font-size: 13px; font-variant-numeric: tabular-nums;
+                       color: var(--text-secondary); }
+.mini-sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+ul.tight { margin: 0; padding-left: 18px; }
+ul.tight li { margin: 2px 0; }
 .foot { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--grid);
         font-size: 12px; color: var(--text-muted); }
 """
@@ -198,9 +239,16 @@ class KPIReport:
         service=None,
         should_be=None,
         ordering=None,
+        cadence=None,
         forward=None,
         levers=None,
         frontier=None,
+        fx=None,
+        service_target: float = None,
+        attributes=None,
+        recommendations=None,
+        open_po=None,
+        suggestions=None,
         as_of: date = None,
         output_path: Path = None,
     ) -> str:
@@ -208,8 +256,11 @@ class KPIReport:
         body = [
             self._header(as_of, should_be, service),
             self._kpi_row(service, should_be, forward),
-            self._chapter_past(service, should_be, ordering),
-            self._chapter_future(forward, frontier),
+            self._currency_note(fx),
+            self._chapter_past(service, should_be, ordering, cadence, service_target,
+                               attributes),
+            self._chapter_future(forward, frontier, recommendations, open_po,
+                                 attributes, suggestions),
             self._footer(as_of),
         ]
         page = (
@@ -289,14 +340,17 @@ class KPIReport:
 
     # ── Chapter 1: what happened ─────────────────────────────────────────────
 
-    def _chapter_past(self, service, should_be, ordering) -> str:
+    def _chapter_past(self, service, should_be, ordering, cadence=None,
+                      service_target=None, attributes=None) -> str:
         parts = ["<h2>Chapter 1 · What happened</h2><hr class='chapter-rule'>"]
-        parts.append(self._service_section(service))
+        parts.append(self._service_section(service, attributes))
+        parts.append(self._otd_trend_section(service, service_target))
         parts.append(self._inventory_section(should_be))
         parts.append(self._ordering_section(ordering))
+        parts.append(self._cadence_section(cadence))
         return "".join(parts)
 
-    def _service_section(self, service) -> str:
+    def _service_section(self, service, attributes=None) -> str:
         if service is None or not len(service.lines):
             return ("<h3>Service — on-time delivery</h3>"
                     "<div class='card'><p class='empty'>No order lines available. "
@@ -364,31 +418,62 @@ class KPIReport:
 
         failures = service.failures_by_sku(top=10)
         out.append(self._table(
-            "Which SKUs caused the OTD misses",
-            failures,
-            [("sku", "SKU", "sku"), ("failed_lines", "Failed lines", "int"),
+            f"Which SKUs caused the OTD misses{self._window_suffix(service)}",
+            self._with_policy(failures, attributes),
+            [("sku", "SKU", "sku"), ("stocking_policy", "Policy", "policy"),
+             ("failed_lines", "Failed lines", "int"),
              ("failed_value", "Value", "money"), ("failure_rate", "Failure rate", "pct"),
              ("avg_days_late", "Avg days late", "num1"),
              ("max_days_late", "Worst", "num0"), ("customers", "Customers", "int")],
             note="Ranked by value, not line count — a Pareto by lines over-weights cheap, "
-                 "frequently-ordered items.",
+                 "frequently-ordered items. Policy is the ERP's own make-to-stock / "
+                 "make-to-order flag: a late MTS line is a stocking failure, a late MTO "
+                 "line is a lead-time one, and they have different fixes.",
             empty="No OTD failures in the period.",
         ))
 
         stuck = service.uncollected_by_sku(top=10)
         out.append(self._table(
-            "Past due, stock available — customer has not collected",
-            stuck,
-            [("sku", "SKU", "sku"), ("stuck_lines", "Lines", "int"),
+            f"Past due, stock available — customer has not collected "
+            f"(open position at {service.as_of})",
+            self._with_policy(stuck, attributes),
+            [("sku", "SKU", "sku"), ("stocking_policy", "Policy", "policy"),
+             ("stuck_lines", "Lines", "int"),
              ("stuck_qty", "Qty", "num0"), ("stuck_value", "Value", "money"),
-             ("avg_days_overdue", "Avg days overdue", "num1"),
-             ("max_days_overdue", "Worst", "num0"), ("customers", "Customers", "int")],
-            note="Not a supply failure — the goods were there. It is an inventory-efficiency "
-                 "problem: committed, aged and immobile stock. The owner is whoever holds the "
-                 "customer relationship, not planning.",
+             ("max_days_overdue", "Days overdue", "num0"),
+             ("customers", "Customers", "int")],
+            note="A snapshot, not a history: these are the lines open and past due right "
+                 "now, so a line collected last month correctly does not appear — what it "
+                 "cost has already been paid and nothing can be done about it. "
+                 "Not a supply failure either; the goods were there. It is committed, aged, "
+                 "immobile stock, owned by whoever holds the customer relationship.",
             empty="Nothing past due with stock available.",
         ))
         return "".join(out)
+
+    @staticmethod
+    def _window_suffix(service) -> str:
+        window = getattr(service, "measured_window", None)
+        if not window:
+            return ""
+        first, last = window
+        return f" — {first} to {last}" if first != last else f" — {first}"
+
+    @staticmethod
+    def _with_policy(frame: pd.DataFrame, attributes: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Attach the ERP stocking policy to a per-SKU table.
+
+        Left unset rather than guessed where the master does not reach the SKU. MTO and
+        MTS carry opposite expectations about whether stock should have been on the
+        shelf, so defaulting one of them rewrites the finding rather than completing it.
+        """
+        if frame is None or not len(frame) or "sku" not in frame.columns:
+            return frame
+        if attributes is None or not len(attributes) or "stocking_policy" not in attributes.columns:
+            return frame
+        lookup = attributes.drop_duplicates("sku").set_index("sku")["stocking_policy"]
+        return frame.assign(stocking_policy=frame["sku"].map(lookup))
 
     def _inventory_section(self, should_be) -> str:
         if should_be is None:
@@ -507,9 +592,461 @@ class KPIReport:
         ))
         return "".join(out)
 
+    def _cadence_section(self, cadence) -> str:
+        """
+        The buying rhythm: did the cumulative PO-minus-sales come back to zero, and how
+        many orders were spent getting it there.
+
+        Sits after the ordering section on purpose. That one reports what individual
+        orders looked like; this one reports what the sequence of them added up to, and
+        the sequence is where a planner who scores well on lot-size consistency can
+        still be a month behind demand all year.
+        """
+        if cadence is None or not len(getattr(cadence, "frame", [])):
+            return ""
+
+        counts = cadence.counts()
+        chips = "".join(
+            f"<span class='chip {cls}'>{_esc(label)} {counts.get(key, 0)}</span> "
+            for key, label, cls in (
+                ("controlled", "In control", "good"),
+                ("chasing", "Chasing demand", "crit"),
+                ("under_ordered", "Under-ordered", "crit"),
+                ("oscillating", "Over-correcting", "crit"),
+                ("losing_control", "Positive bias", "warn"),
+                ("unearned_frequency", "Over-ordering", "warn"),
+            ) if counts.get(key)
+        )
+
+        out = [
+            "<h3>Replenishment cadence — did buying keep pace with selling</h3>",
+            f"<p class='sub'>Monthly PO quantity minus sales quantity, accumulated across "
+            f"{cadence.window_months} months. A curve that returns to zero means the two run "
+            f"rates match — a stronger result than any single month's accuracy, because errors "
+            f"that cancel are errors the inventory never had to carry. "
+            f"<strong>{cadence.control_rate:.0%}</strong> of measured SKUs did that.</p>",
+            f"<p class='sub'>{chips}</p>" if chips else "",
+        ]
+
+        out.append(self._table(
+            "Out of balance — ranked by the money behind the imbalance",
+            cadence.out_of_control.head(12),
+            [("sku", "SKU", "sku"), ("verdict_note", "Pattern", "text"),
+             ("deficit_months", "Months short", "int"),
+             ("surplus_months", "Months long", "int"),
+             ("closing_balance", "Closing balance", "num0"),
+             ("imbalance_pct", "vs demand", "pct"),
+             ("order_count", "Orders", "int"),
+             ("expected_orders", "Cadence allows", "int"),
+             ("exposure_value", "Exposure", "money")],
+            note="Months short is time spent buying behind what was being sold — cover "
+                 "consumed rather than replaced. Months long is the opposite, and a long "
+                 "run of it means nothing is pulling the orders back to the run rate. "
+                 "Exposure adds up what the surplus tied up, what the shortfall left "
+                 "uncovered, and what the extra orders cost to place.",
+            empty="Every SKU's buying tracked its selling.",
+        ))
+
+        out.append(self._cadence_patterns(cadence))
+
+        unearned = cadence.unearned_frequency
+        if len(unearned):
+            out.append(self._table(
+                "Ordering frequency not earned — high cadence on non-critical items",
+                unearned.head(10),
+                [("sku", "SKU", "sku"), ("abc_class", "Class", "text"),
+                 ("order_count", "Orders placed", "int"),
+                 ("expected_orders", "Cadence allows", "int"),
+                 ("orders_vs_expected", "Ratio", "ratio"),
+                 ("review_period_days", "Review (days)", "int"),
+                 ("avoidable_order_cost", "Avoidable/yr", "money")],
+                note="Ordering more often than the review period requires is worth paying "
+                     "for on a critical part and nothing else. On these items it buys no "
+                     "service back, and the fix is a longer review period rather than a "
+                     "better forecast. "
+                     f"Total: {_money(cadence.total_avoidable_order_cost)} a year.",
+            ))
+        return "".join(out)
+
+    # ── Service over time ────────────────────────────────────────────────────
+
+    def _otd_trend_section(self, service, target: float = None) -> str:
+        """
+        On-time delivery month by month.
+
+        A single OTD figure answers "how did we do" and hides "when did it change" —
+        and the second is the question that decides whether anything needs fixing.
+        82% flat for two years and 82% because the last four months collapsed are the
+        same number describing different situations, and only one of them is urgent.
+
+        The volume strip underneath is not decoration. A month at 100% on four lines
+        looks identical to a month at 100% on four hundred, and without the counts the
+        eye reads the thin months as the good ones.
+        """
+        if service is None:
+            return ""
+        monthly = service.monthly_otd()
+        if not len(monthly):
+            # Say why, rather than printing an empty axis. A missing metric shown as a
+            # blank chart reads as a metric of zero.
+            return (
+                "<h3>On-time delivery over time</h3>"
+                "<div class='card'><p class='empty'>Not measurable from this extract — "
+                "no shipped line carries both a ship date and a customer request date, "
+                "so no delivery has an outcome to score. The open order book is still "
+                "judged below.</p></div>"
+            )
+
+        measured = monthly[monthly["lines"] > 0]
+        worst = measured.loc[measured["otd_line_rate"].idxmin()] if len(measured) else None
+        latest = measured.iloc[-1] if len(measured) else None
+        thin_months = int(monthly["thin"].sum())
+
+        note = (
+            f"Measured over the {int(monthly['lines'].sum()):,} lines whose delivery "
+            f"outcome is settled — an open line that is past due can never come out "
+            f"on time, so it is backlog rather than a miss, and is reported separately."
+        )
+        if thin_months:
+            note += (f" {thin_months} month(s) carry fewer than five lines and are drawn "
+                     f"hollow; a rate over that few deliveries is not a measurement.")
+
+        return (
+            "<h3>On-time delivery over time</h3>"
+            f"<div class='card'>{self._otd_chart(monthly, target)}"
+            f"<p class='chart-note'>{_esc(note)}</p></div>"
+        )
+
+    def _otd_chart(self, monthly: pd.DataFrame, target: float = None) -> str:
+        """Rate panel over a volume panel, sharing one x axis and one scale each."""
+        W, PAD_L, PAD_R = 760, 42, 16
+        RATE_TOP, RATE_H = 14, 150
+        VOL_TOP, VOL_H = 196, 46
+        H = VOL_TOP + VOL_H + 22
+
+        n = len(monthly)
+        inner = W - PAD_L - PAD_R
+        # A single month has no width to spread over; centre it rather than divide by nought.
+        step = inner / max(n - 1, 1)
+        x_of = (lambda i: PAD_L + inner / 2) if n == 1 else (lambda i: PAD_L + i * step)
+
+        # A rate that never leaves the 85–100 band is invisible on a 0–100 axis: the
+        # whole story sits in the top eighth of the plot. The axis is focused on the
+        # range in play, floor labelled, so the zoom is stated rather than implied.
+        #
+        # This is a line encoding a rate, not a bar encoding a magnitude — the length
+        # from zero carries no meaning here, so there is nothing for a zero baseline to
+        # protect. The floor never rises above 80%, so the zoom stays bounded.
+        rates = pd.to_numeric(monthly["otd_line_rate"], errors="coerce").dropna()
+        floor = 0.0
+        if len(rates):
+            floor = math.floor(max(0.0, float(rates.min()) - 0.05) * 20) / 20
+            if target and 0 < target <= 1:
+                floor = min(floor, math.floor(max(0.0, target - 0.05) * 20) / 20)
+            floor = min(floor, 0.80)
+        span = max(1.0 - floor, 0.05)
+        y_of = lambda rate: RATE_TOP + RATE_H * (1.0 - (rate - floor) / span)
+
+        parts: List[str] = [
+            f"<svg class='chart' viewBox='0 0 {W} {H}' role='img' "
+            f"aria-label='On-time delivery by month'>"
+        ]
+
+        # Gridlines and y ticks — hairline, solid, recessive.
+        for k in range(5):
+            value = floor + span * k / 4
+            y = y_of(value)
+            parts.append(f"<line class='axis' x1='{PAD_L}' y1='{y:.1f}' x2='{W - PAD_R}' y2='{y:.1f}'/>")
+            parts.append(f"<text class='tick' x='{PAD_L - 8}' y='{y + 4:.1f}' "
+                         f"text-anchor='end'>{value:.0%}</text>")
+
+        if target and 0 < target <= 1:
+            ty = y_of(target)
+            parts.append(f"<line class='base' x1='{PAD_L}' y1='{ty:.1f}' "
+                         f"x2='{W - PAD_R}' y2='{ty:.1f}'/>")
+            # Anchored left: the right edge belongs to the newest month's own label,
+            # and the two collided there.
+            parts.append(f"<text class='lbl' x='{PAD_L + 4}' y='{ty - 6:.1f}' "
+                         f"text-anchor='start'>target {target:.0%}</text>")
+
+        # The rate line. Months with no deliveries break it rather than being drawn
+        # through — a straight segment across a silent month invents data.
+        runs, current = [], []
+        for i, (_, row) in enumerate(monthly.iterrows()):
+            if pd.isna(row["otd_line_rate"]):
+                if len(current) > 1:
+                    runs.append(current)
+                current = []
+            else:
+                current.append((x_of(i), y_of(float(row["otd_line_rate"]))))
+        if len(current) > 1:
+            runs.append(current)
+        for run in runs:
+            pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in run)
+            parts.append(f"<polyline points='{pts}' fill='none' stroke='var(--series-1)' "
+                         f"stroke-width='2' stroke-linejoin='round' stroke-linecap='round'/>")
+
+        # Volume panel, on its own scale. Never a second y-axis on the rate plot.
+        vol_max = float(monthly["lines"].max()) or 1.0
+        band = inner / max(n, 1)
+        bar_w = min(band * 0.62, 24)
+        for i, (_, row) in enumerate(monthly.iterrows()):
+            lines = float(row["lines"])
+            if lines <= 0:
+                continue
+            h = max(VOL_H * (lines / vol_max), 1.5)
+            parts.append(
+                f"<rect class='vol' x='{x_of(i) - bar_w / 2:.1f}' y='{VOL_TOP + VOL_H - h:.1f}' "
+                f"width='{bar_w:.1f}' height='{h:.1f}' rx='2'>"
+                f"<title>{_esc(str(row['period']))} — {lines:,.0f} lines settled</title></rect>"
+            )
+        parts.append(f"<line class='base' x1='{PAD_L}' y1='{VOL_TOP + VOL_H}' "
+                     f"x2='{W - PAD_R}' y2='{VOL_TOP + VOL_H}'/>")
+        parts.append(f"<text class='tick' x='{PAD_L - 8}' y='{VOL_TOP + 12}' "
+                     f"text-anchor='end'>{vol_max:,.0f}</text>")
+        parts.append(f"<text class='tick' x='{PAD_L - 8}' y='{VOL_TOP + VOL_H + 4}' "
+                     f"text-anchor='end'>0</text>")
+        parts.append(f"<text class='lbl' x='{PAD_L}' y='{VOL_TOP - 8}'>lines settled</text>")
+
+        # Markers last so they sit above the line, each with its own tooltip.
+        for i, (_, row) in enumerate(monthly.iterrows()):
+            if pd.isna(row["otd_line_rate"]):
+                continue
+            rate = float(row["otd_line_rate"])
+            cls = "dot-thin" if bool(row["thin"]) else "dot"
+            fill = "var(--surface-1)" if bool(row["thin"]) else "var(--series-1)"
+            parts.append(
+                f"<circle class='{cls}' cx='{x_of(i):.1f}' cy='{y_of(rate):.1f}' r='4.5' "
+                f"fill='{fill}' stroke='{'var(--series-1)' if row['thin'] else 'var(--surface-1)'}'>"
+                f"<title>{_esc(str(row['period']))} — {rate:.0%} on time "
+                f"({row['on_time_lines']:,.0f} of {row['lines']:,.0f} lines)</title></circle>"
+            )
+
+        # Labelled selectively: the newest month and the worst one, never every point.
+        labelled = set()
+        measured = monthly[monthly["lines"] > 0]
+        for idx, anchor in ((measured.index[-1], "end"), (measured["otd_line_rate"].idxmin(), "middle")):
+            if idx in labelled:
+                continue
+            labelled.add(idx)
+            i = monthly.index.get_loc(idx)
+            rate = float(monthly.loc[idx, "otd_line_rate"])
+            parts.append(f"<text class='lbl' x='{x_of(i):.1f}' y='{y_of(rate) - 10:.1f}' "
+                         f"text-anchor='{anchor}'>{rate:.0%}</text>")
+
+        # x labels thinned so they never collide.
+        every = max(1, n // 8)
+        for i, (_, row) in enumerate(monthly.iterrows()):
+            if i % every and i != n - 1:
+                continue
+            parts.append(f"<text class='tick' x='{x_of(i):.1f}' y='{H - 4}' "
+                         f"text-anchor='middle'>{_esc(str(row['period']))}</text>")
+
+        parts.append("</svg>")
+        return "".join(parts)
+
+    # ── Cadence patterns ─────────────────────────────────────────────────────
+
+    def _cadence_patterns(self, cadence, top: int = 6) -> str:
+        """
+        The curve each verdict was actually read from, for the SKUs with most at stake.
+
+        Every column in the table above is a summary of this shape, and the shape says
+        it faster: six flat months below the line then a vertical correction is one
+        glance, where "deficit_months 6, longest_surplus_run 3, closing +775,728" is
+        three numbers the reader has to reassemble into the same picture.
+
+        Diverging around zero because that is what the data is — below the line is
+        cover being consumed, above it is cash being tied up, and the midpoint is not a
+        middling amount of anything, it is the target.
+        """
+        if getattr(cadence, "cumulative", None) is None or not len(cadence.frame):
+            return ""
+        worst = cadence.out_of_control.head(top)
+        if not len(worst):
+            return ""
+
+        cards = []
+        for n, (_, row) in enumerate(worst.iterrows()):
+            curve = cadence.curve(row["sku"])
+            if curve is None:
+                continue
+            cards.append(self._cadence_card(curve, row, n))
+        if not cards:
+            return ""
+
+        return (
+            "<h3>Replenishment pattern — the shape behind each verdict</h3>"
+            f"<p class='sub'>The {len(cards)} SKUs with most money at stake. The line is "
+            f"cumulative PO quantity minus sales quantity; the ticks underneath mark the "
+            f"months an order was actually placed.</p>"
+            f"<div class='card'><div class='grid2'>{''.join(cards)}</div>"
+            "<p class='chart-note'>Below the line is cover being consumed rather than "
+            "replaced. Above it is cash tied up. Zero is not a middling amount of "
+            "anything — it is the target, and a curve that returns to it means the two "
+            "run rates matched.</p></div>"
+        )
+
+    def _cadence_card(self, curve: pd.DataFrame, row: pd.Series, n: int) -> str:
+        W, H = 380, 116
+        PAD_L, PAD_R, TOP, PLOT_H = 8, 8, 22, 62
+        TICK_Y = TOP + PLOT_H + 10
+
+        cum = pd.to_numeric(curve["cumulative"], errors="coerce").fillna(0.0).to_numpy()
+        n_pts = len(cum)
+        inner = W - PAD_L - PAD_R
+        step = inner / max(n_pts - 1, 1)
+        x_of = lambda i: PAD_L + i * step
+
+        # Symmetric around zero so the baseline sits mid-plot and the two directions
+        # are visually comparable — an asymmetric scale makes a small surplus look like
+        # a large one purely because the deficit was bigger.
+        span = max(abs(cum.min()), abs(cum.max()), float(row.get("tolerance_qty") or 0), 1.0)
+        y_of = lambda v: TOP + PLOT_H / 2 - (v / span) * (PLOT_H / 2)
+        zero_y = y_of(0.0)
+
+        uid = f"cad{n}"
+        pts = [(x_of(i), y_of(v)) for i, v in enumerate(cum)]
+        area = (f"{PAD_L},{zero_y:.1f} "
+                + " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+                + f" {x_of(n_pts - 1):.1f},{zero_y:.1f}")
+
+        parts = [
+            f"<svg class='chart' viewBox='0 0 {W} {H}' role='img' "
+            f"aria-label='Cumulative balance for {_esc(row['sku'])}'>",
+            "<defs>",
+            f"<clipPath id='{uid}up'><rect x='0' y='{TOP}' width='{W}' "
+            f"height='{max(zero_y - TOP, 0):.1f}'/></clipPath>",
+            f"<clipPath id='{uid}dn'><rect x='0' y='{zero_y:.1f}' width='{W}' "
+            f"height='{max(TOP + PLOT_H - zero_y, 0):.1f}'/></clipPath>",
+            "</defs>",
+        ]
+
+        # The band inside which a periodic review cannot help but wander.
+        tol = float(row.get("tolerance_qty") or 0)
+        if tol > 0:
+            parts.append(
+                f"<rect x='{PAD_L}' y='{y_of(tol):.1f}' width='{inner:.1f}' "
+                f"height='{abs(y_of(-tol) - y_of(tol)):.1f}' fill='var(--muted-fill)' "
+                f"opacity='0.18'/>"
+            )
+
+        # Same polygon twice, clipped either side of zero: warm above, cool below.
+        for clip, colour in ((f"{uid}up", "var(--series-2)"), (f"{uid}dn", "var(--series-1)")):
+            parts.append(f"<polygon points='{area}' fill='{colour}' opacity='0.16' "
+                         f"clip-path='url(#{clip})'/>")
+        parts.append(f"<line class='base' x1='{PAD_L}' y1='{zero_y:.1f}' "
+                     f"x2='{W - PAD_R}' y2='{zero_y:.1f}'/>")
+        for clip, colour in ((f"{uid}up", "var(--series-2)"), (f"{uid}dn", "var(--series-1)")):
+            line = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+            parts.append(f"<polyline points='{line}' fill='none' stroke='{colour}' "
+                         f"stroke-width='2' stroke-linejoin='round' stroke-linecap='round' "
+                         f"clip-path='url(#{clip})'/>")
+
+        # When an order was placed — the cadence itself, on the time axis rather than
+        # on a second scale.
+        po = pd.to_numeric(curve["po_qty"], errors="coerce").fillna(0.0).to_numpy()
+        for i, (qty, period) in enumerate(zip(po, curve["period"])):
+            if qty <= 0:
+                continue
+            parts.append(
+                f"<line x1='{x_of(i):.1f}' y1='{TICK_Y - 4}' x2='{x_of(i):.1f}' "
+                f"y2='{TICK_Y + 4}' stroke='var(--text-muted)' stroke-width='2' "
+                f"stroke-linecap='round'><title>{_esc(str(period))} — ordered "
+                f"{qty:,.0f}</title></line>"
+            )
+
+        first, last = curve["period"].iloc[0], curve["period"].iloc[-1]
+        parts.append(f"<text class='tick' x='{PAD_L}' y='{H - 3}'>{_esc(str(first))}</text>")
+        parts.append(f"<text class='tick' x='{W - PAD_R}' y='{H - 3}' "
+                     f"text-anchor='end'>{_esc(str(last))}</text>")
+
+        # The endpoint labelled, never every point. Clamped inside the plot: a curve
+        # ending near the floor put its label on the same baseline as the period
+        # labels, and the two ran together.
+        end_v = cum[-1]
+        label_y = y_of(end_v) + (-8 if end_v >= 0 else 14)
+        label_y = min(max(label_y, TOP + 10), TOP + PLOT_H - 2)
+        parts.append(
+            f"<text class='lbl' x='{W - PAD_R}' y='{label_y:.1f}' "
+            f"text-anchor='end'>{end_v:+,.0f}</text>"
+        )
+        parts.append("</svg>")
+
+        verdict_cls = {"controlled": "good", "losing_control": "warn",
+                       "unearned_frequency": "warn"}.get(row["verdict"], "crit")
+        # The order count lives in the header, not in the plot. Inside the SVG it sat
+        # on the same baseline as the first period label and the two overlapped.
+        orders = (f"{int(row['order_count'])} orders placed · cadence allows "
+                  f"{int(row['expected_orders'])}")
+        return (
+            f"<div class='mini'><div class='mini-head'>"
+            f"<span class='sku'>{_esc(row['sku'])}</span>"
+            f"<span class='chip {verdict_cls}'>{_esc(_VERDICT_SHORT.get(row['verdict'], row['verdict']))}</span>"
+            f"<span class='mini-val'>{_money(row['exposure_value'])}</span></div>"
+            f"<div class='mini-sub'>{_esc(orders)}</div>"
+            f"{''.join(parts)}</div>"
+        )
+
+    # ── Currency ─────────────────────────────────────────────────────────────
+
+    def _currency_note(self, fx) -> str:
+        """
+        Says which currency the report is in, and names any money it could not restate.
+
+        Shown next to the KPI tiles rather than buried, because every figure above and
+        below it is a sum over lines that were raised in several currencies. A reader
+        who does not know that a conversion happened cannot tell a genuine total from a
+        mixture of scales, and both print with the same symbol.
+        """
+        if fx is None or not getattr(fx, "reports", None):
+            return ""
+        if not fx.multi_currency and fx.rates_configured:
+            return ""
+
+        parts = [
+            f"<div class='callout'>Money is reported in <strong>{_esc(fx.reporting_currency)}</strong>. "
+        ]
+        converted = [r for r in fx.reports.values() if r.is_multi_currency]
+        if converted:
+            detail = "; ".join(
+                f"{r.doc_type}: {r.rows_converted:,} of {r.rows_total:,} lines restated"
+                for r in converted
+            )
+            parts.append(f"Source lines arrive in several currencies and were converted "
+                         f"before any total was taken ({_esc(detail)}).")
+
+        rejected = sum(r.rows_rate_rejected for r in fx.reports.values())
+        if rejected:
+            parts.append(
+                f" {rejected:,} lines carried an exchange-rate column that was not a rate "
+                f"— a placeholder 1.0 on a foreign line, or an inverted quote — and were "
+                f"converted at the configured planning rate instead of the booked one."
+            )
+
+        gaps = fx.gaps
+        if gaps:
+            listed = ", ".join(f"{code} ({n:,} lines)" for code, n in sorted(gaps.items()))
+            parts.append(
+                f"</div><div class='callout crit'><strong>No exchange rate for "
+                f"{_esc(listed)}.</strong> Those lines carry no value in "
+                f"{_esc(fx.reporting_currency)} — they are excluded from every money "
+                f"figure here rather than counted at face value, so totals below are "
+                f"understated by whatever they were worth. Add the rates to "
+                f"<code>config/fx_rates.json</code> and re-run."
+            )
+        elif not fx.rates_configured:
+            parts.append(
+                f"</div><div class='callout warn'><strong>No rate table configured.</strong> "
+                f"Any line not already in {_esc(fx.reporting_currency)} is unvalued."
+            )
+        parts.append("</div>")
+        return "".join(parts)
+
     # ── Chapter 2: what's coming ─────────────────────────────────────────────
 
-    def _chapter_future(self, forward, frontier) -> str:
+    def _chapter_future(self, forward, frontier, recommendations=None,
+                        open_po=None, attributes=None, suggestions=None) -> str:
         parts = ["<h2>Chapter 2 · What is coming</h2><hr class='chapter-rule'>"]
 
         if forward is None:
@@ -519,9 +1056,230 @@ class KPIReport:
 
         parts.append(self._stockout_section(forward))
         parts.append(self._slow_burn_section(forward))
+        parts.append(self._actions_section(recommendations, open_po, forward, attributes))
+        parts.append(self._suggestions_section(suggestions, attributes))
         if frontier is not None:
             parts.append(self._frontier_section(frontier))
         return "".join(parts)
+
+    # ── Parameter suggestions ────────────────────────────────────────────────
+
+    def _suggestions_section(self, suggestions, attributes) -> str:
+        """
+        What the data supports, next to what is in force — never applied, only shown.
+
+        Kept explicitly as a suggestion because the pipeline cannot see the reasons a
+        parameter was set: a review period stretched to match a supplier's shipping
+        window, a service level raised after a customer escalation. The arithmetic here
+        knows none of that, so it proposes and a planner disposes.
+
+        The safety-stock delta is the number to read first. It is capital, and its sign
+        says which direction the whole catalogue is mis-set in.
+        """
+        if suggestions is None or not len(getattr(suggestions, "frame", [])):
+            return ""
+        changed = suggestions.changed
+        if not len(changed):
+            return ("<h3>Parameter suggestions</h3><div class='card'><p class='empty'>"
+                    "Every parameter in force already matches what the data supports."
+                    "</p></div>")
+
+        delta = suggestions.safety_stock_delta_value
+        direction = "more than" if delta > 0 else "less than"
+        head = (
+            f"<h3>Parameter suggestions — what the data supports</h3>"
+            f"<p class='sub'><strong>{len(changed):,}</strong> of "
+            f"{len(suggestions.frame):,} SKUs would change. Safety stock under the "
+            f"suggested parameters is <strong>{_money(abs(delta))}</strong> {direction} "
+            f"the policy in force. Nothing here is applied — these are proposals to "
+            f"review, because the reason a parameter was set by hand is not visible in "
+            f"the data.</p>"
+        )
+
+        work = self._with_policy(changed.copy(), attributes)
+        if "ss_delta_value" in work.columns:
+            work = work.reindex(
+                work["ss_delta_value"].abs().sort_values(ascending=False).index
+            )
+        table = self._table(
+            "",
+            work.head(12),
+            [("sku", "SKU", "sku"), ("stocking_policy", "Policy", "policy"),
+             ("abc_class", "ABC", "text"),
+             ("review_period_days", "Review now", "num0"),
+             ("suggested_review_period_days", "Suggested", "num0"),
+             ("service_level", "Service now", "pct"),
+             ("suggested_service_level", "Suggested", "pct"),
+             ("ss_delta_qty", "SS change", "num0"),
+             ("ss_delta_value", "Capital", "money"),
+             ("changes", "What changes", "text")],
+            note="Ranked by the capital the safety-stock change moves. A positive "
+                 "figure is stock the measured lead time and forecast error say is "
+                 "missing; a negative one is capital the policy is holding without "
+                 "cause.",
+        )
+
+        fired = [(r, suggestions.hits.get(r.rule_id, 0)) for r in suggestions.rules]
+        fired = [(r, n) for r, n in fired if n]
+        rules = ""
+        if fired:
+            rows = "".join(
+                f"<tr><td class='left'>{_esc(r.rule_id)}</td>"
+                f"<td class='left wrap'>{_esc(getattr(r, 'rationale', '') or getattr(r, 'name', ''))}</td>"
+                f"<td>{n:,}</td></tr>"
+                for r, n in sorted(fired, key=lambda x: -x[1])
+            )
+            rules = (
+                "<div class='card'><div class='scroll'><table><thead><tr>"
+                "<th class='left'>Rule</th><th class='left'>Why</th><th>SKUs</th>"
+                f"</tr></thead><tbody>{rows}</tbody></table></div>"
+                "<p class='sub' style='margin-top:10px'>Every rule that fired, and how "
+                "many SKUs it caught. A rule matching almost everything is usually a "
+                "scope that is too broad rather than a finding.</p></div>"
+            )
+
+        notes = ""
+        if getattr(suggestions, "notes", None):
+            items = "".join(f"<li>{_esc(n)}</li>" for n in suggestions.notes)
+            notes = f"<div class='callout warn'><ul class='tight'>{items}</ul></div>"
+
+        return head + table + rules + notes
+
+    # ── The work list ────────────────────────────────────────────────────────
+
+    def _actions_section(self, recommendations, open_po, forward, attributes) -> str:
+        """
+        The head of the work list: which materials to change, and which open POs.
+
+        Everything above this point is diagnosis. This is the part a planner can act on
+        before lunch, so it is ranked by money and cut to a head rather than printed in
+        full — a list of nine hundred items is a list nobody starts.
+
+        The PO half is derived from the forward risk rather than from a second
+        recommendation pass. A separate engine would eventually disagree with the
+        stockout and slow-burn sections sitting directly above it, and a report that
+        contradicts itself two sections apart is worse than one that says less.
+        """
+        out = [self._materials_to_adjust(recommendations, attributes)]
+        out.append(self._pos_to_adjust(open_po, forward, attributes))
+        rendered = [p for p in out if p]
+        if not rendered:
+            return ""
+        return "<h3>What to change — the head of the list</h3>" + "".join(rendered)
+
+    def _materials_to_adjust(self, recommendations, attributes) -> str:
+        if recommendations is None or not len(recommendations):
+            return ""
+        df = recommendations.copy()
+        if "recommended_action" not in df.columns:
+            return ""
+
+        # HOLD is the absence of an action; it is most of the catalogue and belongs in
+        # the CSV, not in a work list.
+        df = df[~df["recommended_action"].astype(str).str.upper().str.startswith("HOLD")]
+        if df.empty:
+            return ""
+
+        cost = None
+        if attributes is not None and "unit_cost" in attributes.columns:
+            cost = attributes.drop_duplicates("sku").set_index("sku")["unit_cost"]
+        unit = df["sku"].map(cost) if cost is not None else np.nan
+        buy = pd.to_numeric(df.get("suggested_po_qty"), errors="coerce").fillna(0.0)
+        push = pd.to_numeric(df.get("pushout_open_po_qty"), errors="coerce").fillna(0.0)
+        df["action_qty"] = np.where(buy > 0, buy, push)
+        df["action_value"] = df["action_qty"] * pd.to_numeric(unit, errors="coerce").fillna(0.0)
+        df = self._with_policy(df, attributes)
+        df = df.sort_values("action_value", ascending=False).head(12)
+
+        return self._table(
+            "Materials to act on",
+            df,
+            [("sku", "SKU", "sku"), ("stocking_policy", "Policy", "policy"),
+             ("recommended_action", "Action", "text"),
+             ("action_qty", "Qty", "num0"), ("action_value", "Value", "money"),
+             ("days_of_supply", "Days of supply", "num0"),
+             ("net_requirement", "Net requirement", "num0")],
+            note="Ranked by the money the action moves, not by urgency alone — the "
+                 "shortest cover on a cheap part is rarely the first call to make. "
+                 "Items already in balance are held, and are in the recommendations CSV "
+                 "rather than here.",
+            empty="Nothing to change.",
+        )
+
+    def _pos_to_adjust(self, open_po, forward, attributes) -> str:
+        """
+        Open PO lines whose timing disagrees with the position they are arriving into.
+
+        Two cases only, both read off the forward risk: an order landing into stock
+        that already has years of cover, and an order landing after the shelf it was
+        meant to fill is empty. Everything else is left alone — a report that proposes
+        touching every PO gets ignored wholesale.
+        """
+        if open_po is None or not len(open_po) or "sku" not in open_po.columns:
+            return ""
+        qty_col = next((c for c in ("open_qty", "order_qty") if c in open_po.columns), None)
+        if qty_col is None:
+            return ""
+
+        slow = forward.slow_burn if forward is not None else pd.DataFrame()
+        risk = forward.stockout if forward is not None else pd.DataFrame()
+        cover = (slow.set_index("sku")["days_of_cover"] if len(slow) else pd.Series(dtype=float))
+        late = pd.DataFrame()
+        if len(risk) and {"inbound_day", "days_to_stockout"} <= set(risk.columns):
+            late = risk[risk["inbound_day"].notna()
+                        & (risk["inbound_day"] > risk["days_to_stockout"])]
+        late_by_sku = (late.set_index("sku")["days_to_stockout"]
+                       if len(late) else pd.Series(dtype=float))
+
+        df = open_po.copy()
+        df["_qty"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
+        df = df[df["_qty"] > 0]
+        if df.empty:
+            return ""
+
+        df["days_of_cover"] = df["sku"].map(cover)
+        df["out_on_day"] = df["sku"].map(late_by_sku)
+        df["action"] = np.where(
+            df["days_of_cover"].notna(), "Push out or cancel",
+            np.where(df["out_on_day"].notna(), "Pull in — arrives too late", ""),
+        )
+        df = df[df["action"] != ""]
+        if df.empty:
+            return ""
+
+        value = None
+        for col in ("open_amount", "line_value"):
+            if col in df.columns:
+                value = pd.to_numeric(df[col], errors="coerce")
+                break
+        if value is None and "unit_cost" in df.columns:
+            value = df["_qty"] * pd.to_numeric(df["unit_cost"], errors="coerce")
+        df["po_value"] = value.fillna(0.0) if value is not None else 0.0
+
+        eta = next((c for c in ("committed_delivery", "estimated_delivery", "eta")
+                    if c in df.columns), None)
+        if eta:
+            df["eta"] = pd.to_datetime(df[eta], errors="coerce").dt.date
+        df = self._with_policy(df, attributes)
+        df = df.sort_values("po_value", ascending=False).head(12)
+
+        cols = [("po_number", "PO", "text"), ("sku", "SKU", "sku"),
+                ("stocking_policy", "Policy", "policy"), ("action", "Action", "text"),
+                ("_qty", "Open qty", "num0"), ("po_value", "Value", "money")]
+        if "eta" in df.columns:
+            cols.append(("eta", "ETA", "text"))
+        cols.append(("days_of_cover", "Days of cover", "cover"))
+
+        return self._table(
+            "Open POs to change",
+            df,
+            cols,
+            note="Push out or cancel where the stock it lands in already has more than "
+                 "a year of cover; pull in where the SKU runs out before this order "
+                 "arrives. Read off the same forward projection as the two sections "
+                 "above, so the three cannot disagree.",
+            empty="No open PO needs its timing changed.",
+        )
 
     def _stockout_section(self, forward) -> str:
         risk = forward.stockout
@@ -705,6 +1463,20 @@ class KPIReport:
             return f"<td>{_num(_f(value), 0)}</td>"
         if kind.startswith("num"):
             return f"<td>{_num(_f(value), int(kind[-1]))}</td>"
+        if kind == "cover":
+            # Infinite cover is a real finding — stock against no demand at all — and
+            # it arrives here as `inf`, which the numeric formatter renders as an
+            # em dash indistinguishable from a missing value.
+            v = _f(value)
+            if not np.isfinite(v):
+                return "<td>no demand</td>"
+            return f"<td>{_num(v, 0)}</td>"
+        if kind == "policy":
+            # Text, not colour. MTO and MTS are not better and worse than one another,
+            # and a status hue would say one of them is a problem.
+            if value is None or (not isinstance(value, str) and pd.isna(value)):
+                return "<td class='left' style='color:var(--text-muted)'>—</td>"
+            return f"<td class='left'>{_esc(value)}</td>"
         if kind == "chip":
             text = str(value)
             cls = ("crit" if text in ("high", "too late", "inbound PO")

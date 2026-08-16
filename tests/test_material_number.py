@@ -57,6 +57,30 @@ class TestNormalization:
     def test_a_non_numeric_code_is_untouched(self, raw):
         assert _normalize_material(pd.Series([raw])).iloc[0] == raw.strip().upper()
 
+    @pytest.mark.parametrize("raw,expected", [
+        ("6048713.0", "6048713"),            # a numeric cell read back as a float
+        ("6048713.00", "6048713"),
+        ("000006048713.0", "6048713"),       # padded *and* float-ified
+        ("  6048713.0  ", "6048713"),
+    ])
+    def test_a_float_suffix_is_trimmed(self, raw, expected):
+        """
+        The same silent-empty-join as the padding, arriving by a different route: a
+        spreadsheet storing an identifier column as numeric renders every value as
+        `6048713.0`, which matches nothing. Found on the IN30 master, whose
+        `Alternate material` key joined 0 SKUs until this was trimmed.
+        """
+        assert _normalize_material(pd.Series([raw])).iloc[0] == expected
+
+    @pytest.mark.parametrize("raw", [
+        "6048713.5",            # a real decimal, not a float-ified integer
+        "4190.6002",            # a dotted code — the part after the point is not zeros
+        "1.0.0",                # a version-like code
+        "ABC.0",                # not all digits before the point
+    ])
+    def test_a_meaningful_dot_is_kept(self, raw):
+        assert _normalize_material(pd.Series([raw])).iloc[0] == raw.strip().upper()
+
     def test_case_and_whitespace_still_normalize(self):
         assert _normalize_material(pd.Series([" abc-1 "])).iloc[0] == "ABC-1"
 

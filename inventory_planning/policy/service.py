@@ -208,6 +208,80 @@ class ServiceResult:
         counts["share"] = counts["lines"] / max(len(self.lines), 1)
         return counts
 
+    @property
+    def measured_window(self) -> Optional[tuple]:
+        """
+        First and last month a delivery outcome was actually observed.
+
+        Every attribution below is scored over this window and nothing else, so a
+        heading that omits it invites the reader to take "SKU-006 caused five misses"
+        as a statement about now rather than about a period that may have ended months
+        before the extract was taken.
+        """
+        settled = self.completed
+        if settled.empty or "actual_date" not in settled.columns:
+            return None
+        stamps = pd.to_datetime(settled["actual_date"], errors="coerce").dropna()
+        if stamps.empty:
+            return None
+        return stamps.min().to_period("M"), stamps.max().to_period("M")
+
+    # ── Over time ────────────────────────────────────────────────────────────
+
+    def monthly_otd(self, min_lines: int = 5) -> pd.DataFrame:
+        """
+        On-time delivery month by month, over exactly the lines the headline uses.
+
+        A single OTD figure answers "how did we do" and hides "when did it change",
+        which is the question that decides whether anything needs fixing. 82% flat for
+        two years and 82% because the last four months collapsed are the same number
+        and different situations.
+
+        Bucketed on the **ship** date, not the request date: the month a delivery
+        succeeded or failed is the month it happened, and bucketing on the promise
+        would credit a late shipment to the month it was due rather than the month it
+        eventually moved.
+
+        `thin` marks months whose line count is too small for the rate to mean
+        anything. They are returned rather than dropped — a month with three lines is
+        itself a finding, and silently removing it leaves a gap the reader will
+        misread as zero.
+        """
+        cols = ["period", "lines", "on_time_lines", "otd_line_rate",
+                "value", "on_time_value", "otd_value_rate", "thin"]
+        settled = self.completed
+        if settled.empty or "actual_date" not in settled.columns:
+            return pd.DataFrame(columns=cols)
+
+        work = settled.assign(_stamp=pd.to_datetime(settled["actual_date"], errors="coerce"))
+        work = work.dropna(subset=["_stamp"])
+        if work.empty:
+            return pd.DataFrame(columns=cols)
+
+        work["period"] = work["_stamp"].dt.to_period("M")
+        work["_on_time"] = work["service_state"] == ON_TIME
+        work["_value"] = pd.to_numeric(work["line_value"], errors="coerce").fillna(0.0)
+
+        out = (
+            work.groupby("period")
+            .agg(lines=("_on_time", "size"),
+                 on_time_lines=("_on_time", "sum"),
+                 value=("_value", "sum"),
+                 on_time_value=("_value", lambda s: float(s[work.loc[s.index, "_on_time"]].sum())))
+            .reset_index()
+        )
+        # Every month between the first and last, so a month with no deliveries at all
+        # shows as a gap in the volume rather than as an absent point on the rate.
+        full = pd.period_range(out["period"].min(), out["period"].max(), freq="M")
+        out = out.set_index("period").reindex(full).rename_axis("period").reset_index()
+        for col in ("lines", "on_time_lines", "value", "on_time_value"):
+            out[col] = out[col].fillna(0.0)
+
+        out["otd_line_rate"] = np.where(out["lines"] > 0, out["on_time_lines"] / out["lines"], np.nan)
+        out["otd_value_rate"] = np.where(out["value"] > 0, out["on_time_value"] / out["value"], np.nan)
+        out["thin"] = out["lines"] < min_lines
+        return out[cols]
+
     # ── Attribution ──────────────────────────────────────────────────────────
 
     def failures_by_sku(self, top: int = None) -> pd.DataFrame:

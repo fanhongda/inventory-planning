@@ -42,6 +42,7 @@ class InventoryPlanner:
         self._quality_log: list = []   # accumulates quality reports across all loads
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
+        self._fx = None                # set by load_all(); which money was restated, and what could not be
 
         # Readers
         self.sales_reader   = SalesHistoryReader(self.config_dir)
@@ -158,6 +159,7 @@ class InventoryPlanner:
             item_master=item_master_df if item_master_df is not None else results.get("item_master"),
             planning_master=(planning_master_df if planning_master_df is not None
                              else results.get("planning_master")),
+            po_history=results.get("po_history"),
         )
         if crosscheck.resolutions:
             print()
@@ -200,6 +202,10 @@ class InventoryPlanner:
             "should_be": should_be,
             "levers": levers,
             "suggestions": suggestions,
+            # Carried forward so the KPI review's work list uses the same
+            # recommendations the planning run produced, rather than deriving a second
+            # set that would eventually disagree with the CSV the planner works from.
+            "recommendations": results.get("recommendations"),
             "crosscheck": crosscheck,
             "frontier": None,
         }
@@ -254,6 +260,7 @@ class InventoryPlanner:
         """
         from datetime import date as _date
 
+        from .policy.cadence import CadenceAnalyzer
         from .policy.diagnostics import DiagnosticsAnalyzer
         from .policy.service import ServiceAnalyzer, latest_observed_date
         from .reporting.kpi_report import KPIReport
@@ -291,6 +298,23 @@ class InventoryPlanner:
         print()
         print(ordering.summary())
 
+        # Order-size CV says whether the lots were consistent. It cannot say whether
+        # they arrived at the right time or in the right direction, and consistent lots
+        # bought at the wrong moments cost exactly what erratic ones do.
+        params = policy.get("parameters")
+        cadence = CadenceAnalyzer(
+            order_cost=float(params.defaults.get("order_cost_usd", 350))
+            if params is not None else 350.0,
+        ).analyze(
+            po_history=po_history_df,
+            sales_history=sales_df,
+            sku_attributes=attributes,
+            parameters=getattr(params, "frame", None),
+            as_of=as_of,
+        )
+        print()
+        print(cadence.summary())
+
         forward = diagnostics.forward(
             sku_attributes=attributes, inventory=inventory_df,
             open_po=open_po_df, open_so=open_so_df,
@@ -309,11 +333,25 @@ class InventoryPlanner:
                 levers=policy.get("levers"), open_po=open_po_df, as_of=as_of,
             )
 
+        # The service level most of the catalogue actually runs at — the line the OTD
+        # trend is scored against. Modal rather than mean: the parameter takes a few
+        # discrete values from the policy tiers, and averaging them produces a target
+        # no SKU is actually held to.
+        service_target = None
+        frame = getattr(params, "frame", None)
+        if frame is not None and "service_level" in frame.columns:
+            levels = pd.to_numeric(frame["service_level"], errors="coerce").dropna()
+            if len(levels):
+                service_target = float(levels.mode().iloc[0])
+
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
         path = self.output_dir / f"kpi_review_{stamp}.html"
         KPIReport(title).render(
             service=service, should_be=should_be, ordering=ordering,
-            forward=forward, levers=policy.get("levers"), frontier=frontier,
+            cadence=cadence, forward=forward, levers=policy.get("levers"),
+            frontier=frontier, fx=self._fx, service_target=service_target,
+            attributes=attributes, recommendations=policy.get("recommendations"),
+            open_po=open_po_df, suggestions=policy.get("suggestions"),
             as_of=as_of, output_path=path,
         )
         print(f"\n  KPI review saved: {path}")
@@ -322,6 +360,7 @@ class InventoryPlanner:
         return {
             "service": service,
             "ordering": ordering,
+            "cadence": cadence,
             "forward": forward,
             "frontier": frontier,
             "report_path": path,
@@ -364,6 +403,7 @@ class InventoryPlanner:
         plan = inputs["_intake_plan"]
         self._intake = inputs.pop("_intake", None)
         self._intake_plan = inputs.pop("_intake_plan", None)
+        self._fx = inputs.pop("_fx", None)
 
         if not plan.can_run:
             missing = ", ".join(c.name for c in plan.missing_required)
@@ -538,6 +578,9 @@ class InventoryPlanner:
             "inventory_consolidated": inventory_df,
             "item_master": item_master_df,
             "planning_master": planning_master_df,
+            # Carried for the policy layer's benefit: it is the only source of a
+            # measured unit cost on an extract whose inventory export is quantity-only.
+            "po_history": po_history_df,
             "as_of": as_of,
             "_quality_reports": self._quality_log,
         }

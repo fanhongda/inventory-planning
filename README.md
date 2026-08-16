@@ -7,6 +7,21 @@ chain principles. It reads whatever exports a planner actually has, works out wh
 stock *should* be, ranks the actions that would close the gap, and says plainly which
 of its numbers are measured and which are assumptions.
 
+Roughly half of it is not planning arithmetic. Real ERP extracts are wrong in ways
+nothing raises: a material number padded in one report and not the next, five currencies
+summed as though they were one, a spreadsheet that silently swapped month and day on the
+40% of dates it could reinterpret. None of these produce an error — they produce a clean
+run, a confident total, and a number that is off by a factor nobody can see. So the
+intake layer is treated as a first-class problem rather than glue, and every figure the
+report prints carries whether it was measured, derived, or assumed.
+
+The other half is the refusal to agree. A planning system earns its place by disagreeing
+usefully with the organisation around it, and most of the modules that look like extra
+complexity exist to keep that ability: measured values outrank stated ones and every
+disagreement is reported, the planner's own safety stock is compared but never consumed,
+and a deviation between recommendation and reality is attributed rather than learned
+from.
+
 ---
 
 ## Design Philosophy
@@ -88,6 +103,11 @@ when the deviation cannot be explained by execution failure or supply constraint
 
 | Step | Method | Output |
 |---|---|---|
+| **Intake** — routing | Contract scoring per document, adapters frozen per export | which file is which, decided from content not filename |
+| **Intake** — mixed-format detection | Whole-column representation census at profile time | any column holding two conventions is named for manual check |
+| **Intake** — date repair | Evidence-gated month/day restore on spreadsheet-mangled columns | both halves of a split date column survive, or the repair declines and says so |
+| **Intake** — currency normalisation | Per-line transaction currency → one reporting currency, effective-dated | every money column comparable; unrated codes named, never defaulted |
+| **Intake** — capability report | What each run can and cannot answer, given what arrived | the questions this extract cannot support, stated up front |
 | Demand characterisation | Frequency + CV classification | stocking-high / stocking-med / non-stocking |
 | Demand pattern routing | CV thresholds | smooth / intermittent / erratic / lumpy |
 | Forecasting | ETS, ARIMA or Croston per pattern | 6-month forecast + t+1 point forecast |
@@ -97,9 +117,12 @@ when the deviation cannot be explained by execution failure or supply constraint
 | Purchase recommendation | Forecast consumption: max(t+1 forecast, realizable backlog due in horizon) + SS | PURCHASE-REQUEST / ORDER-FOR-BACKLOG / PUSH-OUT / HOLD |
 | Should-be inventory | cycle + safety + buyer-owned pipeline, incoterm-aware | gap vs actual, per lever |
 | Lever ranking | Net annual benefit, not cash freed | ordered action list with what each is worth |
+| Service attribution | OTD measured and split four ways, and tracked by month | who owns each failure, and when it moved |
+| Ordering behaviour | Over-ordering, chronic air freight, erratic lot sizing | what the buying pattern cost |
+| Replenishment cadence | Cumulative monthly PO qty − sales qty, against the order count the review period allows | controlled / chasing / positive bias / over-correcting, priced |
+| Stocking policy vs behaviour | ERP make-to-stock / make-to-order flag, carried alongside the inferred stocking class | where policy and observed demand disagree |
 | Parameter suggestion | What the data supports vs what is in force | per-SKU CSV + paste-able rule blocks |
 | Source cross-check | Measured vs ERP master vs planner worksheet | every material disagreement, with both values |
-| Service attribution | OTD measured and split four ways | who owns each failure |
 | Feedback loop | Cumulative gap attribution across months | OPERATOR_DEVIATION / SUPPLY_GAP / MODEL_BIAS |
 | Lead-time drift | Successive snapshots compared; drift separated from source change | which suppliers moved, and by how much |
 
@@ -307,6 +330,134 @@ Against the safety stock the planner set by hand:
 Nothing is ever written back to the parameter file. A parameter that changed because a
 script decided it should is a parameter nobody can defend in a review.
 
+### A column can hold two conventions at once, and the parser must not pick one
+
+The intake assumed a column speaks one convention. Reasonable, and wrong in a way that
+produces no error: whichever parser is chosen, the other representation becomes null.
+
+Excel is the usual cause. Opened under a locale that disagrees with the file, it
+converts the cells it *can* read as local order — the ones where both components are 12
+or less — into real dates, **swapping month and day** as it does so, and leaves the rest
+as text because `10/14/2024` is not a valid day-first date. The column comes back half
+`2024-04-10 00:00:00` and half `10/14/2024`.
+
+On the real sales extract this removed 8,737 of 34,128 rows from `Invdate Date` and
+13,163 of 32,800 from `Orddate Date` — 9.7% of all shipped quantity across 759 of 1,256
+SKUs. Nothing looked wrong downstream, because the demand that survived was real; there
+was simply less of it. The survivors were exactly the values whose day exceeded 12.
+
+Two separate responses, because they answer different needs:
+
+- **The profiler flags any column carrying two incompatible representations**, reading
+  the whole column rather than a sample — a partial conversion follows whichever values
+  were ambiguous, not row order, so a split column is frequently uniform for its first
+  several hundred rows. The flag survives the repair: rescuing this run's numbers does
+  not fix the file, and the next export will be broken the same way.
+- **The parser repairs the swap, but only on evidence.** Three things must hold: the
+  text half states an unambiguous order, the converted half contains no day above 12 at
+  all — the fingerprint of having been filtered to the ambiguous values — and restoring
+  the values must not push them outside the span the rest of the column occupies. That
+  last check is a veto rather than a requirement, so it refuses a bad repair without
+  refusing every export whose halves already overlap.
+
+The fingerprint is the proof. A mixed column can only arise when the spreadsheet's
+locale disagreed with the file — had it agreed, every value would have converted and no
+text half would remain to compare against. Where evidence is absent the rows are still
+recovered; only the month/day correction is withheld.
+
+### Charts are inline SVG, and a shape is not a summary statistic
+
+The report is one self-contained file that has to open from a network share with no
+assets and no script, so there is no plotting library available — and none would be
+appropriate if there were. Every chart is inline SVG against the same CSS tokens as the
+rest of the page, authored for both themes rather than auto-flipped.
+
+Two of them replace numbers that were hiding something:
+
+- **On-time delivery over time.** A single OTD figure answers "how did we do" and hides
+  "when did it change", which is the question that decides whether anything needs
+  fixing. 82% flat for two years and 82% because the last four months collapsed are the
+  same number describing different situations. The volume strip beneath is not
+  decoration — a month at 100% on four lines looks identical to one at 100% on four
+  hundred, and without the counts the eye reads the thin months as the good ones.
+- **Replenishment pattern.** The cadence diagnosis *is* a shape, and rendering it as
+  three columns of statistics made the reader rebuild the picture in their head. Small
+  multiples of the cumulative curve, diverging around zero, read by comparison: six flat
+  months below the line then a vertical correction is one glance.
+
+The axis on the OTD chart is focused on the range in play rather than anchored at zero.
+That is correct for a line encoding a rate — the length from zero carries no meaning, so
+there is nothing for a zero baseline to protect — and the floor is labelled and never
+rises above 80%, so the zoom is stated rather than implied. The rule it would break is
+the one about *bars*, where length is the encoding.
+
+### Money is converted before it is added, and an unknown rate is not 1.0
+
+A purchase organisation spanning several countries raises each PO in the supplier's
+currency. SAP exports that faithfully — one `Currency` column, one line value, no
+conversion — and nothing about the result looks wrong: every figure is a valid number
+and so is their sum. On the real extract that sum was ₹7,004,449,000 added to
+$240,323,000 and printed with a dollar sign. Restated, purchase history is $402,281,808.
+
+What the mixture destroys is not the total but the *ranking*. A rupee line outranks
+every dollar line on value alone, so ABC classification, excess value, value at risk and
+the whole efficient frontier get sorted by which currency a supplier happens to bill in.
+
+Three rules keep the conversion honest:
+
+- **A rate the source booked wins — once it is shown to be a rate.** It is what the
+  transaction settled at. But the backlog extract carries `Exchange Rate` = 1 on all
+  3,169 of its INR lines, and ERP rate columns are frequently quoted upside down
+  (94.7 rupees per dollar where the conversion needs 0.01056). A placeholder 1.0 on a
+  foreign line, or a quote an order of magnitude away from the configured rate, is
+  rejected in favour of the table — and the rejection is reported, not silent.
+- **Rates are effective-dated.** Purchase history spans eight years. One rate across all
+  of it renders a currency move as a procurement trend.
+- **An unrated currency blanks its money rather than defaulting to 1.0.** Defaulting is
+  how ₹126,550 becomes $126,550, and nothing downstream can tell that it happened. The
+  lines are excluded from every money figure and named in the report instead.
+
+The one assumption made silently: a document with no currency column is taken to be
+single-currency. That is the ordinary single-entity export, and it is recorded as an
+assumption rather than a fact.
+
+### Order-size CV cannot see timing; the cumulative flow balance can
+
+`diagnostics.erratic` scores lot-size consistency. A planner can pass it perfectly and
+still be a month behind demand every month of the year, because consistent lots placed
+at the wrong times produce exactly the stockouts erratic ones do.
+
+`policy/cadence.py` accumulates `po_qty − sales_qty` month by month instead. The shape
+of that curve separates four failures the CV cannot:
+
+| Shape | Reading | Fix |
+|---|---|---|
+| Returns to ≈ 0 | Run rates match. Errors that cancel are errors the inventory never carried | none — this is the target |
+| Sits negative for months | Buying behind selling and staying behind | replenishment timing |
+| Climbs and stays up | Persistent positive bias — nothing closes the loop | the review itself, not the forecast |
+| Swings both ways | Over-correction; bullwhip at single-SKU scale | both, and it costs both |
+
+Alongside it sits the question the CV never asks: **how many orders were spent getting
+there**. A monthly review entitles the planner to twelve orders a year. Twelve that land
+the cumulative on zero is control; forty that land on the same zero is the same result
+at three times the ordering cost, and usually means the cadence is being overridden by
+expediting.
+
+Two choices keep it from crying wolf. The tolerance band is at least **one typical lot**,
+because a periodic review swings by a full lot even when working perfectly — a part
+bought quarterly sits a quarter's demand down for most of every quarter, and that is the
+policy operating, not failing. And **ordering above the cadence has to be earned**: it is
+worth paying for on a critical part and on nothing else, so it is priced at the order
+cost and reported only where the item is not A-class. On the real extract that is 40 SKUs
+and $81,900 a year of ordering cost, all of it on C-class items.
+
+What it deliberately does not model is the lag between raising a PO and receiving it.
+The balance is keyed on the **order** date, so it measures the planner's decisions
+against the demand they were meant to cover. Supplier delivery against those decisions
+is a different question that `service` and `diagnostics.forward` already answer, and
+mixing the two would let a reliable planner buying from a late supplier read as a
+control failure.
+
 ### Smaller decisions
 
 **Croston's method for intermittent demand.** ETS and ARIMA on sparse demand (6 active
@@ -471,7 +622,8 @@ output/
 | `config/stocking_policy.json` | Stocking tiers, service levels, CV thresholds, DOS excess threshold, `demand_basis`, backlog realization |
 | `config/incoterm_rules.json` | EXW/FOB/DDP goods-in-transit counting rules |
 | `config/supplier_incoterm.json` | Supplier ID → incoterm mapping |
-| `config/node_config.json` | Location ID, currency — one entry per DC |
+| `config/node_config.json` | Location ID, reporting currency — one entry per DC |
+| `config/fx_rates.json` | Exchange rates into the reporting currency, effective-dated. A currency absent here is reported unvalued, never counted at face value |
 | `policy/policy.md` | Company-level hard constraints (human-readable, Claude-interpreted) |
 
 `planning_parameters.md` is markdown with fenced YAML, not a config format, because the
@@ -551,6 +703,7 @@ misses 90 days becoming 110, which is the more expensive event.
 inventory_planning/
 ├── orchestrator.py            run_planning → run_policy_analysis → run_kpi_review
 ├── ingest_bridge.py           canonical frames → analytics column expectations
+├── fx.py                      transaction currency → reporting currency, effective-dated
 ├── explain.py                 why a file routed where it did — per-contract scoring
 ├── ingest/                    ← contract-driven intake (no imports from this package)
 │   ├── contracts/*.yaml       canonical fields: type, grain, derivable_from, assertions
@@ -572,6 +725,7 @@ inventory_planning/
 │   ├── suggestions.py         suggested parameters + paste-able rule blocks
 │   ├── service.py             OTD measured, split four ways; request-date quality
 │   ├── diagnostics.py         over-ordering, chronic air, stockout risk, slow burn
+│   ├── cadence.py             cumulative PO − sales balance vs the cadence's order count
 │   └── decisions.py           accept/reject log → constraint candidates
 ├── analytics/
 │   ├── demand_classifier.py   CV + frequency → demand pattern

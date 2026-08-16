@@ -312,10 +312,41 @@ Also in chapter 1: which SKUs drive the excess capital, over-ordering (bought mo
 of supply than any policy justifies), chronic air freight (a planning gap paid for at
 the freight desk), and erratic lot sizing.
 
+**Replenishment cadence** sits next to those and answers what lot-size CV cannot: did
+the buying keep pace with the selling, and how many orders were spent doing it. The
+monthly `po_qty − sales_qty` balance is accumulated across the window; a curve that
+returns to ≈ 0 means the two run rates match, which is a stronger statement than any
+single month's accuracy. Four readings come out of its shape — **controlled**,
+**chasing** (persistently behind), **losing_control** (persistent positive bias, so
+nothing is closing the loop), **oscillating** (over-correcting, bullwhip at SKU scale) —
+plus **unearned_frequency**.
+
+Relay that last one carefully, because it is the one a planner can act on this week:
+a monthly review entitles them to twelve orders a year, and ordering above the cadence
+is worth paying for on a critical part and on nothing else. Items ordered far above
+their cadence *and* not A-class are listed with the annual ordering cost it wastes, and
+the fix is a longer review period rather than a better forecast.
+
+Read the notes under the section before quoting its direction. If a share of demand or
+purchase rows carry no usable date, the balance is biased by that much and the section
+says so — the imbalance is in the ingest, not the buying, and the date mapping has to
+be fixed first.
+
 **Chapter 2 — what is coming.** Stockout risk ranked by *demand value at risk* — a
 stockout costs sales, not inventory — with whether an inbound PO actually covers it or
 lands too late. Then slow burn: stock with over a year of cover, flagging any that
 **still has inbound POs**, which are the first push-out or cancel candidates.
+
+Then the work list, which is what the planner actually acts on: **materials to act on**
+(the recommendations that are not HOLD, ranked by the money the action moves) and
+**open POs to change** (push out or cancel where the stock it lands in already has a
+year of cover; pull in where the SKU runs out before it arrives). Both are read off the
+same forward projection as the sections above, so the three cannot disagree.
+
+Last, **parameter suggestions** — what the data supports next to what is in force, with
+the capital the safety-stock change would move. Relay these as proposals, never as
+findings: the pipeline cannot see why a parameter was set by hand, and a review period
+stretched to match a supplier's shipping window looks identical to a careless one.
 
 If OTD cannot be measured (no sales history carrying `ship_date` and
 `customer_request_date`), the report says so rather than printing a blank. Do not
@@ -382,7 +413,8 @@ All tuning lives in `config/` — no code changes needed:
 | `stocking_policy.json` | Frequency thresholds (9/12, 6/12), service levels (95%, 90%), forecast horizon |
 | `incoterm_rules.json` | EXW/FOB/DDP GIT counting rules per incoterm |
 | `supplier_incoterm.json` | Supplier ID → incoterm mapping (when PO file lacks incoterm column) |
-| `node_config.json` | Location ID, currency — set `location_id` for each DC |
+| `node_config.json` | Location ID, reporting currency — set `location_id` for each DC |
+| `fx_rates.json` | Rates into the reporting currency, effective-dated. A code absent here is reported unvalued, never counted at face value — check the report's currency callout before quoting any total |
 
 **Planning policy lives in `config/planning_parameters.md`** — segmentation boundaries,
 calculation conventions, and scoped overrides, in markdown a planner edits directly:
@@ -437,6 +469,7 @@ adapter, correct it, freeze it.
 | `required_field:<x>` absent | No column matched and no derivation applied | Add a `column_map` entry, or a `derivations` expression, to the adapter |
 | `open_qty >= 0` violated | `order_qty` mapped to the wrong column, or over-receipts in the source | Check the mapping first; genuine over-receipt should be clamped in the adapter |
 | `committed_delivery >= order_date` violated | Date order misparsed (DMY read as MDY) | Set `parsing.dayfirst` in the adapter; intake usually detects this from the data |
+| `⚠ MIXED FORMATS` note | One source column holds two conventions — typically a spreadsheet opened under a locale that disagreed with the file, which converted the values it could read (swapping month and day) and left the rest as text. Whichever parser wins, the other half nulls out silently. | **Relay this to the user every time.** Where evidence was conclusive the parser restored the swapped values — check the transform log for `swapped` — but the source file is still wrong and the next export will be too. The fix is upstream: export dates in ISO, or as a real date column rather than text |
 | `distribution_drift:<col>` | A column's *meaning* changed while its name did not — a UoM, currency or filter change at the source | Do not just re-run. Confirm with whoever produces the extract |
 | Unmapped status codes warning | This source uses a status vocabulary the value domain doesn't cover | Add them to `value_maps` in the adapter — an unmapped closed code counts closed POs as live supply |
 

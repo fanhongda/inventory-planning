@@ -37,7 +37,8 @@ fields:
     aliases: [qty on hand, on hand, on-hand, on hand qty, onhand, onhand qty,
               stock qty, stock on hand, soh, available qty, available quantity,
               unrestricted stock, unrestricted, physical stock, inventory on hand,
-              closing stock, quantity, ending inventory]
+              closing stock, quantity, ending inventory,
+              total stock qty, totalstock qty, total stock, totalstock]
     assertions:
       - expr: "qty_on_hand >= 0"
         severity: warn

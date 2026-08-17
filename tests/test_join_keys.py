@@ -193,3 +193,86 @@ class TestSkuAgreementIsReported:
         notes = " ".join(Intake(verbose=False)
                          .load_files(sorted(tmp_path.glob("*.xlsx"))).notes)
         assert "keys on something" not in notes
+
+
+class TestOneMasterAdapterServesEveryRegion:
+    """
+    The FSP planning master is one export template shared across regions, so one adapter
+    serves all of them. The ERP number sits in `Alternate material` for the IN30 export
+    and in `Material` for other regions; the adapter coalesces the two.
+
+    The regression this guards: the earlier IN30-only adapter hard-mapped `sku` to
+    `Alternate material`, and its fingerprint matched every region sharing this template.
+    On a region whose `Alternate material` is blank it re-keyed every row to a null SKU,
+    and the rollup collapsed the whole master to one row — silently deleting the
+    planner-baseline comparison.
+    """
+
+    ERP = [f"6{i:06d}" for i in range(60)]   # "6000000", "6000001", …
+
+    @classmethod
+    def _master(cls, *, erp_in_alternate: bool) -> pd.DataFrame:
+        n = len(cls.ERP)
+        # Numeric ID cells read back as "6000000.0" under dtype=str — the trailing ".0"
+        # the material_number normalisation on the derived key has to strip.
+        erp = pd.Series([float(x) for x in cls.ERP])
+        local = pd.Series([f"LOCAL-{i:04d}" for i in range(n)])
+        blank = pd.Series([np.nan] * n)
+        material, alternate = (local, erp) if erp_in_alternate else (erp, blank)
+        return pd.DataFrame({
+            "Material": material,
+            "Alternate material": alternate,
+            "Material description": [f"ITEM {i}" for i in range(n)],
+            "Stock Cat": "MTS",
+            "Material Classification": "Runners",
+            "vendor name": "ACME",
+            "Std cost": np.linspace(5, 90, n).round(2),
+            "SS": range(10, 10 + n),
+        })
+
+    def _frame(self, tmp_path, *, erp_in_alternate: bool):
+        self._master(erp_in_alternate=erp_in_alternate).to_excel(
+            tmp_path / "master.xlsx", index=False)
+        return (Intake(verbose=False)
+                .load_files([tmp_path / "master.xlsx"]).frame("planning_master"))
+
+    def test_in30_layout_keys_on_alternate_material(self, tmp_path):
+        frame = self._frame(tmp_path, erp_in_alternate=True)
+        assert len(frame) == len(self.ERP)
+        assert set(frame["sku"]) == set(self.ERP)
+
+    def test_other_region_keys_on_material(self, tmp_path):
+        """An empty `Alternate material` must fall through to `Material`, not collapse."""
+        frame = self._frame(tmp_path, erp_in_alternate=False)
+        assert len(frame) == len(self.ERP)
+        assert set(frame["sku"]) == set(self.ERP)
+
+    def test_the_derived_key_carries_the_planner_parameter(self, tmp_path):
+        """The whole point of the master: its safety stock arrives, keyed correctly."""
+        frame = self._frame(tmp_path, erp_in_alternate=False).set_index("sku")
+        assert pd.to_numeric(frame["planner_safety_stock"]).notna().all()
+        assert int(pd.to_numeric(frame.loc["6000000", "planner_safety_stock"])) == 10
+
+    def test_a_region_without_the_alternate_column_keys_on_material(self, tmp_path):
+        """
+        The IN30 export drops `Alternate material` entirely (its secondary code is a
+        different column, `Material II`). The coalesce input is absent, not just empty;
+        the derivation must treat it as null and fall through to `Material`, not skip and
+        leave the master keyless.
+        """
+        n = len(self.ERP)
+        pd.DataFrame({
+            "Material": pd.Series([float(x) for x in self.ERP]),
+            "Material II": [f"ULF{i:05d}" for i in range(n)],
+            "Material description": [f"ITEM {i}" for i in range(n)],
+            "Stock Cat": "MTO",
+            "Material Classification": "strangers",
+            "vendor name": "ACME",
+            "Std cost": np.linspace(5, 90, n).round(2),
+            "SS": range(10, 10 + n),
+        }).to_excel(tmp_path / "master.xlsx", index=False)
+        frame = (Intake(verbose=False)
+                 .load_files([tmp_path / "master.xlsx"]).frame("planning_master"))
+        assert len(frame) == n
+        assert set(frame["sku"]) == set(self.ERP)
+

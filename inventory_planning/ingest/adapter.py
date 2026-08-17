@@ -280,6 +280,19 @@ def _normalize_material(series: pd.Series) -> pd.Series:
     return cleaned.where(~numeric, unpadded)
 
 
+def _apply_normalize(series: pd.Series, normalize: Optional[str]) -> pd.Series:
+    """Apply a contract field's string `normalize` rule. Shared by the parse and derive stages."""
+    if normalize == "upper_strip":
+        return series.str.upper().str.strip() if series.dtype == object else series
+    if normalize == "lower_strip":
+        return series.str.lower().str.strip() if series.dtype == object else series
+    if normalize == "strip":
+        return series.str.strip() if series.dtype == object else series
+    if normalize == "material_number":
+        return _normalize_material(series)
+    return series
+
+
 @dataclass
 class Adapter:
     """A frozen, versioned mapping from one source format to one contract."""
@@ -520,17 +533,11 @@ class Adapter:
                 log.append(TransformStep(col, "parsed", f"date ({fmt})"))
 
             else:
-                if spec.normalize == "upper_strip":
-                    series = series.str.upper().str.strip() if series.dtype == object else series
-                elif spec.normalize == "lower_strip":
-                    series = series.str.lower().str.strip() if series.dtype == object else series
-                elif spec.normalize == "strip":
-                    series = series.str.strip() if series.dtype == object else series
-                elif spec.normalize == "material_number":
-                    series = _normalize_material(series)
+                normalized = _apply_normalize(series, spec.normalize)
+                if spec.normalize == "material_number":
                     log.append(TransformStep(col, "normalized",
                                              "material number (leading zeros removed)"))
-                df[col] = series
+                df[col] = normalized
 
         return df
 
@@ -585,13 +592,37 @@ class Adapter:
         """
         for target, expr_src in self.derivations.items():
             expr = Expression(expr_src)
-            if not expr.can_evaluate(df):
-                missing = sorted(expr.missing_columns(df))
+            missing = set(expr.missing_columns(df))
+            if missing and missing >= set(expr.columns):
+                # Nothing to derive from — every input is absent from this export.
                 log.append(TransformStep(target, "derived",
-                                         f"SKIPPED — needs {missing} ({expr_src})"))
+                                         f"SKIPPED — needs {sorted(missing)} ({expr_src})"))
                 continue
+            if missing:
+                # Some inputs are present, some absent. A derivation that combines the
+                # candidate columns different regions use — e.g. an sku coalesced across
+                # the two key columns SAP exports put the material number in — must
+                # survive a candidate not existing in this particular export. The absent
+                # column is null here, so the coalesce falls through to the present one.
+                for col in missing:
+                    df[col] = np.nan
+                log.append(TransformStep(target, "derived",
+                                         f"absent here, treated as null: {sorted(missing)}"))
             df[target] = expr.evaluate(df)
             log.append(TransformStep(target, "derived", f"= {expr_src}"))
+
+        # A derived identifier must be normalised the same as a mapped one. Normalisation
+        # runs in the parse stage, before these fields exist, so an sku coalesced from two
+        # candidate key columns would otherwise keep the SAP zero-padding or trailing ".0"
+        # that the downstream join depends on having stripped.
+        for target in self.derivations:
+            spec = contract.field(target)
+            if spec is None or target not in df.columns:
+                continue
+            df[target] = _apply_normalize(df[target], spec.normalize)
+            if spec.normalize == "material_number":
+                log.append(TransformStep(target, "normalized",
+                                         "material number (leading zeros removed)"))
 
         for field_name in contract.derivable_fields:
             already_present = field_name in df.columns and df[field_name].notna().any()

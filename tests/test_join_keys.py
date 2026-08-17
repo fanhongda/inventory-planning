@@ -30,7 +30,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from inventory_planning.ingest.intake import Intake
+from inventory_planning.ingest.intake import Intake, load_file
 from inventory_planning.ingest.profiler import Profiler
 from inventory_planning.ingest.registry import AdapterRegistry
 
@@ -276,3 +276,123 @@ class TestOneMasterAdapterServesEveryRegion:
         assert len(frame) == n
         assert set(frame["sku"]) == set(self.ERP)
 
+
+
+class TestAFrozenAdapterDeclinesWhatItDoesNotOwn:
+    """
+    A frozen adapter redirects the join key, so a file it claims by accident gets
+    re-keyed to whatever that adapter thinks the key is.
+
+    This is not hypothetical. The first Regional adapter fingerprinted on six columns every
+    regional master shares and hard-mapped `sku` to `Alternate material`. On a region
+    whose second key column is blank it re-keyed all 60 rows to a null SKU and the
+    rollup collapsed the master to one row. That one halted the run — `required_field:sku`
+    fails and `unusable()` raises — but a hard stop on valid data is still the adapter
+    claiming a file it was never written for.
+
+    `TestOneMasterAdapterServesEveryRegion` covers what the adapter *should* claim.
+    This covers the inverse, which had no guard: what it must refuse. The tests are
+    written against the whole registry rather than one adapter, so they keep applying
+    as adapters are added.
+    """
+
+    @staticmethod
+    def _route(registry, df, name):
+        return registry.route(df, source_name=name)
+
+    def test_no_frozen_adapter_claims_a_document_of_another_type(self, registry):
+        """
+        A fingerprint is header overlap, and headers repeat across document types —
+        `Material`, `Vendor`, a cost column. Nothing stops an over-broad signature from
+        claiming a purchase history.
+        """
+        frozen = [a for a in registry.adapters if a.status == "frozen"]
+        assert frozen, "no frozen adapters — this guard is pointless if it tests nothing"
+
+        others = {
+            "po_history": pd.DataFrame({
+                "Material": [f"600{i:04d}" for i in range(40)],
+                "Vendor": "V1", "PO Number": [f"45{i:06d}" for i in range(40)],
+                "PO Date": "2026-01-01", "GR Date": "2026-02-01",
+                "PO quantity": 10, "Net Price": 5.0,
+            }).astype(str),
+            "inventory": pd.DataFrame({
+                "Material": [f"600{i:04d}" for i in range(40)],
+                "Plant": "1000", "Total Stock Qty": 10, "BUn": "EA",
+            }).astype(str),
+        }
+        for name, df in others.items():
+            route = self._route(registry, df, f"{name}.xlsx")
+            claimed = route.adapter
+            if claimed.status != "frozen":
+                continue
+            assert claimed.doc_type == route.contract.doc_type, (
+                f"{claimed.name} claimed a {name} export as {claimed.doc_type}"
+            )
+
+    def test_a_generic_master_is_not_claimed_by_the_regional_adapter(self, registry):
+        """
+        The tenant adapter must not claim a master that merely happens to have two
+        identifier columns. At the default 0.6 threshold it did — including the fixture
+        in this file, which then stopped reporting the very mismatch it exists to prove.
+        """
+        generic = pd.DataFrame({
+            "Material": [f"LOCAL-{i:04d}" for i in range(60)],
+            "Alternate material ": [f"600{i:04d}" for i in range(60)],
+            "SS": range(10, 70),
+            "Std cost": np.linspace(5, 90, 60).round(2),
+        }).astype(str)
+        route = self._route(registry, generic, "master.xlsx")
+        assert route.adapter.status != "frozen", (
+            f"{route.adapter.name} claimed a generic master it was not written for"
+        )
+
+    def test_a_frozen_adapter_never_nulls_the_key_it_claims(self, registry, tmp_path):
+        """
+        The property that actually matters, stated directly: whatever a frozen adapter
+        claims, it must produce a usable key for. A fingerprint tuned by hand can always
+        be one export away from wrong; this asserts the consequence rather than the
+        cause.
+        """
+        from inventory_planning.ingest.contract import default_registry
+
+        contracts = default_registry()
+        shapes = {
+            "regional_pl30_layout": pd.DataFrame({
+                "Material": [f"LOCAL-{i:04d}" for i in range(60)],
+                "Alternate material": [float(f"6{i:06d}") for i in range(60)],
+                "Material description": [f"ITEM {i}" for i in range(60)],
+                "Stock Cat": "MTS", "Material Classification": "Runners",
+                "vendor name": "ACME", "Std cost": np.linspace(5, 90, 60).round(2),
+                "SS": range(10, 70),
+            }),
+            "other_region_layout": pd.DataFrame({
+                "Material": [float(f"6{i:06d}") for i in range(60)],
+                "Alternate material": [np.nan] * 60,
+                "Material description": [f"ITEM {i}" for i in range(60)],
+                "Stock Cat": "MTS", "Material Classification": "Runners",
+                "vendor name": "ACME", "Std cost": np.linspace(5, 90, 60).round(2),
+                "SS": range(10, 70),
+            }),
+        }
+        for label, df in shapes.items():
+            # Loaded the way the pipeline loads, not with `.astype(str)`. The two are
+            # not equivalent: `astype` renders a NaN as the literal string "nan", which
+            # `coalesce` reads as a real value and never falls through, while
+            # `load_sheets` reads a blank cell as a genuine NaN. A fixture built the
+            # first way tests a frame the loader never produces — and on pandas 2 it
+            # fails for that reason alone, which is a bug in the fixture rather than in
+            # the adapter.
+            path = tmp_path / f"{label}.xlsx"
+            df.to_excel(path, index=False)
+            loaded = load_file(path)
+
+            route = self._route(registry, loaded, path.name)
+            if route.adapter.status != "frozen":
+                continue
+            out, _ = route.adapter.apply(loaded, contracts.get(route.adapter.doc_type))
+            key = out["sku"]
+            assert key.notna().all(), f"{label}: {route.adapter.name} nulled the key"
+            assert len(out) == len(df), (
+                f"{label}: {len(df)} rows collapsed to {len(out)} — a null key rolled up"
+            )

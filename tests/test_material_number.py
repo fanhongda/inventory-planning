@@ -81,6 +81,18 @@ class TestNormalization:
     def test_a_meaningful_dot_is_kept(self, raw):
         assert _normalize_material(pd.Series([raw])).iloc[0] == raw.strip().upper()
 
+    @pytest.mark.parametrize("raw", ["nan", "NaN", "NAN", "NaT", "None", "<NA>", "null"])
+    def test_a_stringified_null_reads_back_as_null(self, raw):
+        """
+        The one shape of the empty-key failure that stays quiet. A null rendered as
+        text is a non-null string, so `required_field:sku` passes, and then the rollup
+        groups every row under that one key and collapses the document to a single row.
+        Several paths produce it — `Series.astype(str)` on pandas 2 among them — and a
+        coalesce across two candidate key columns will happily prefer it over the real
+        value sitting in the other column.
+        """
+        assert pd.isna(_normalize_material(pd.Series([raw])).iloc[0])
+
     def test_case_and_whitespace_still_normalize(self):
         assert _normalize_material(pd.Series([" abc-1 "])).iloc[0] == "ABC-1"
 

@@ -273,6 +273,13 @@ def _normalize_material(series: pd.Series) -> pd.Series:
     if series.dtype != object and not pd.api.types.is_string_dtype(series):
         return series
     cleaned = series.astype("string").str.strip().str.upper()
+    # A null that has already been rendered as text is worse than a null. `NAN` is a
+    # non-null string, so `required_field:sku` passes, and then the rollup groups every
+    # row under one key and collapses the document to a single row — the one shape of
+    # this failure that stays quiet. Reading it back as null makes the guard fire
+    # instead. No material number is literally "NAN"; several code paths produce it,
+    # `Series.astype(str)` on pandas 2 among them.
+    cleaned = cleaned.mask(cleaned.isin({"NAN", "NAT", "NONE", "<NA>", "NULL"}))
     cleaned = cleaned.str.replace(r"^(\d+)\.0+$", r"\1", regex=True)
     numeric = cleaned.str.fullmatch(r"0*\d+").fillna(False)
     # `.str.lstrip("0")` would turn "000" into "", so restore a bare zero.

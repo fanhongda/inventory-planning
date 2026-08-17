@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
+from .fx import FxSummary, FxTable, convert_money
 from .ingest.intake import Intake, IntakeResult
 
 
@@ -50,12 +51,41 @@ class IngestBridge:
         self.config_dir = Path(config_dir) if config_dir else Path(__file__).parent.parent / "config"
         self.verbose = verbose
         self.location_id = self._load_location_id()
+        self.fx = FxTable.load(self.config_dir, reporting_currency=self._load_reporting_currency())
+        self._warn_currency_mismatch()
 
-    def _load_location_id(self) -> str:
+    def _node_config(self) -> Dict[str, Any]:
         cfg = self.config_dir / "node_config.json"
         if cfg.exists():
-            return json.loads(cfg.read_text(encoding="utf-8")).get("location_id", "DC-01")
-        return "DC-01"
+            return json.loads(cfg.read_text(encoding="utf-8"))
+        return {}
+
+    def _load_location_id(self) -> str:
+        return self._node_config().get("location_id", "DC-01")
+
+    def _load_reporting_currency(self) -> Optional[str]:
+        """
+        The node's currency is what the planner reports in, so it wins over the rate
+        file's own header. A node configured in EUR reading a USD-headed rate table is
+        a misconfiguration worth surfacing rather than quietly resolving.
+        """
+        return self._node_config().get("currency")
+
+    def _warn_currency_mismatch(self) -> None:
+        """
+        The node currency and the rate file's header must agree, or the rates point the
+        wrong way. Rates are directional — a table of "into USD" quotes used to report
+        in EUR inverts every conversion, and the totals stay plausible while doing it.
+        """
+        path = self.config_dir / "fx_rates.json"
+        if not path.exists():
+            return
+        declared = json.loads(path.read_text(encoding="utf-8")).get("reporting_currency")
+        node = self._load_reporting_currency()
+        if declared and node and str(declared).upper() != str(node).upper():
+            print(f"  ⚠ node_config.json reports in {node} but fx_rates.json quotes into "
+                  f"{declared}. Reporting in {node}; the rates are being read as "
+                  f"into-{node} quotes, which they are not. Fix one of the two files.")
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -75,9 +105,13 @@ class IngestBridge:
             "item_master_df": None,
             "planning_master_df": None,
         }
+        fx = FxSummary(
+            reporting_currency=self.fx.reporting_currency,
+            rates_configured=self.fx.source_path is not None,
+        )
 
         for doc_type, doc in result.documents.items():
-            frame = self._prepare(doc.frame.copy(), doc_type)
+            frame = self._prepare(doc.frame.copy(), doc_type, fx)
             if doc_type == "inventory":
                 out["inventory_df"] = frame
             elif doc_type == "item_master":
@@ -99,6 +133,10 @@ class IngestBridge:
 
         out["_intake"] = result
         out["_intake_plan"] = result.plan
+        out["_fx"] = fx
+        if self.verbose and (fx.multi_currency or not fx.rates_configured):
+            print()
+            print(fx.summary())
         return out
 
     def load(
@@ -114,7 +152,13 @@ class IngestBridge:
 
     # ── Per-document preparation ─────────────────────────────────────────────
 
-    def _prepare(self, df: pd.DataFrame, doc_type: str) -> pd.DataFrame:
+    def _prepare(self, df: pd.DataFrame, doc_type: str, fx: FxSummary = None) -> pd.DataFrame:
+        # Currency first, before the renames — the money columns still carry their
+        # canonical names here, and every downstream figure is built on their values.
+        df, report = convert_money(df, doc_type, self.fx)
+        if fx is not None and not report.skipped:
+            fx.reports[doc_type] = report
+
         df = df.rename(columns=_DOWNSTREAM_RENAMES.get(doc_type, {}))
         # Every downstream output carries location_id for multi-echelon readiness;
         # only the inventory contract sources it from the data, so the rest inherit
@@ -129,16 +173,27 @@ class IngestBridge:
         """
         Lead time is already derived by the contract (from dates or a pre-computed
         column). What remains is the outlier trim the analytics assume has happened.
+
+        The trim blanks the lead time; it does not drop the row. An implausible lead
+        time means the *receipt date* is unusable, and nothing else on the line is
+        implicated — the order was still raised, for that quantity, on that date, at
+        that price. Dropping the whole row threw 11,910 of the 22,476 purchase lines in
+        the last year off the real extract, 63% of the ordered quantity, and every
+        analysis that counts what was bought then read the remainder as the whole:
+        ordering diagnostics under-counted, and the cumulative PO-versus-sales balance
+        showed items running a six-figure deficit that they were never actually in.
         """
         if "lead_time_days" not in df.columns:
             df["lead_time_days"] = np.nan
             return df
 
+        df = df.copy()
         df["lead_time_days"] = pd.to_numeric(df["lead_time_days"], errors="coerce")
         bad = (df["lead_time_days"] <= 0) | (df["lead_time_days"] > 730)
         if bad.sum() and self.verbose:
-            print(f"  Excluded {int(bad.sum())} PO rows with implausible lead time (<=0 or >730d)")
-        df = df[~bad].copy()
+            print(f"  {int(bad.sum())} PO rows have an implausible lead time (<=0 or >730d) — "
+                  f"their lead time is discarded, the orders themselves are kept")
+        df.loc[bad, "lead_time_days"] = np.nan
 
         if "po_qty" in df.columns:
             df["po_qty"] = pd.to_numeric(df["po_qty"], errors="coerce")

@@ -221,6 +221,115 @@ def detect_date_order(values: pd.Series) -> Optional[bool]:
     return day_first > month_first
 
 
+# ── Internal consistency ─────────────────────────────────────────────────────
+#
+# One column, two ways of writing the same thing. The assumption that a column speaks
+# one convention is usually safe and, when it is wrong, wrong in a way that produces no
+# error — one representation parses and the other quietly becomes null.
+#
+# Excel is the usual cause. Open a US-format export under a day-first locale and it
+# converts the cells it *can* read as day-first — the ones where both components are
+# 12 or less — into real dates, silently swapping month and day as it goes, and leaves
+# the rest as text because `10/14/2024` is not a valid day-first date. The column is
+# then half native dates and half text, and the two halves disagree about what the
+# numbers mean. The real sales extract had 25,391 text values against 8,737 converted
+# ones in `Invdate Date`, and the same split again in `Orddate Date`.
+#
+# This does not attempt to repair anything. It reports that a column contains more than
+# one kind of value, and leaves the judgement to a person, because the correct response
+# differs: a date mix is repairable, a decimal-style mix usually means two systems were
+# pasted together, and a numeric-and-text mix is often a footnote row.
+
+_ISO_DATE_RE = re.compile(r"^\s*\d{4}-\d{1,2}-\d{1,2}([ T].*)?$")
+_DELIM_DATE_RE = re.compile(r"^\s*\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}\s*$")
+_PLAIN_NUM_RE = re.compile(r"^-?[\d,.\s]+$")
+
+# A representation has to hold this share of the column before the mix is worth
+# raising. Below it the odd value is a footnote or a stray "N/A", not a second
+# convention, and flagging it trains the reader to skip the warning.
+MIX_MIN_SHARE = 0.02
+MIX_MIN_COUNT = 10
+
+
+def classify_representation(raw: Any) -> Optional[str]:
+    """Which way of writing a value this is, or None when it carries no signal."""
+    text = str(raw).strip()
+    if not text or text.lower() in ("nan", "nat", "none"):
+        return None
+    if _ISO_DATE_RE.match(text):
+        return "iso_date"
+    if _DELIM_DATE_RE.match(text):
+        return "delimited_date"
+    if _EU_NUM_RE.match(text):
+        return "eu_number"
+    if _US_NUM_RE.match(text):
+        return "us_number"
+    if _PLAIN_NUM_RE.match(text):
+        return "plain_number"
+    return "text"
+
+
+def detect_representation_mix(values: pd.Series) -> Optional[Dict[str, int]]:
+    """
+    Counts per representation when a column holds more than one, else None.
+
+    Reads the whole column rather than a sample. A partial Excel conversion follows
+    whichever values were ambiguous, not row order, so the first 500 rows of a split
+    column are frequently all one representation — sampling would report exactly the
+    files that look tidiest at the top and miss the split underneath.
+
+    Only *incompatible* pairings are reported. A column of dates alongside a handful of
+    free-text remarks is untidy; a column of dates written two ways is a correctness
+    problem, because whichever parser is chosen silently discards the other half.
+    """
+    seen = values.dropna()
+    if seen.empty:
+        return None
+
+    text = seen.astype("string").str.strip()
+    text = text[text.notna() & (text != "") & ~text.str.lower().isin(["nan", "nat", "none"])]
+    if text.empty:
+        return None
+
+    # Matched in the same priority order as `classify_representation`, each mask
+    # excluding everything already claimed, so the counts partition the column.
+    counts: Dict[str, int] = {}
+    remaining = pd.Series(True, index=text.index)
+    for kind, pattern in (("iso_date", _ISO_DATE_RE),
+                          ("delimited_date", _DELIM_DATE_RE),
+                          ("eu_number", _EU_NUM_RE),
+                          ("us_number", _US_NUM_RE),
+                          ("plain_number", _PLAIN_NUM_RE)):
+        hit = remaining & text.str.match(pattern).fillna(False)
+        n = int(hit.sum())
+        if n:
+            counts[kind] = n
+        remaining &= ~hit
+    leftover = int(remaining.sum())
+    if leftover:
+        counts["text"] = leftover
+
+    if len(counts) < 2:
+        return None
+
+    total = sum(counts.values())
+    material = {
+        k: v for k, v in counts.items()
+        if v >= MIX_MIN_COUNT and v / total >= MIX_MIN_SHARE
+    }
+    if len(material) < 2:
+        return None
+
+    # Which combinations actually corrupt. Two ways of writing a date, or two decimal
+    # conventions, mean half the column parses wrong. Numbers next to text usually
+    # means a total row, which `_count_total_rows` already reports.
+    date_forms = {"iso_date", "delimited_date"} & set(material)
+    number_forms = {"eu_number", "us_number"} & set(material)
+    if len(date_forms) < 2 and len(number_forms) < 2:
+        return None
+    return dict(sorted(material.items(), key=lambda kv: -kv[1]))
+
+
 def detect_decimal_style(values: pd.Series) -> Optional[str]:
     """
     Distinguish European (1.200,50) from US (1,200.50) numeric formatting.
@@ -284,6 +393,9 @@ class ColumnProfile:
     samples: Optional[List[str]] = None           # only when include_samples=True
     dayfirst_evidence: Optional[bool] = None      # True=DMY, False=MDY, None=ambiguous
     decimal_style: Optional[str] = None           # "eu" (1.200,50) | "us" (1,200.50)
+    # Two or more incompatible ways of writing the same value in one column. Whichever
+    # parser wins, the other representation becomes null without raising.
+    representation_mix: Optional[Dict[str, int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -322,6 +434,8 @@ class ColumnProfile:
             out["date_order"] = "DMY" if self.dayfirst_evidence else "MDY"
         if self.decimal_style:
             out["decimal_style"] = self.decimal_style
+        if self.representation_mix:
+            out["representation_mix"] = self.representation_mix
         if self.samples is not None:
             out["samples"] = self.samples
         return out
@@ -469,6 +583,19 @@ class Profiler:
         if eu_votes:
             notes.append(f"European decimal format detected (evidence in {eu_votes[:3]})")
 
+        # Raised loudly and per column, because this is the class of defect that
+        # produces a clean-looking run over half the data.
+        for col in cols:
+            if not col.representation_mix:
+                continue
+            detail = ", ".join(f"{k.replace('_', ' ')} x{v:,}"
+                               for k, v in col.representation_mix.items())
+            notes.append(
+                f"⚠ MIXED FORMATS in {col.name!r}: {detail}. One column, two conventions "
+                f"— whichever one is parsed, the other becomes null without raising. "
+                f"Check this column by hand before trusting anything derived from it."
+            )
+
         return TableProfile(
             source_name=source_name,
             row_count=len(df),
@@ -534,6 +661,11 @@ class Profiler:
         sample = non_null_series.head(self.SAMPLE_ROWS)
 
         prof.decimal_style = detect_decimal_style(sample)
+        # Judged over more rows than the other detectors use. A partial Excel
+        # conversion is not evenly distributed — it follows whichever values happened
+        # to be ambiguous — so a 500-row sample off the top of the file can be entirely
+        # one representation while the column as a whole is split.
+        prof.representation_mix = detect_representation_mix(non_null_series)
         # Strip whichever thousands separator this column actually uses before
         # judging numeric-ness, or every European-formatted amount reads as text.
         stripped = sample.astype(str).str.strip()

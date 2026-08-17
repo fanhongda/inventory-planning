@@ -416,6 +416,7 @@ class Intake:
         result.plan = self.resolver.resolve(loaded, unrecognised, withheld=withheld)
         self._note_po_overlap(result)
         self._check_sku_agreement(result)
+        self._note_mixed_formats(result)
 
         if self.verbose:
             print(result.summary())
@@ -481,6 +482,46 @@ class Intake:
                 "numbers derived from it will be empty rather than wrong."
             )
             result.notes.append("\n".join(lines))
+
+    @staticmethod
+    def _note_mixed_formats(result: IntakeResult) -> None:
+        """
+        Name every source column that holds two conventions at once, for a human to look at.
+
+        Raised even where the parser repaired it. The repair is a rescue of this run's
+        numbers, not a fix — the file on the share drive is still broken, the next
+        export will be broken the same way, and whoever produces it does not yet know.
+        A note that disappears the moment the symptom is handled is how a source defect
+        becomes permanent.
+
+        It is also raised where the parser declined to repair, which is the case that
+        actually needs the human: the column is split, the evidence did not support a
+        correction, and some of it is being read one way and the rest another.
+        """
+        flagged: List[str] = []
+        for doc in sorted(result.documents.values(), key=lambda d: d.doc_type):
+            profile = doc.profile
+            if profile is None:
+                continue
+            for col in profile.columns:
+                if not col.representation_mix:
+                    continue
+                detail = ", ".join(f"{k.replace('_', ' ')} x{v:,}"
+                                   for k, v in col.representation_mix.items())
+                flagged.append(f"      {doc.source_name} · {col.name!r}: {detail}")
+        if not flagged:
+            return
+
+        result.notes.append(
+            "  ⚠ MIXED FORMATS — one column, two conventions. Check these by hand:\n"
+            + "\n".join(flagged)
+            + "\n      Usually a spreadsheet opened under a locale that disagreed with the "
+              "file: it converts\n      the values it can read and silently swaps month and "
+              "day, leaving the rest as text. Where\n      the evidence was conclusive the "
+              "parser restored them — see the transform log — but the\n      source file is "
+              "still wrong and the next export will be too. Fix it upstream: export dates\n"
+              "      in ISO (YYYY-MM-DD), or as a real date column rather than text."
+        )
 
     @staticmethod
     def _note_po_overlap(result: IntakeResult) -> None:

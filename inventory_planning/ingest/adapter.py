@@ -140,6 +140,106 @@ class ParsingRules:
 _ISO_PREFIX = re.compile(r"^\s*\d{4}-\d{2}-\d{2}")
 
 
+# One date column written two ways, which the single-parser assumption above cannot
+# survive. Excel produces it: opened under a locale that disagrees with the file, it
+# converts the cells it can read — the ones where both components are 12 or less — into
+# real dates, swapping month and day as it does so, and leaves the rest as text because
+# `10/14/2024` is not a valid day-first date. Read back out, the column is half
+# `2024-04-10 00:00:00` and half `10/14/2024`.
+#
+# Whichever parser is chosen, the other half becomes NaT. On the real sales extract that
+# silently removed 8,737 of 34,128 rows — 9.7% of all shipped quantity across 759 of
+# 1,256 SKUs — and the survivors were exactly the values whose day exceeded 12.
+_MIXED_DELIM_DATE = re.compile(r"^\s*\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}\s*$")
+_MIXED_ISO_DATE = re.compile(r"^\s*\d{4}-\d{1,2}-\d{1,2}([ T].*)?$")
+
+# Converted values needed before "not one day exceeds 12" is evidence rather than
+# coincidence. Days are roughly uniform over 1..31, so the chance of a genuine sample
+# staying at or below 12 is about 0.4^n — vanishing well before this threshold.
+_SWAP_MIN_EVIDENCE = 20
+# How far outside the text half's own span a repaired value may fall before the repair
+# is judged to have made things worse.
+_SPAN_SLACK = pd.Timedelta(days=31)
+
+
+def _parse_mixed_dates(series: pd.Series, dayfirst: bool):
+    """
+    Parse a column that holds both ISO-converted and delimited-text dates.
+
+    Returns `(parsed, description)`, or None when the column is not mixed and the
+    ordinary single-parser path should handle it.
+
+    Repairing the month/day swap is gated on evidence, never assumed. Three things must
+    hold together: the text half states an unambiguous order (some component exceeds
+    12), the converted half contains no day above 12 at all — the fingerprint of having
+    been filtered to the ambiguous values — and swapping must actually move the
+    converted half *into* the span the text half occupies rather than out of it. That
+    last check is what makes the repair self-correcting: where the evidence is
+    misleading, the swap loses the comparison and the values are kept as they are.
+    """
+    text = series.astype(str).str.strip()
+    iso_mask = text.str.match(_MIXED_ISO_DATE).fillna(False)
+    delim_mask = text.str.match(_MIXED_DELIM_DATE).fillna(False) & ~iso_mask
+    if not (iso_mask.any() and delim_mask.any()):
+        return None
+
+    from .profiler import detect_date_order
+
+    order = detect_date_order(text[delim_mask])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        delim = pd.to_datetime(text[delim_mask], errors="coerce",
+                               dayfirst=order if order is not None else dayfirst)
+        native = pd.to_datetime(text[iso_mask], errors="coerce", format="ISO8601")
+
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    parsed.loc[delim.index] = delim
+    parsed.loc[native.index] = native
+
+    n_iso, n_delim = int(iso_mask.sum()), int(delim_mask.sum())
+    detail = f"mixed: {n_delim:,} text + {n_iso:,} ISO-converted"
+
+    usable = native.dropna()
+    eligible = (
+        order is not None
+        and len(usable) >= _SWAP_MIN_EVIDENCE
+        and not (usable.dt.day > 12).any()
+    )
+    if not eligible:
+        return parsed, detail
+
+    swapped = pd.to_datetime(
+        dict(year=usable.dt.year, month=usable.dt.day, day=usable.dt.month),
+        errors="coerce",
+    )
+    span = delim.dropna()
+    if span.empty:
+        return parsed, detail
+    lo, hi = span.min() - _SPAN_SLACK, span.max() + _SPAN_SLACK
+
+    def inside(values):
+        return int(((values >= lo) & (values <= hi)).sum())
+
+    # The fingerprint above is the proof, not this check. A mixed column can only arise
+    # when the spreadsheet's locale disagreed with the file: had it agreed, every value
+    # would have converted and there would be no text half left to compare against. So
+    # a converted half holding no day past the 12th has been filtered to the ambiguous
+    # values, and filtering to the ambiguous values is precisely what swaps them.
+    #
+    # The span comparison is therefore a veto, not a requirement — it fires only when
+    # restoring the values would push them somewhere the rest of the column never goes.
+    # Demanding the swap be strictly *better* would refuse it for every export whose
+    # halves already overlap, which is most of them.
+    if inside(swapped) < inside(usable):
+        return parsed, f"{detail}; month/day swap not supported by the date span"
+
+    parsed.loc[swapped.index] = swapped
+    return parsed, (
+        f"{detail}; {len(swapped):,} converted values had month and day swapped by the "
+        f"spreadsheet and were restored ({'DMY' if order else 'MDY'} source order)"
+    )
+
+
 def _looks_iso(series: pd.Series, sample: int = 200) -> bool:
     """Whether a text date column is in unambiguous ISO order."""
     values = series.dropna().astype(str).head(sample)
@@ -162,14 +262,35 @@ def _normalize_material(series: pd.Series) -> pd.Series:
     Only an all-digit value is unpadded. `4190-6002`, `ULFMCV224151` and
     `SERVICE_BSINES_SUP` keep their exact form, because a leading zero in a
     non-numeric code can be significant.
+
+    A trailing `.0` is dropped for the same reason. When a spreadsheet stores an
+    identifier column as numeric rather than text, every value reads back as
+    `7100016.0`, and that joins with nothing — the same silent empty result as the
+    padding, arriving by a different route. Only an otherwise all-digit value with
+    nothing but zeros after the point is trimmed, so `4190-6002` and a genuine
+    decimal are both left alone.
     """
     if series.dtype != object and not pd.api.types.is_string_dtype(series):
         return series
     cleaned = series.astype("string").str.strip().str.upper()
+    cleaned = cleaned.str.replace(r"^(\d+)\.0+$", r"\1", regex=True)
     numeric = cleaned.str.fullmatch(r"0*\d+").fillna(False)
     # `.str.lstrip("0")` would turn "000" into "", so restore a bare zero.
     unpadded = cleaned.str.lstrip("0").replace("", "0")
     return cleaned.where(~numeric, unpadded)
+
+
+def _apply_normalize(series: pd.Series, normalize: Optional[str]) -> pd.Series:
+    """Apply a contract field's string `normalize` rule. Shared by the parse and derive stages."""
+    if normalize == "upper_strip":
+        return series.str.upper().str.strip() if series.dtype == object else series
+    if normalize == "lower_strip":
+        return series.str.lower().str.strip() if series.dtype == object else series
+    if normalize == "strip":
+        return series.str.strip() if series.dtype == object else series
+    if normalize == "material_number":
+        return _normalize_material(series)
+    return series
 
 
 @dataclass
@@ -382,6 +503,17 @@ class Adapter:
                 log.append(TransformStep(col, "parsed", f"numeric ({spec.type})"))
 
             elif spec.is_temporal:
+                # A column written two ways is handled before anything picks a single
+                # parser, because picking one is what silently discards the other half.
+                # An explicit `date_format` in the adapter still wins: that is a human
+                # stating what the source is, and it outranks inference.
+                mixed = None if p.date_format else _parse_mixed_dates(series, p.dayfirst)
+                if mixed is not None:
+                    df[col], detail = mixed
+                    log.append(TransformStep(col, "parsed", f"date ({detail})",
+                                             rows_affected=int(df[col].notna().sum())))
+                    continue
+
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", UserWarning)
                     if p.date_format:
@@ -401,17 +533,11 @@ class Adapter:
                 log.append(TransformStep(col, "parsed", f"date ({fmt})"))
 
             else:
-                if spec.normalize == "upper_strip":
-                    series = series.str.upper().str.strip() if series.dtype == object else series
-                elif spec.normalize == "lower_strip":
-                    series = series.str.lower().str.strip() if series.dtype == object else series
-                elif spec.normalize == "strip":
-                    series = series.str.strip() if series.dtype == object else series
-                elif spec.normalize == "material_number":
-                    series = _normalize_material(series)
+                normalized = _apply_normalize(series, spec.normalize)
+                if spec.normalize == "material_number":
                     log.append(TransformStep(col, "normalized",
                                              "material number (leading zeros removed)"))
-                df[col] = series
+                df[col] = normalized
 
         return df
 
@@ -466,13 +592,37 @@ class Adapter:
         """
         for target, expr_src in self.derivations.items():
             expr = Expression(expr_src)
-            if not expr.can_evaluate(df):
-                missing = sorted(expr.missing_columns(df))
+            missing = set(expr.missing_columns(df))
+            if missing and missing >= set(expr.columns):
+                # Nothing to derive from — every input is absent from this export.
                 log.append(TransformStep(target, "derived",
-                                         f"SKIPPED — needs {missing} ({expr_src})"))
+                                         f"SKIPPED — needs {sorted(missing)} ({expr_src})"))
                 continue
+            if missing:
+                # Some inputs are present, some absent. A derivation that combines the
+                # candidate columns different regions use — e.g. an sku coalesced across
+                # the two key columns SAP exports put the material number in — must
+                # survive a candidate not existing in this particular export. The absent
+                # column is null here, so the coalesce falls through to the present one.
+                for col in missing:
+                    df[col] = np.nan
+                log.append(TransformStep(target, "derived",
+                                         f"absent here, treated as null: {sorted(missing)}"))
             df[target] = expr.evaluate(df)
             log.append(TransformStep(target, "derived", f"= {expr_src}"))
+
+        # A derived identifier must be normalised the same as a mapped one. Normalisation
+        # runs in the parse stage, before these fields exist, so an sku coalesced from two
+        # candidate key columns would otherwise keep the SAP zero-padding or trailing ".0"
+        # that the downstream join depends on having stripped.
+        for target in self.derivations:
+            spec = contract.field(target)
+            if spec is None or target not in df.columns:
+                continue
+            df[target] = _apply_normalize(df[target], spec.normalize)
+            if spec.normalize == "material_number":
+                log.append(TransformStep(target, "normalized",
+                                         "material number (leading zeros removed)"))
 
         for field_name in contract.derivable_fields:
             already_present = field_name in df.columns and df[field_name].notna().any()

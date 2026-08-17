@@ -36,6 +36,28 @@ identifying_any:
   - [planner_safety_stock, planner_reorder_point, planner_min_qty, planner_max_qty,
      planner_review_period_days, planner_service_level]
 
+value_domains:
+
+  stocking_policy:
+    canonical: [MTS, MTO]
+    # No default. An unrecognised code must stay unset rather than become MTO: the
+    # policy decides whether stock is expected to sit on the shelf at all, so a
+    # guessed value silently rewrites what "past due with stock available" means.
+    map:
+      "mts": MTS
+      "make to stock": MTS
+      "make-to-stock": MTS
+      "maketostock": MTS
+      "stock": MTS
+      "stocked": MTS
+      "mto": MTO
+      "make to order": MTO
+      "make-to-order": MTO
+      "maketoorder": MTO
+      "order": MTO
+      "non-stock": MTO
+      "non stock": MTO
+
 fields:
 
   sku:
@@ -180,6 +202,31 @@ fields:
     unit: currency_per_base_uom
     role: measure
     aliases: [unit cost, standard cost, std cost, cost, unit price, price]
+
+  currency:
+    type: string
+    role: dimension
+    normalize: upper_strip
+    description: >
+      Currency the planner's standard cost is stated in. Rarely present on a planning
+      master, but when it is, it decides whether that cost can be compared with a
+      measured purchase price at all.
+    aliases: [currency, currency code, curr, crcy, doc currency, document currency,
+              trans currency, transaction currency, local currency, waers]
+
+  stocking_policy:
+    type: string
+    role: dimension
+    value_domain: stocking_policy
+    description: >
+      Whether the item is held on the shelf or bought against a specific order —
+      make-to-stock or make-to-order, as the ERP records it. Distinct from the
+      pipeline's own `stocking_class`, which is inferred from how often demand
+      actually occurred: this is the policy in force, that is the behaviour observed,
+      and the gap between them is a finding rather than a contradiction.
+    aliases: [stock cat, stock category, stocking policy, stock policy, order policy,
+              planning policy, procurement policy, mto/mts, mto mts, fulfilment policy,
+              fulfillment policy, replenishment policy]
 
   planner_notes:
     type: string

@@ -28,12 +28,25 @@ kpi     = planner.run_kpi_review(policy, sales_df=inputs['sales_df'],
 reintroduce per-document loader calls. The legacy `load_sales_history()` style still
 works but requires the caller to know the answer already.
 
-Outputs land in `output_dir`: `kpi_review_*.html` is the two-chapter review,
-`inventory_report_*.html` is the older forecast-oriented report, plus CSVs.
+Outputs land in `output_dir`: `kpi_review_*.html` is the review, plus CSVs
+(`purchase_recommendations_*`, `parameter_suggestions_*`, `inventory_projection_*`,
+`forecast_detail_*`, `supplier_params`, `sku_planning_params`) and
+`suggested_rules_*.md`. There is no longer an `inventory_report_*.html` — the older
+forecast-oriented report was removed, and three skill evals went on asserting its
+existence for months afterwards.
+
+The review covers, in order: service (OTD split four ways, plus OTD by month), inventory
+against policy, ordering behaviour, replenishment cadence, forward risk, then the work
+list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 151 tests, all should pass
+python3 -m pytest tests/ -q        # 459 tests, all should pass
 ```
+
+Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
+allows both. They differ in ways that fail silently — datetime resolution (`us` vs `ns`,
+so `.astype("int64")` on a date column is out by 1000×), `NaT` stringification, and
+`np.where` on typed columns. Test a fix under both before claiming it works.
 
 ## Where knowledge lives — data, not code
 
@@ -45,6 +58,7 @@ Supporting a new ERP or changing a planning rule should not require a code chang
 | `inventory_planning/ingest/adapters/**/*.yaml` | how one specific export satisfies a contract; drafted on first run, reviewed, then frozen |
 | `config/planning_parameters.md` | segmentation boundaries, calculation conventions, scoped policy overrides — every rule carries a rationale |
 | `config/*.json` | service levels, incoterm rules, node config |
+| `config/fx_rates.json` | exchange rates into the reporting currency, effective-dated. A currency absent here is reported unvalued, never counted at face value |
 
 If you find yourself adding an `if` for a particular customer's column name or business
 rule, it belongs in one of those files instead.
@@ -89,6 +103,46 @@ scored against the clock marks every open line past due.
 **Absence of a column is not evidence for a document type** (`registry.py`). A missing
 receipt-date column made `is_null(receive_date)` vacuously true, so a sales export
 scored 100% as an open PO.
+
+**Money is converted before anything sums it, and an unknown rate is never 1.0**
+(`fx.py`). Source lines arrive in the supplier's currency; adding them raw put ₹7.0bn
+next to $240m and printed the total with a dollar sign. A currency with no configured
+rate blanks its money columns and is reported — defaulting it turns ₹126,550 into
+$126,550 and nothing downstream can tell. A rate the export itself carries wins only
+after passing a plausibility gate: a placeholder `1.0` on a foreign line and an inverted
+quote are both rejected in favour of the table.
+
+**An implausible lead time discards the lead time, not the order** (`ingest_bridge.py`).
+The receipt date is what is unusable; the order was still raised, for that quantity, on
+that date. Dropping whole rows threw away 63% of the ordered quantity and made every
+ordering diagnostic read the remainder as the whole.
+
+**A column can hold two conventions at once, and the parser must not pick one**
+(`adapter.py::_parse_mixed_dates`). A spreadsheet opened under a mismatched locale
+converts the values it can read — swapping month and day — and leaves the rest as text.
+Whichever parser wins, the other half becomes NaT silently. Repairing the swap is gated
+on evidence (unambiguous text order, no day above 12 in the converted half, and the
+repair must not push values outside the column's own span); without it the rows are
+still recovered, only the month/day correction is withheld.
+
+**Cadence is keyed on the order date, not the receipt** (`cadence.py`). The cumulative
+`po_qty − sales_qty` balance measures the planner's decisions against the demand they
+were meant to cover. Folding in supplier delivery would let a reliable planner buying
+from a late supplier read as a control failure — that question belongs to `service.py`
+and `diagnostics.forward`.
+
+**Ordering above the review cadence has to be earned.** It is worth paying for on a
+critical item and nothing else, so it is priced at the order cost and reported only
+where the item is not A-class.
+
+**`stocking_policy` (the ERP's MTO/MTS) is never merged with `stocking_class`** (the
+inferred tier). One is the policy in force, the other the behaviour observed; where they
+disagree that *is* the finding, and merging them erases it.
+
+**Charts are inline SVG against the CSS tokens, never a library** (`kpi_report.py`). The
+report is one self-contained file that opens from a share with no assets and no script.
+Both themes are authored, not auto-flipped. Run the palette through the dataviz
+validator rather than eyeballing contrast.
 
 ## Style
 

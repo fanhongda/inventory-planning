@@ -1,0 +1,82 @@
+name: default__regional_planning_master__planning_master
+doc_type: planning_master
+version: 1
+tenant: default
+system: regional_planning_master
+status: frozen
+description: >
+  Regional planning master (SAP). One export template, many regions — this adapter
+  handles all of them, and replaces the earlier PL30-only one.
+
+  The trap it exists for: the ERP material number every other extract joins on is not
+  always in the same column. Some PL30 exports put a local code in `Material` and the
+  ERP number in `Alternate material`; other exports (PL10, and current PL30) put the ERP
+  number straight in `Material`. Where a region keys `Material` on a local code, mapping
+  `sku` to `Material` agrees with nothing — the merge returns no rows, and that is not an
+  error anywhere: the unit costs, safety stocks and stocking policy simply never arrive,
+  and every figure derived from them reads as absent rather than as wrong.
+
+  So `sku` is derived, not mapped: `coalesce(alternate_material, material)` takes the ERP
+  number wherever the region put it — `Alternate material` when populated, `Material`
+  otherwise. The order is deliberate: preferring `Alternate material` covers the export
+  that keys `Material` on a local code, while an empty or absent `Alternate material`
+  (PL10, current PL30) falls through to `Material`. One rule, every region.
+
+  The predecessor (`default__regional_pl30`) hard-mapped `sku` to `Alternate material`. Its
+  fingerprint matched every region sharing this template, so on a master whose
+  `Alternate material` is empty or absent it re-keyed all rows to a null SKU and the
+  rollup collapsed the whole master to a single row, silently deleting the
+  planner-baseline comparison. The coalesce removes that failure mode.
+
+fingerprint:
+  # Strict on purpose. At the default 0.6 threshold `Material` + `Alternate material` +
+  # `Std cost` was enough to claim any master-shaped export with a secondary key column
+  # — including the synthetic fixture in tests/test_join_keys.py, which then stopped
+  # reporting the very mismatch it exists to prove is reported. 0.8 of six requires the
+  # template-specific columns (Stock Cat, Material Classification, vendor name) too, and
+  # tolerates one signature column being absent — the PL30 export drops `Alternate
+  # material`, and the coalesce falls through to `Material` when it does.
+  min_confidence: 0.8
+  header_contains:
+    - Material
+    - Alternate material
+    - Stock Cat
+    - Material Classification
+    - Std cost
+    - vendor name
+
+grain: sku__fine
+rollup_to: sku
+
+column_map:
+  # Both candidate key columns are carried as non-contract helpers so the parse stage
+  # leaves them untouched — mapping the empty one straight onto `sku` would stringify
+  # its NaN to "NAN", which coalesce then treats as a real value and never falls through.
+  alternate_material: Alternate material
+  material: Material
+  stocking_policy: Stock Cat
+  unit_cost: Std cost
+  planner_safety_stock: SS
+  supplier: vendor name
+  description: Material description
+
+derivations:
+  # The ERP number is in Alternate material for PL30 and in Material for other regions.
+  # Whichever is populated wins; the result is normalised as a material number so the
+  # numeric-cell ".0" and any SAP zero-padding are stripped, the same as a mapped key.
+  sku: "coalesce(alternate_material, material)"
+
+notes:
+  - >
+    `Alternate material` and `Material` are both stored as numeric cells, so they read
+    back as `7100016.0`. The `material_number` normalisation on the derived `sku` trims
+    the trailing `.0` along with SAP's zero padding; without that step the key still
+    joins nothing.
+  - >
+    `Stock Cat` carries MTO/MTS as the ERP holds it. It is the policy in force, and is
+    deliberately not merged with the pipeline's inferred `stocking_class`: one is the
+    intention, the other is the observed behaviour, and where they disagree that is the
+    finding.
+  - >
+    `material` and `alternate_material` are carried only as the coalesce inputs. Nothing
+    downstream joins on them — the join key is the derived `sku`.

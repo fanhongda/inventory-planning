@@ -34,6 +34,15 @@ from .profiler import Profiler, TableProfile, normalize_header
 # Sentinel so a missing contract can be probed for `.discriminator` without a guard.
 _NO_CONTRACT = DocContract(doc_type="", description="")
 
+# How a content test has to perform before it may settle a routing question.
+#
+# A lone applicable test carries the verdict by itself, so it must hold nearly
+# everywhere. Two live tests are judged on the gap between them instead: they are
+# typically complements of one another, so a decisive split is 74/26, not 90/10, and
+# demanding a high level from both is demanding something they cannot jointly give.
+_LONE_TEST_FLOOR = 0.80
+_MIN_MARGIN = 0.30
+
 # Canonical fields holding the item key every join in the pipeline runs on. A column
 # shaped like a document line number disqualifies itself from these and from nothing
 # else — the same column is exactly what `po_line_number` wants.
@@ -340,19 +349,32 @@ class AdapterRegistry:
         ordered = sorted(shares.items(), key=lambda kv: -kv[1])
         winner, top = ordered[0]
 
-        if top < 0.80:
-            return None
-
         if len(ordered) == 1:
-            # One candidate's test is applicable and it holds. That is decisive on its
-            # own: the others could not even be evaluated because the source lacks the
-            # fields they turn on, which is itself the answer.
-            return winner, top, "", 0.0
+            # Nothing to compare against, so the level has to carry the verdict alone.
+            # The others could not even be evaluated, because the source lacks the
+            # fields they turn on — which is itself part of the answer.
+            return (winner, top, "", 0.0) if top >= _LONE_TEST_FLOOR else None
 
         runner_up, second = ordered[1]
-        # With two live tests, demand a clear margin. A narrow gap is not evidence, and
-        # reporting the tie is more useful than committing to a coin flip.
-        if top - second < 0.30:
+        # With two live tests the *margin* is the evidence, not the absolute level, and
+        # requiring a high level of both was wrong. These tests are usually exact
+        # complements — open_so asks `is_null(ship_date)`, sales_history asks
+        # `not_null(ship_date)` — so they sum to one and neither can reach 0.80 unless
+        # the other collapses. A shipped-order extract that is 74% shipped and 26% still
+        # open is an ordinary sales history, and it says so with a 48-point margin; the
+        # old floor threw that away and handed the decision back to the header score.
+        #
+        # Which is the one signal already known to be unreliable here: reaching this
+        # code at all means the headers could not separate the candidates. On the file
+        # that exposed this the two scored *identically* to six decimal places, so the
+        # winner was decided by which contract sorts first alphabetically.
+        #
+        # No absolute floor on this branch, and none is needed: every discriminator
+        # pair in the contracts is `is_null(x)` against `not_null(x)` on one column, so
+        # two live tests sum to at least one and the winner is already the majority
+        # reading. With the margin below also satisfied it holds for at least 65% of
+        # rows. A floor here would be unreachable code dressed as caution.
+        if top - second < _MIN_MARGIN:
             return None
         return winner, top, runner_up, second
 

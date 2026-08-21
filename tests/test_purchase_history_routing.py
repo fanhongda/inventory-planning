@@ -27,6 +27,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
+from inventory_planning.ingest.profiler import Profiler
 from inventory_planning.ingest.registry import AdapterRegistry
 
 
@@ -175,6 +176,81 @@ class TestContentTestsAreEvidenceNotAssumption:
             "with no received quantity there is no evidence either way; the router "
             "must say so rather than manufacture a verdict"
         )
+
+
+class TestComplementaryTestsAreJudgedOnTheMargin:
+    """
+    A shipped-order extract that is 74% shipped is a sales history, and used to route
+    to `open_so` anyway.
+
+    Reported from an OTD export of 6,634 lines. Its content said so plainly —
+    `not_null(ship_date)` held for 74% of rows against 26% for `is_null(ship_date)` —
+    and the router abstained, because it required the winning test to hold for 80% of
+    rows before any verdict counted.
+
+    Those two tests are exact complements. They sum to one, so neither can pass an 80%
+    floor unless the other collapses below 20%, and every ordinary sales history — one
+    with some of its order book still open — falls in the band where the rule refuses
+    to look. The floor belongs on a *lone* test, which has nothing to be compared
+    against; where two live tests disagree, the gap between them is the evidence.
+
+    What the abstention fell back to is the reason this matters. Reaching the content
+    test at all means the headers could not separate the candidates, and on this file
+    they scored identically to six decimal places — so the document type was decided by
+    which contract sorts first alphabetically. `open_so` does, and the demand signal
+    went into the backlog.
+    """
+
+    @staticmethod
+    def _shipped_orders(ship_share: float, n: int = 900):
+        rng = np.random.default_rng(11)
+        shipped = rng.random(n) < ship_share
+        return pd.DataFrame({
+            "Material #":     [f"7108{i % 200:03d}MRO" for i in range(n)],
+            "Customer":       "0007601785 - Johnson Control",
+            "Order Date":     "2026-03-13",
+            "Requested Date": "2026-05-28",
+            "Promise Date":   "2026-07-30",
+            "Ship Date":      np.where(shipped, "2026-06-26", ""),
+            "Order Qty":      (np.arange(n) % 20 + 1),
+            "Open Amt ($)":   np.where(shipped, 0, 4518.35),
+        }).astype(str).replace("", None)
+
+    def _verdict(self, registry, ship_share):
+        df = self._shipped_orders(ship_share)
+        profile = Profiler().profile(df, source_name="otd.xlsx")
+        return registry._discriminate(df, profile, ["open_so", "sales_history"])
+
+    def test_a_mostly_shipped_book_is_a_sales_history(self, registry):
+        winner, top, _, second = self._verdict(registry, 0.74)
+        assert winner == "sales_history"
+        # The point of the change, stated as the property rather than the number: the
+        # verdict is reached from a level the old 80% floor would have rejected, on a
+        # margin wide enough to be evidence.
+        assert top < 0.80
+        assert top - second > 0.30
+
+    def test_the_same_rule_reads_the_mirror_image(self, registry):
+        """26% shipped is an open order book, by the same margin and the same rule."""
+        winner, _, _, _ = self._verdict(registry, 0.26)
+        assert winner == "open_so"
+
+    def test_a_genuine_coin_flip_still_abstains(self, registry):
+        """
+        The floor was doing a real job and must not simply be deleted. Half shipped is
+        not evidence of anything, and saying so stays more useful than guessing.
+        """
+        assert self._verdict(registry, 0.50) is None
+        assert self._verdict(registry, 0.55) is None
+
+    def test_a_lone_test_still_has_to_hold_almost_everywhere(self, registry):
+        """
+        With nothing to compare against there is no margin to read, so the level has to
+        carry the verdict by itself — the 80% floor still applies on that branch.
+        """
+        df = self._shipped_orders(0.60).drop(columns=["Open Amt ($)"])
+        profile = Profiler().profile(df, source_name="otd.xlsx")
+        assert registry._discriminate(df, profile, ["sales_history"]) is None
 
 
 class TestOverlappingPoNumbers:

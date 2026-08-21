@@ -188,6 +188,7 @@ validator rather than eyeballing contrast.
 - Empty results keep their full column schema so callers can index them unconditionally;
   a bare `pd.DataFrame()` turns "nothing to report" into a `KeyError`.
 - Report what a run cannot answer rather than emitting a blank that reads as fine.
-- `skill/SKILL.md` is the Claude Code workflow document. If you change a public entry
+- `.claude/skills/inventory-planning/SKILL.md` is the Claude Code workflow document,
+  and the same file VS Code loads as an Agent Skill. If you change a public entry
   point or an invariant above, update it too — it and this file are the two consumers
   of the same knowledge and drift between them is the failure mode to avoid.

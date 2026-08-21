@@ -18,7 +18,7 @@
   ],
 
   "_fixtures": [
-    "python skill/evals/fixtures.py <dir>  writes four variants from sample_data/:",
+    "python .claude/skills/inventory-planning/evals/fixtures.py <dir>  writes four variants from sample_data/:",
     "  clean             the baseline",
     "  multi_currency    USD/GBP/INR, all rated. Raw sum is 27x the true total",
     "  unrated_currency  adds JPY, which fx_rates.json does not carry",

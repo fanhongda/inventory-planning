@@ -16,12 +16,16 @@ description: >
 # DC Inventory Planning Skill
 
 You are running a single-stage distribution-centre inventory planning pipeline.
-The package lives at `/Users/fanhongda/dev/inventory-planning/`.
-All logic is in `inventory_planning/` — do not rewrite it; orchestrate it.
+The package is the `inventory-planning` repository this skill ships inside, so **every
+path below is relative to the repository root — run from there.** All logic is in
+`inventory_planning/`; do not rewrite it, orchestrate it.
 
-> **Canonical location:** `skill/SKILL.md` inside the `inventory-planning` repo, so this
-> document versions together with the code it describes. The path under `claude skills/`
-> is a symlink to it.
+> **Canonical location:** `.claude/skills/inventory-planning/SKILL.md`, inside the repo,
+> so this document versions together with the code it describes. That path is not an
+> arbitrary one: `.claude/skills/` is a default discovery directory for both Claude Code
+> and VS Code's Agent Skills, so cloning the repo installs the skill and there is no
+> per-machine step. The directory name has to stay equal to the `name` in the
+> frontmatter — a mismatch makes the skill fail to load, silently.
 >
 > The same repo carries `.github/copilot-instructions.md` for VS Code + GitHub Copilot,
 > which cannot read this file. The two are different documents for different consumers —
@@ -134,11 +138,11 @@ name the *information*, not a filename:
 
 ```python
 import sys
-sys.path.insert(0, '/Users/fanhongda/dev/inventory-planning')
+sys.path.insert(0, '.')          # repository root; run from there
 from inventory_planning.orchestrator import InventoryPlanner
 
 planner = InventoryPlanner(
-    output_dir='/Users/fanhongda/dev/inventory-planning/output/<YYYYMMDD_HHMM>',
+    output_dir='output/<YYYYMMDD_HHMM>',
     interactive=False,
 )
 inputs = planner.load_all([<every file path the user gave, in any order>])

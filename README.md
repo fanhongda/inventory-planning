@@ -775,7 +775,9 @@ inventory_planning/
     └── kpi_report.py          two-chapter review: what happened / what is coming
 
   (at repo root:)
-  skill/SKILL.md                     Claude Code workflow — how to run it, what to relay
+  .claude/skills/inventory-planning/ the skill itself — SKILL.md is the workflow, and
+                                     .claude/skills is where Claude Code and VS Code
+                                     both look, so cloning the repo installs it
   .github/copilot-instructions.md    VS Code + Copilot — invariants and layout
   principles/sc-principles.md        MIT CTL key concepts + formulas
   policy/policy.md                   company-specific hard constraints (blank — populate)

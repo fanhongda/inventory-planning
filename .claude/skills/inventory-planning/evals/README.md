@@ -75,7 +75,7 @@ There is no runner in this repo yet; the assertion types are documented in
 ## Fixtures
 
 ```bash
-python skill/evals/fixtures.py <target_dir>
+python .claude/skills/inventory-planning/evals/fixtures.py <target_dir>
 ```
 
 Generates four variants from `sample_data/` — which is synthetic (`SKU-002`,

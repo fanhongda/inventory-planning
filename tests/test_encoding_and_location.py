@@ -243,6 +243,25 @@ class TestLocationComesFromTheSourceWhereTheSourceHasOne:
         assert spec is not None
         assert "plant" in spec.aliases
 
+    @pytest.mark.parametrize("header", ["Plant", "Plnt", "Werks", "Storage Location"])
+    def test_sap_spells_plant_several_ways(self, header):
+        """
+        `Plnt` is what MB52 and most stock ALV layouts print, and it was not an alias —
+        so the one file that names its plant that way had `location_id` stamped from
+        config on all 14,442 rows, hiding that the extract covers two plants.
+        """
+        from inventory_planning.ingest.profiler import Profiler
+        from inventory_planning.ingest.registry import AdapterRegistry
+        frame = pd.DataFrame({
+            "Material": [f"600{i % 40:04d}" for i in range(120)],
+            header: [["5790", "5792"][i % 2] for i in range(120)],
+            "Closing Stock": range(120),
+        }).astype(str)
+        profile = Profiler().profile(frame, source_name="stock.xlsx")
+        mapping = AdapterRegistry()._assign_columns(
+            profile, AdapterRegistry().contracts.get("inventory"))
+        assert mapping.get("location_id") == header
+
     def test_the_placeholder_is_named_as_one(self, tmp_path):
         out = IngestBridge(verbose=False).load(self._files(tmp_path, with_plant=False))
         notes = "\n".join(out["_intake"].notes)

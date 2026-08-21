@@ -32,8 +32,9 @@ SALES_HISTORY_SCHEMA = {
     "customer":             ["customer", "customer name", "sold to", "sold-to", "account", "client"],
     "uom":                  ["uom", "unit", "unit of measure", "base unit"],
     "location_id":          ["location_id", "location", "location code", "warehouse",
-                             "warehouse code", "plant", "storage location", "sloc",
-                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
+                             "warehouse code", "plant", "plnt", "storage location",
+                             "sloc", "site", "dc", "wrh", "wh", "branch", "facility",
+                             "werks"],
 }
 
 PO_HISTORY_SCHEMA = {
@@ -54,8 +55,9 @@ PO_HISTORY_SCHEMA = {
     # Pre-computed LT (days) present in some ERP exports — captured as a bonus field
     "lt_days_precalc":      ["lt", "lead time", "lt days", "lead time days"],
     "location_id":          ["location_id", "location", "location code", "warehouse",
-                             "warehouse code", "plant", "storage location", "sloc",
-                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
+                             "warehouse code", "plant", "plnt", "storage location",
+                             "sloc", "site", "dc", "wrh", "wh", "branch", "facility",
+                             "werks"],
 }
 
 OPEN_SO_SCHEMA = {
@@ -77,8 +79,9 @@ OPEN_SO_SCHEMA = {
     "so_number":            ["so_number", "so number", "sales order", "order number",
                              "document number"],
     "location_id":          ["location_id", "location", "location code", "warehouse",
-                             "warehouse code", "plant", "storage location", "sloc",
-                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
+                             "warehouse code", "plant", "plnt", "storage location",
+                             "sloc", "site", "dc", "wrh", "wh", "branch", "facility",
+                             "werks"],
 }
 
 OPEN_PO_SCHEMA = {
@@ -103,8 +106,9 @@ OPEN_PO_SCHEMA = {
     "closed_status":        ["closed_status", "closed status", "status", "po status"],
     "order_date":           ["order_date", "order date", "po date", "doc date"],
     "location_id":          ["location_id", "location", "location code", "warehouse",
-                             "warehouse code", "plant", "storage location", "sloc",
-                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
+                             "warehouse code", "plant", "plnt", "storage location",
+                             "sloc", "site", "dc", "wrh", "wh", "branch", "facility",
+                             "werks"],
 }
 
 INVENTORY_SCHEMA = {
@@ -120,8 +124,9 @@ INVENTORY_SCHEMA = {
                              "openpoquantity", "open po quantity"],
     "uom":                  ["uom", "unit", "unit of measure", "base unit"],
     "location_id":          ["location_id", "location", "location code", "warehouse",
-                             "warehouse code", "plant", "storage location", "sloc",
-                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
+                             "warehouse code", "plant", "plnt", "storage location",
+                             "sloc", "site", "dc", "wrh", "wh", "branch", "facility",
+                             "werks"],
     "snapshot_date":        ["snapshot_date", "snapshot date", "report date",
                              "as of date", "date"],
 }

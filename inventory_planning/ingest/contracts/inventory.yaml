@@ -33,8 +33,8 @@ fields:
     description: DC / plant / warehouse. Carried on every output for multi-echelon readiness.
     normalize: upper_strip
     aliases: [location, location id, location code, warehouse, warehouse code,
-              warehouse id, plant, storage location, sloc, site, dc, wh, wrh, branch,
-              facility, stock location]
+              warehouse id, plant, plnt, storage location, sloc, site, dc, wh, wrh,
+              branch, facility, stock location, werks]
 
   line_number:
     type: string

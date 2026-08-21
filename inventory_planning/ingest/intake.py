@@ -415,7 +415,8 @@ class Intake:
 
         result.plan = self.resolver.resolve(loaded, unrecognised, withheld=withheld)
         self._note_po_overlap(result)
-        self._check_sku_agreement(result)
+        suspect = self._check_key_shape(result)
+        self._check_sku_agreement(result, suspect)
         self._note_mixed_formats(result)
 
         if self.verbose:
@@ -423,11 +424,134 @@ class Intake:
         return result
 
 
+    # Fewer distinct item numbers than this, in a document of any real size, is not an
+    # item key. SAP line numbers land here — a purchase order rarely runs past line 60,
+    # so `Item` yields six values — and so does a status code or a plant.
+    _SUSPICIOUS_KEY_DISTINCT = 10
+    # Only asked of a source big enough for the count to mean anything. Ten SKUs in a
+    # twelve-row file is a small file, not a broken key.
+    _KEY_SHAPE_MIN_ROWS = 30
+
+    @classmethod
+    def _check_key_shape(cls, result: IntakeResult) -> set:
+        """
+        Name any document whose `sku` is too coarse to be an item number. Returns them.
+
+        This is the check that was missing, and its absence is what let a line-number
+        key through: `_check_sku_agreement` measures how much of a document's key the
+        others recognise, and skips any document with fewer than ten distinct keys as
+        too small a sample to judge. A document keyed on 10, 20, 30 has exactly that
+        shape, so the one guard written for it declined to look — and then, because the
+        corrupt key was still counted as evidence against everybody else, blamed the
+        file that was mapped correctly.
+
+        Cardinality is judged against the *source* row count rather than the frame's,
+        because a rollup to sku grain collapses the document to one row per key and
+        erases the very disproportion being looked for.
+
+        Unlike the agreement check this one needs no second document, which matters:
+        a lone sales history keyed on six line numbers is diagnosable on its own, and
+        the old code went silent on it twice over.
+        """
+        keyed = {dt: doc for dt, doc in result.documents.items()
+                 if "sku" in doc.frame.columns and len(doc.frame)}
+        skus = {dt: set(doc.frame["sku"].dropna().astype(str)) for dt, doc in keyed.items()}
+
+        # A coarse key is a symptom, not a diagnosis. Eight SKUs across eighty rows is
+        # equally a small catalogue ordered repeatedly — the project's own sample data
+        # is exactly that — so cardinality alone accuses honest files. Something else
+        # has to corroborate: either the values are a series, or nothing else in the
+        # run recognises a single one of them.
+        coarse = {
+            dt for dt, own in skus.items()
+            if len(own) < cls._SUSPICIOUS_KEY_DISTINCT
+            and max(keyed[dt].route.profile.row_count, len(keyed[dt].frame))
+            >= cls._KEY_SHAPE_MIN_ROWS
+        }
+        columns = {dt: cls._key_column(keyed[dt]) for dt in coarse}
+        suspect = {dt for dt, col in columns.items() if col is not None and col.is_small_ordinal}
+        for doc_type in coarse - suspect:
+            rest = set().union(*(s for dt, s in skus.items()
+                                 if dt != doc_type and dt not in suspect), set())
+            if rest and not (skus[doc_type] & rest):
+                suspect.add(doc_type)
+
+        # What the healthy documents key on. Where there is any, it is far better
+        # evidence for naming the right column than cardinality is.
+        others: set = set().union(
+            *(s for dt, s in skus.items() if dt not in suspect), set()
+        )
+
+        for doc_type in sorted(suspect):
+            doc, own = keyed[doc_type], skus[doc_type]
+            source_rows = max(doc.route.profile.row_count, len(doc.frame))
+            mapped = doc.route.adapter.column_map.get("sku", "(derived)")
+            column = columns[doc_type]
+            lines = [
+                f"  ⚠ {doc_type} is keyed on only {len(own)} distinct item number(s) "
+                f"across {source_rows:,} source rows.",
+                f"      {doc.source_name}: sku <- {mapped!r}, values "
+                f"{', '.join(sorted(own)[:6])}"
+                + (" …" if len(own) > 6 else "") + ".",
+            ]
+            if column is not None and column.is_small_ordinal:
+                lines.append(
+                    f"      Those are a series, not identifiers — {mapped!r} is a "
+                    f"document line number. SAP labels the line number `Item` in every "
+                    f"module; the material is in a different column."
+                )
+            named = cls._alternative_keys(doc, mapped, others)
+            lines.append(
+                f"      Columns that could be the item key instead: {named}." if named
+                else "      No other column in this export looks like an item key — "
+                     "the material number may simply not be in the extract."
+            )
+            lines.append(
+                "      Every join downstream is on sku. Map it in an adapter for this "
+                "export before trusting any number in the run."
+            )
+            result.notes.append("\n".join(lines))
+        return suspect
+
+    @staticmethod
+    def _key_column(doc: LoadedDocument):
+        """Profile of the source column behind `sku`, or None when it was derived."""
+        mapped = doc.route.adapter.column_map.get("sku")
+        return doc.route.profile.column(mapped) if mapped else None
+
+    @classmethod
+    def _alternative_keys(cls, doc: LoadedDocument, mapped: str, others: set) -> str:
+        """
+        The columns in `doc` worth trying as the item key, best first.
+
+        Overlap with the keys the other documents already use decides it where there
+        are other documents; cardinality only stands in when this is the only file.
+        Cardinality alone is a weak ranking and reads as nonsense — it recommended a
+        net-value column, which is unique per row and therefore looks like a perfect
+        key right up until someone tries to join on it.
+        """
+        scored = []
+        for name, values in doc.key_candidates.items():
+            if name == mapped or len(values) < _MIN_KEY_DISTINCT:
+                continue
+            col = doc.route.profile.column(name)
+            # Dates and money are never item keys however distinct they are, and a
+            # second line-number column is the mistake being diagnosed, not the fix.
+            if col is not None and (col.inferred_type not in ("string", "integer")
+                                    or col.is_small_ordinal):
+                continue
+            if not others:
+                scored.append((len(values), f"{name!r} ({len(values):,} values)"))
+            elif values & others:
+                share = len(values & others) / len(values)
+                scored.append((share, f"{name!r} (matches {share:.0%})"))
+        return ", ".join(text for _, text in sorted(scored, reverse=True)[:3])
+
     # Below this share of its SKUs meeting any other document, a file is not joining.
     _SKU_AGREEMENT_FLOOR = 0.20
 
     @classmethod
-    def _check_sku_agreement(cls, result: IntakeResult) -> None:
+    def _check_sku_agreement(cls, result: IntakeResult, suspect: set = frozenset()) -> None:
         """
         Warn when a document's SKUs meet nothing else, and name the column that would.
 
@@ -441,9 +565,16 @@ class Intake:
 
         The suggestion is the useful half. Knowing that `sku` matches nothing is a
         puzzle; knowing that `Alternate material` would have matched 82% is an answer.
+
+        Documents `_check_key_shape` has already condemned are dropped rather than
+        reported twice — and, more importantly, dropped from the evidence. A corrupt
+        key agrees with nothing by construction, so leaving it in the comparison set
+        makes every correctly-mapped file look like the one that disagrees. That is
+        not hypothetical: on a two-file run the only warning printed named the file
+        whose mapping was right.
         """
         keyed = {dt: doc for dt, doc in result.documents.items()
-                 if "sku" in doc.frame.columns and len(doc.frame)}
+                 if dt not in suspect and "sku" in doc.frame.columns and len(doc.frame)}
         if len(keyed) < 2:
             return
 

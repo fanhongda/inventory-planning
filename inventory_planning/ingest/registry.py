@@ -34,6 +34,11 @@ from .profiler import Profiler, TableProfile, normalize_header
 # Sentinel so a missing contract can be probed for `.discriminator` without a guard.
 _NO_CONTRACT = DocContract(doc_type="", description="")
 
+# Canonical fields holding the item key every join in the pipeline runs on. A column
+# shaped like a document line number disqualifies itself from these and from nothing
+# else — the same column is exactly what `po_line_number` wants.
+_ITEM_KEY_FIELDS = frozenset({"sku"})
+
 
 @dataclass
 class RouteResult:
@@ -576,7 +581,8 @@ class AdapterRegistry:
         # names the true grain.
         ratio = len(raw) / max(distinct, 1)
         discriminator = None
-        for canonical in ("po_line_number", "po_schedule_line", "location_id", "bin", "lot"):
+        for canonical in ("po_line_number", "so_line_number", "line_number",
+                          "po_schedule_line", "location_id", "bin", "lot"):
             col = column_map.get(canonical)
             if col and col in raw.columns:
                 if len(raw.drop_duplicates(subset=key_cols + [col])) > distinct:
@@ -605,14 +611,23 @@ class AdapterRegistry:
         Name alone is not enough, and the failure is not hypothetical: in an SAP
         extract, `Item` is the PO line number while `Material` is the SKU. Both match
         an alias of `sku`, and taking the first one silently plants the wrong
-        identifier in every downstream join. Scoring resolves it because the profile
-        already knows `Item` holds two distinct small integers while `Material` holds
-        high-cardinality codes.
+        identifier in every downstream join. Scoring resolves it, because `Material`
+        holds high-cardinality codes and every contract gives `Item` a line-number
+        field to lose to.
+
+        It resolves it only while both columns are there to compare, though. Where the
+        export omits `Material`, or carries it empty, or spells it something the
+        aliases do not list, `Item` is the last candidate standing for a required field
+        and wins by default. So the contract's `never` rules run first and remove the
+        pairing outright once the profile has named the source system, and the rescue
+        pass at the end refuses a column whose values are a series.
         """
         candidates: List[Tuple[float, str, str]] = []
+        system = profile.system
 
         for canonical, spec in contract.fields.items():
             aliases = [canonical] + spec.aliases
+            banned, banned_tokens = spec.forbidden_headers(system)
             # First occurrence wins, exactly as `token_rank` below does. A dict
             # comprehension here keeps the *last*, and the two disagreeing is a real
             # bug rather than a nicety: `po_date` normalizes to the same string as its
@@ -638,6 +653,9 @@ class AdapterRegistry:
                 if col.is_period_column:
                     continue
                 if col.non_null == 0 and not include_empty:
+                    continue
+                if banned and (col.normalized in banned
+                               or frozenset(col.normalized.split()) in banned_tokens):
                     continue
                 rank = alias_rank.get(col.normalized)
                 penalty = 0.0
@@ -675,12 +693,24 @@ class AdapterRegistry:
         # and `sku` ends up unmapped, which is worse than the ambiguity it was added to
         # resolve. Ranking required fields first instead would reintroduce the original
         # bug, since `sku` would simply claim its highest-scoring candidate again.
+        #
+        # But "wrong when it is the only identifier the file has" assumed the column
+        # might be an identifier. Where the data says it is a series — 10, 20, 30 —
+        # it is not one, and rescuing `sku` with it produces a key that joins to
+        # nothing while reporting success. Leaving `sku` unmapped fails the required-
+        # field test instead, which stops the run and asks a human a question they can
+        # answer in a minute. That is the whole trade: a loud stop over a silent
+        # report of zeroes.
         for canonical, spec in contract.fields.items():
             if not spec.required or canonical in column_map:
                 continue
             for _score, field, col_name in candidates:
                 if field != canonical:
                     continue
+                if canonical in _ITEM_KEY_FIELDS:
+                    col = profile.column(col_name)
+                    if col is not None and col.is_small_ordinal:
+                        continue
                 holder = next((f for f, c in column_map.items() if c == col_name), None)
                 if holder is None or contract.fields[holder].required:
                     continue

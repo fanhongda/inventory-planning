@@ -593,6 +593,37 @@ export gets filed as an item master, taking the demand signal with it. An item m
 earns the name by carrying a planning parameter; a file with none is a list of item
 numbers, whatever else is on it.
 
+**A contract can also state what a field must never be.** Aliases answer "what else
+might this column be called?", which is the wrong question when one header word means
+two different things in two ERPs. `Item` is the case: in SAP it is the position within
+a document — VBAP-POSNR, EKPO-EBELP, MSEG-ZEILE, QMFE-FENUM all render as `Item` — and
+never the material, while most other systems use it for the material. No amount of
+data shape settles that, so the profiler decides *which ERP wrote the file* once, from
+header vocabulary and SAP's zero-padded keys, and the contract declares the mapping the
+dialect forbids:
+
+```yaml
+  sku:
+    aliases: [sku, material, material number, ..., matnr, matl, item]
+    never:
+      sap: [item, itm, item no, position, pos, line item, 项目]
+```
+
+Three layers back it up, because each one alone has a hole:
+
+| layer | what it catches | where it is blind |
+|---|---|---|
+| a line-number field on every transactional contract | `Item` alongside `Material` | an export with no material column — `Item` is then the only candidate for a required field |
+| the `never` rule | any spelling, whatever the values look like | a file that never says which ERP wrote it |
+| the shape verdict — a column holding 10, 20, 30 is a series, not identifiers | an unidentified source | a line number that is not written as a series |
+
+When they all miss, intake says so rather than proceeding: a document keyed on fewer
+than ten distinct item numbers is reported by name, with the values, the reason, and
+the columns that would have joined instead. Refusing to map is deliberate — the
+required-field test then fails and stops the run, which is a question a human answers
+in a minute, where a backlog keyed on 10, 20, 30 produces a full report of confident
+zeroes and no error at all.
+
 ---
 
 ## Output

@@ -364,6 +364,149 @@ def _collapse_mask(mask: str) -> str:
     return "".join(parts)
 
 
+# ── Source-system detection ──────────────────────────────────────────────────
+#
+# Which ERP wrote a file is worth knowing on its own, because some header words mean
+# different things in different systems and no amount of data shape resolves the
+# disagreement. `Item` is the case that forced this: in SAP every transactional table
+# is keyed on `<document> + <item>`, and that item number renders as `Item` in ALV
+# output — VBAP-POSNR, EKPO-EBELP, MSEG-ZEILE, QMFE-FENUM all of them. In SAP `Item`
+# is never the material. In Oracle, NetSuite and most WMS exports it usually is.
+#
+# So the ambiguity is not in the data, it is in the dialect, and it is resolvable
+# once — here — rather than guessed at per column.
+
+SYSTEM_SAP = "sap"
+SYSTEM_UNKNOWN = "unknown"
+
+# One of these settles it. Either an SAP data-dictionary field name — which only
+# reaches a spreadsheet via SE16, a query or an ABAP report — or a display phrase
+# that no other ERP produces.
+_SAP_STRONG = frozenset({
+    # Data dictionary names, by module
+    "matnr", "maktx", "mtart", "matkl", "meins", "bismt", "charg",           # MARA/MAKT
+    "werks", "lgort", "dispo", "dismm", "beskz", "plifz", "webaz",           # MARC
+    "eisbe", "minbe", "disls", "bstmi", "bstfe", "bstrf", "mabst", "lgrad",
+    "labst", "insme", "speme",                                               # MARD
+    "stprs", "verpr", "vprsv", "peinh", "salk3", "lbkum", "bwkey",           # MBEW
+    "ebeln", "ebelp", "etenr", "eindt", "bedat", "netpr", "elikz", "pstyp",  # EKKO/EKPO/EKET
+    "lifnr", "ekorg", "ekgrp", "bstae", "wemng",
+    "vbeln", "posnr", "auart", "kunnr", "vdatu", "kwmeng", "vrkme", "netwr", # VBAK/VBAP
+    "waerk", "pstyv", "abgru", "uepos", "kdmat", "vkorg", "vtweg", "spart",
+    "wmeng", "bmeng", "edatu", "mbdat", "lddat", "wadat", "wadat_ist",       # VBEP/LIKP
+    "lfimg", "vgbel", "vgpos", "fkimg", "fkdat", "fkart", "aubel", "aupos",  # LIPS/VBRP
+    "omeng", "vbtyp", "gbsta", "lfsta",
+    "mblnr", "mjahr", "zeile", "bwart", "shkzg", "budat", "sobkz", "dmbtr",  # MKPF/MSEG
+    "qmnum", "qmart", "fenum", "fegrp", "fecod", "otgrp", "oteil",           # QMEL/QMFE
+    "aufnr", "aufpl", "aplzl", "vornr", "arbid", "gltrp", "gstrp",           # AUFK/AFKO/AFVC
+    "rsnum", "rspos", "bdmng", "enmng", "bdter",                             # RESB
+    "equnr", "sernr", "tplnr", "obknr",                                      # EQUI/IFLOT/OBJK
+    "bukrs", "waers", "menge", "zterm", "inco1", "inco2",
+    # Display phrases produced by SAP and effectively nothing else
+    "sold to party", "ship to party", "bill to party", "payer",
+    "purchasing document", "purchasing doc", "purch doc", "purchasing group",
+    "purchasing organization", "purchasing organisation",
+    "material document", "movement type", "storage location", "special stock",
+    "mrp controller", "mrp type", "lot size", "valuation area", "valuation class",
+    "moving average price", "planned delivery time", "gr processing time",
+    "base unit of measure", "wbs element", "functional location",
+    "unrestricted", "unrestricted use", "unrestricted stock",
+    "higher level item", "schedule line", "reason for rejection",
+    "goods recipient", "notification number", "reservation number",
+})
+
+# Two of these together settle it. Individually they are ordinary supply-chain words
+# that a non-SAP export can carry — which is exactly why one is not enough.
+_SAP_MEDIUM = frozenset({
+    "plant", "batch", "company code", "profit center", "profit centre",
+    "material description", "material group", "material type",
+    "material number", "material classification",
+    "sales document", "billing document", "sales organization",
+    "sales organisation", "distribution channel", "division",
+    "item category", "document date", "posting date", "requirement date",
+    "storage bin", "condition type", "cost center", "cost centre",
+    "created by", "created on",
+})
+
+# The other decisive signal, and the one that survives translation: SAP stores keys in
+# fixed-width character fields and pads them with zeros, so a material number leaves
+# the system as `000000000006013908`. No other convention produces that.
+_SAP_PADDED_KEY = re.compile(r"^0{2,}\d+$")
+_SAP_PADDED_MIN_LEN = 8
+_SAP_PADDED_MIN_SHARE = 0.8
+
+
+# Bounds on what can pass for a line number. The widest of SAP's own item fields is
+# six digits (VBAP-POSNR); EKPO-EBELP is five and MSEG-ZEILE four.
+_ORDINAL_MAX_VALUE = 999_999
+# Above this many distinct values the column is a catalogue, not a position within a
+# document — no order has a thousand lines.
+_ORDINAL_MAX_DISTINCT = 200
+# A line number is drawn from a small vocabulary reused by every document, so the rows
+# must outnumber the distinct values several times over. An item number does not.
+_ORDINAL_MIN_REPEAT = 3.0
+
+
+def _looks_like_a_line_number(values: pd.Series, distinct: int, rows: int) -> bool:
+    """
+    Whether an integer column has the shape of a document line number.
+
+    Three things have to hold together, and the third is what carries the weight.
+    Small values and heavy repetition are necessary but common — a plant code or a
+    status flag has both. What distinguishes a position number is that its values
+    form a *series*: either SAP's default increment of ten (10, 20, 30 …) or a dense
+    count from one. A numeric part number satisfies neither.
+
+    Deliberately conservative, because the verdict does bite: a column judged a series
+    is refused as an item key even where that leaves a required field unmapped. A miss
+    costs nothing — the other two layers still apply — while a false positive would
+    refuse a real key and stop a run that should have gone through.
+    """
+    if distinct < 2 or distinct > _ORDINAL_MAX_DISTINCT:
+        return False
+    if rows < distinct * _ORDINAL_MIN_REPEAT:
+        return False
+
+    unique = np.sort(values.unique())
+    if unique[0] < 0 or unique[-1] > _ORDINAL_MAX_VALUE:
+        return False
+
+    by_tens = bool(unique[-1] >= 10 and (unique % 10 == 0).all())
+    # A dense count from 0 or 1 with room for only a few gaps.
+    from_one = bool(unique[0] <= 1 and unique[-1] <= distinct * 2)
+    return by_tens or from_one
+
+
+def detect_source_system(
+    header_tokens: List[str], columns: List[ColumnProfile]
+) -> Tuple[str, List[str]]:
+    """
+    Which ERP wrote this file, and the evidence for saying so.
+
+    Deliberately biased toward `unknown`. A false positive is expensive — it turns on
+    dialect rules that forbid mappings, so calling a non-SAP file SAP can leave a
+    genuine `Item`-keyed source with no item key at all. A false negative only means
+    the generic rules apply, which is where every file started.
+    """
+    tokens = set(header_tokens)
+    evidence: List[str] = []
+
+    strong = sorted(tokens & _SAP_STRONG)
+    medium = sorted(tokens & _SAP_MEDIUM)
+    padded = [c.name for c in columns if c.zero_padded_code]
+
+    if strong:
+        evidence.append(f"SAP field names in headers: {', '.join(strong[:4])}")
+    if padded:
+        evidence.append(f"zero-padded SAP keys in {', '.join(padded[:3])}")
+    if len(medium) >= 2:
+        evidence.append(f"SAP vocabulary: {', '.join(medium[:4])}")
+
+    if strong or padded or len(medium) >= 2:
+        return SYSTEM_SAP, evidence
+    return SYSTEM_UNKNOWN, []
+
+
 # ── Column profile ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -396,6 +539,16 @@ class ColumnProfile:
     # Two or more incompatible ways of writing the same value in one column. Whichever
     # parser wins, the other representation becomes null without raising.
     representation_mix: Optional[Dict[str, int]] = None
+    # An integer column holding a short, repeating run of small numbers — the shape of
+    # an ERP line/position number (10, 20, 30 … or 1, 2, 3 …). Recorded because that
+    # shape is the difference between a line number and an item number, and the header
+    # alone cannot tell them apart: SAP spells both of them `Item`.
+    is_small_ordinal: bool = False
+    # Values are numbers written with leading zeros to a fixed width — SAP's own
+    # storage convention for keys, e.g. `000000000006013908`. Feeds source-system
+    # detection, and is itself a warning: joined against an unpadded export of the
+    # same key, it matches nothing.
+    zero_padded_code: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -436,6 +589,10 @@ class ColumnProfile:
             out["decimal_style"] = self.decimal_style
         if self.representation_mix:
             out["representation_mix"] = self.representation_mix
+        if self.is_small_ordinal:
+            out["is_small_ordinal"] = True
+        if self.zero_padded_code:
+            out["zero_padded_code"] = True
         if self.samples is not None:
             out["samples"] = self.samples
         return out
@@ -469,6 +626,10 @@ class TableProfile:
     candidate_keys: List[List[str]] = dc_field(default_factory=list)
     suspected_total_rows: int = 0
     notes: List[str] = dc_field(default_factory=list)
+    # Which ERP wrote the file, and why we think so. Drives the dialect rules in the
+    # contracts — the ones that say a header word means something different here.
+    system: str = SYSTEM_UNKNOWN
+    system_evidence: List[str] = dc_field(default_factory=list)
 
     def column(self, name: str) -> Optional[ColumnProfile]:
         return next((c for c in self.columns if c.name == name), None)
@@ -501,6 +662,9 @@ class TableProfile:
             "columns": [c.to_dict() for c in self.columns if not c.is_period_column],
             "candidate_keys": self.candidate_keys,
         }
+        if self.system != SYSTEM_UNKNOWN:
+            out["system"] = self.system
+            out["system_evidence"] = self.system_evidence
         if self.shape == "wide_periods":
             out["period_columns_count"] = len(self.period_columns)
             out["period_range"] = list(self.period_range) if self.period_range else None
@@ -569,12 +733,16 @@ class Profiler:
 
         header_tokens = [normalize_header(c) for c in df.columns]
         header_hash = self.header_hash(df.columns)
+        system, system_evidence = detect_source_system(header_tokens, cols)
 
         if shape == "wide_periods":
             notes.append(
                 f"Wide period layout detected ({len(period_cols)} period columns) — "
                 f"routed as pre-aggregated demand, not a transactional extract"
             )
+
+        if system != SYSTEM_UNKNOWN:
+            notes.append(f"Source system: {system.upper()} ({'; '.join(system_evidence)})")
 
         dmy_votes = [c.name for c in cols if c.dayfirst_evidence is True]
         eu_votes = [c.name for c in cols if c.decimal_style == "eu"]
@@ -610,6 +778,8 @@ class Profiler:
             candidate_keys=candidate_keys,
             suspected_total_rows=suspected_totals,
             notes=notes,
+            system=system,
+            system_evidence=system_evidence,
         )
 
     # ── Fingerprinting ───────────────────────────────────────────────────────
@@ -659,6 +829,15 @@ class Profiler:
             return prof
 
         sample = non_null_series.head(self.SAMPLE_ROWS)
+
+        # Judged on the raw text, before any numeric inference. `000000000006013908`
+        # parses cleanly as an integer, so by the time a type has been inferred the
+        # padding — the whole signal — is gone.
+        padded = sample.astype(str).str.strip()
+        prof.zero_padded_code = bool(
+            (padded.str.len() >= _SAP_PADDED_MIN_LEN).mean() >= _SAP_PADDED_MIN_SHARE
+            and padded.str.match(_SAP_PADDED_KEY).mean() >= _SAP_PADDED_MIN_SHARE
+        )
 
         prof.decimal_style = detect_decimal_style(sample)
         # Judged over more rows than the other detectors use. A partial Excel
@@ -715,6 +894,10 @@ class Profiler:
                 prof.zero_rate = float((full_numeric == 0).mean())
                 is_int = bool((full_numeric % 1 == 0).all())
                 prof.inferred_type = "integer" if is_int else "decimal"
+                if is_int:
+                    prof.is_small_ordinal = _looks_like_a_line_number(
+                        full_numeric, distinct, total
+                    )
         elif prof.date_parse_rate >= 0.8:
             prof.inferred_type = "date"
         else:

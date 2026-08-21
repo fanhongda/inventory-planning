@@ -155,9 +155,20 @@ contract tests. It prints an intake summary. **Read it and relay three things:**
 3. **Degradations** — the "What this run cannot tell you" block. These are not
    warnings to bury; they are the honest limits of the analysis and belong in the
    final summary.
+4. **Key warnings** — "keys on something the other documents do not use", or "keyed on
+   only N distinct item number(s)". Every join in the pipeline is on `sku`, so a key
+   that is wrong produces a complete report full of zeroes and no error anywhere.
+   **Stop and fix the mapping before running.** The warning names the column that
+   would have joined instead; Step 2b is how to apply it.
 
 Do **not** walk the user through column-by-column mapping confirmation. The mapping is
-inferred, tested and logged. Surface it only when a test fails or confidence is low.
+inferred, tested and logged. Surface it only when a test fails, confidence is low, or
+one of the key warnings above appears.
+
+On SAP exports a `required_field:sku` failure usually means the guard did its job
+rather than that anything is missing: `Item` is SAP's line number in every module, it
+is refused as the item key, and the material is in a column the aliases did not
+recognise. Look at the headers, find the material column, and map it in an adapter.
 
 ### Step 2b — When routing or mapping is wrong
 
@@ -443,7 +454,7 @@ Data-shape knowledge lives in `inventory_planning/ingest/` and is also data, not
 
 | Location | What it holds |
 |---|---|
-| `ingest/contracts/*.yaml` | Canonical fields per document: type, grain, `derivable_from`, assertions, value domains. Change these to change what the pipeline *means* by a field. |
+| `ingest/contracts/*.yaml` | Canonical fields per document: type, grain, `derivable_from`, `never`, assertions, value domains. Change these to change what the pipeline *means* by a field. |
 | `ingest/adapters/<tenant>__<system>/*.yaml` | How one specific export satisfies a contract. Add a file here to support a new ERP — no code change. |
 
 **Adding a new ERP is a YAML file, not a code change.** Run once, review the drafted
@@ -467,6 +478,8 @@ adapter, correct it, freeze it.
 |---|---|---|
 | `grain:<x>` — rows share a natural key | Source is finer than the contract (PO schedule lines, WMS bins). Left alone, every quantity is inflated and nothing downstream notices. | Intake proposes `rollup_to` automatically — verify it in the adapter notes before freezing |
 | `required_field:<x>` absent | No column matched and no derivation applied | Add a `column_map` entry, or a `derivations` expression, to the adapter |
+| `required_field:sku` absent on an SAP export | Usually the guard working, not a gap. `Item` is SAP's line number in every module — VBAP-POSNR, EKPO-EBELP, MSEG-ZEILE, QMFE-FENUM — so it is refused as the item key, and the real material column is spelled something the aliases do not list | Read the headers, find the material column, map `sku` to it in the adapter. Do **not** map `sku` to `Item` to make the error go away — that is the failure the refusal exists to prevent |
+| `⚠ keyed on only N distinct item number(s)` | The item key holds a series (10, 20, 30 …), not identifiers — a line number reached `sku` under a header that looked right, or a frozen adapter points at the wrong column | Stop. The note names the columns that would have joined. Fix the adapter before running: every join is on `sku`, so the report would otherwise be complete, zero-filled and silent |
 | `open_qty >= 0` violated | `order_qty` mapped to the wrong column, or over-receipts in the source | Check the mapping first; genuine over-receipt should be clamped in the adapter |
 | `committed_delivery >= order_date` violated | Date order misparsed (DMY read as MDY) | Set `parsing.dayfirst` in the adapter; intake usually detects this from the data |
 | `⚠ MIXED FORMATS` note | One source column holds two conventions — typically a spreadsheet opened under a locale that disagreed with the file, which converted the values it could read (swapping month and day) and left the rest as text. Whichever parser wins, the other half nulls out silently. | **Relay this to the user every time.** Where evidence was conclusive the parser restored the swapped values — check the transform log for `swapped` — but the source file is still wrong and the next export will be too. The fix is upstream: export dates in ISO, or as a real date column rather than text |

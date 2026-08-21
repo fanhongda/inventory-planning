@@ -54,7 +54,7 @@ Supporting a new ERP or changing a planning rule should not require a code chang
 
 | Location | Holds |
 |---|---|
-| `inventory_planning/ingest/contracts/*.yaml` | what each canonical field *means*: type, grain, `derivable_from`, assertions, value domains, `discriminator` |
+| `inventory_planning/ingest/contracts/*.yaml` | what each canonical field *means*: type, grain, `derivable_from`, `never` (headers a field must not take under a given ERP), assertions, value domains, `discriminator` |
 | `inventory_planning/ingest/adapters/**/*.yaml` | how one specific export satisfies a contract; drafted on first run, reviewed, then frozen |
 | `config/planning_parameters.md` | segmentation boundaries, calculation conventions, scoped policy overrides — every rule carries a rationale |
 | `config/*.json` | service levels, incoterm rules, node config |
@@ -103,6 +103,22 @@ scored against the clock marks every open line past due.
 **Absence of a column is not evidence for a document type** (`registry.py`). A missing
 receipt-date column made `is_null(receive_date)` vacuously true, so a sales export
 scored 100% as an open PO.
+
+**`Item` is a line number in SAP and a material almost everywhere else** (`profiler.py
+::detect_source_system`, `contracts/*.yaml` `never:`). VBAP-POSNR, EKPO-EBELP,
+MSEG-ZEILE and QMFE-FENUM all render as `Item`, and no data shape resolves the clash —
+so the source system is decided once, from headers and SAP's zero-padded keys, and the
+contract declares what the dialect forbids. Every transactional contract also has a
+line-number field so `Item` has somewhere to go, and a column holding 10, 20, 30 is
+refused as an item key even in the rescue pass for a required field. **Never "fix" a
+`required_field:sku` failure by mapping `sku` to `Item`.** Leaving it unmapped stops the
+run; mapping it produces a complete report of zeroes and no error at all.
+
+**A key too coarse to be an item number is reported, and is not evidence against
+anything else** (`intake.py::_check_key_shape`). The agreement check skips documents
+with fewer than ten distinct keys as too small a sample — which is precisely the shape
+of a line-number key — and then counted that key as evidence, so the only warning
+printed named the file that was mapped correctly.
 
 **Money is converted before anything sums it, and an unknown rate is never 1.0**
 (`fx.py`). Source lines arrive in the supplier's currency; adding them raw put ₹7.0bn

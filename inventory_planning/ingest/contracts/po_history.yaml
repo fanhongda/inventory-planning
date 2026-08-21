@@ -39,7 +39,15 @@ fields:
     normalize: material_number
     aliases: [sku, material, material number, part number, part no, product code,
               item code, item no, item number, item id, article, article no,
-              stock code, product_id, item_id, item]
+              stock code, product_id, item_id, matnr, matl, matl no, item]
+
+    # `Item` is banned rather than merely outranked because outranking only works
+    # while there is something to outrank. In SAP `Item` is the position within a
+    # document — VBAP-POSNR, EKPO-EBELP, MSEG-ZEILE and QMFE-FENUM all render as
+    # `Item` — and is never the material. Most other ERPs use it for the material,
+    # so the ban is scoped to the dialect that means it as a line number.
+    never:
+      sap: [item, itm, item no, position, pos, line item, 项目]
 
   supplier:
     type: string
@@ -56,6 +64,21 @@ fields:
     role: identifier
     aliases: [po number, po no, po num, po, purchase order, purchase order number,
               purch.doc., purchasing document, document number, doc no, order number]
+
+  po_line_number:
+    type: string
+    role: identifier
+    description: >
+      Line item within the purchase order — EKPO-EBELP, which SAP labels `Item`.
+      Present so that column has a home: nothing downstream keys on it, and its whole
+      job is to absorb a header that would otherwise be claimed by `sku`, which is how
+      a document ends up keyed on 10, 20, 30 and joining to nothing. `open_po` has had
+      this field since that failure; a purchase *history* export is the same EKPO
+      filtered differently, arrives with the same column, and had nowhere to put it.
+      It also establishes po_line grain, so the rollup note can name what makes the
+      source finer than the contract.
+    aliases: [line, line no, line number, po line, sched. line, schedule line,
+              item, item no., position, pos, line item, seq, sequence]
 
   po_date:
     type: date

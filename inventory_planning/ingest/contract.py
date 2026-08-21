@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -72,6 +72,13 @@ class FieldContract:
     required: bool = False
     description: str = ""
     aliases: List[str] = dc_field(default_factory=list)
+    # Headers this field must never take, keyed by source system ("any" applies
+    # everywhere). The counterpart to `aliases`, and needed for the same reason a
+    # dictionary needs antonyms: one header word can mean two different things in two
+    # ERPs, and no amount of data shape resolves the disagreement. `Item` is the case
+    # this exists for — in SAP it is always the line number within a document and
+    # never the material, while in most other systems it is the material.
+    never: Dict[str, List[str]] = dc_field(default_factory=dict)
     derivable_from: List[str] = dc_field(default_factory=list)
     assertions: List[Assertion] = dc_field(default_factory=list)
     required_by: List[str] = dc_field(default_factory=list)
@@ -99,12 +106,48 @@ class FieldContract:
             required=bool(raw.get("required", False)),
             description=raw.get("description", ""),
             aliases=list(raw.get("aliases", []) or []),
+            never=cls._parse_never(name, raw.get("never")),
             derivable_from=list(derivable),
             assertions=[Assertion.parse(a) for a in (raw.get("assertions", []) or [])],
             required_by=list(raw.get("required_by", []) or []),
             normalize=raw.get("normalize"),
             value_domain=raw.get("value_domain"),
         )
+
+    # Applies whatever the source system turns out to be.
+    ANY_SYSTEM = "any"
+
+    @staticmethod
+    def _parse_never(name: str, raw: Any) -> Dict[str, List[str]]:
+        """Accept either a bare list (meaning every system) or a system -> list map."""
+        if not raw:
+            return {}
+        if isinstance(raw, list):
+            return {FieldContract.ANY_SYSTEM: [str(h) for h in raw]}
+        if isinstance(raw, dict):
+            return {str(sys_): [str(h) for h in (headers or [])]
+                    for sys_, headers in raw.items()}
+        raise ValueError(
+            f"Field {name!r}: `never` must be a list of headers or a "
+            f"system -> headers mapping, got {type(raw).__name__}"
+        )
+
+    def forbidden_headers(self, system: str) -> Tuple[set, set]:
+        """
+        Headers this field may not claim under `system`, as (normalized, token sets).
+
+        Both forms are returned because the assignment scorer matches aliases both
+        ways, and a rule that only blocked the exact spelling would be walked around
+        by `ITEM_NO` where `Item No.` was refused.
+        """
+        from .profiler import normalize_header
+
+        spellings = list(self.never.get(self.ANY_SYSTEM, []))
+        if system and system != self.ANY_SYSTEM:
+            spellings += self.never.get(system, [])
+        normalized = {normalize_header(h) for h in spellings}
+        normalized.discard("")
+        return normalized, {frozenset(n.split()) for n in normalized}
 
     @property
     def is_numeric(self) -> bool:

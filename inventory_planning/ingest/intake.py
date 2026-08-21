@@ -28,6 +28,7 @@ from .contract_tests import ContractTester, ContractTestReport
 from .encoding import describe_choice, sniff_encoding
 from .profiler import TableProfile
 from .registry import AdapterRegistry, RouteResult
+from .supersede import SupersessionMap, SupersessionReport
 
 
 def _unnamed_share(columns) -> float:
@@ -206,6 +207,17 @@ class LoadedDocument:
     def row_count(self) -> int:
         return len(self.frame)
 
+    # A misroute passes every contract test, so confidence is the only handle on it.
+    # Named once because two callers must agree on what "uncertain" means: the summary
+    # that asks a human to confirm, and the supersession guard that refuses to rewrite
+    # item numbers on a document it is not sure about.
+    _CONFIDENT = 0.75
+
+    @property
+    def route_uncertain(self) -> bool:
+        return (self.route.confidence < self._CONFIDENT
+                or "close call" in (self.route.reason or ""))
+
     def explain(self) -> str:
         """Full provenance for this document — routing, every transform, every test."""
         lines = [
@@ -226,6 +238,10 @@ class IntakeResult:
     documents: Dict[str, LoadedDocument] = dc_field(default_factory=dict)
     plan: IntakePlan = dc_field(default_factory=IntakePlan)
     failures: List[Tuple[str, str]] = dc_field(default_factory=list)
+    # What the declared material renumberings did to the frames above. Empty on a run
+    # with no substitution list — which is not the same as a run where every number
+    # is its own material, and the plan says which of the two happened.
+    supersessions: SupersessionReport = dc_field(default_factory=SupersessionReport)
     # Observations worth stating that are not problems. Kept apart from `failures`
     # so the run does not cry wolf about things the planner already knows.
     notes: List[str] = dc_field(default_factory=list)
@@ -287,10 +303,7 @@ class IntakeResult:
         # from the wrong premise — so `OK` on the line above is not evidence that the
         # file is what the router thinks. Where the margin was thin, say so here rather
         # than only inside the routing reason nobody reads.
-        uncertain = [
-            doc for doc in self.documents.values()
-            if doc.route.confidence < 0.75 or "close call" in (doc.route.reason or "")
-        ]
+        uncertain = [doc for doc in self.documents.values() if doc.route_uncertain]
         if uncertain:
             lines.append("")
             lines.append("  ⚠ Routed on a thin margin — confirm before trusting the run:")
@@ -299,6 +312,14 @@ class IntakeResult:
                              f"({doc.route.confidence:.0%})")
             lines.append("      python -m inventory_planning.explain <file>   "
                          "shows what each contract scored and why")
+
+        # Above the notes, not among them. Merging two item numbers changes what every
+        # figure below is counted over, so it is not an observation about the data —
+        # it is a statement about what the run is planning.
+        merge = self.supersessions.summary()
+        if merge:
+            lines.append("")
+            lines.append(merge)
 
         for note in self.notes:
             lines.append("")
@@ -330,6 +351,16 @@ class IntakeResult:
             },
             "plan": self.plan.to_dict(),
             "failures": [{"source": n, "reason": r} for n, r in self.failures],
+            "supersessions": {
+                "applied": [
+                    {"old_sku": p.old_sku, "new_sku": p.new_sku, "ratio": p.ratio,
+                     "source": p.source}
+                    for p in self.supersessions.applied
+                ],
+                "phase_pairs": self.supersessions.phase_pairs,
+                "problems": list(self.supersessions.problems),
+                "challenges": list(self.supersessions.challenges),
+            },
         }
 
 
@@ -421,6 +452,11 @@ class Intake:
             if missing:
                 withheld[doc_type] = missing
 
+        # Before any cross-document check, because every one of them is about item
+        # numbers: a renumbered part looks like two documents disagreeing on their key
+        # until the two numbers have been made into one.
+        self._apply_supersessions(result)
+
         result.plan = self.resolver.resolve(loaded, unrecognised, withheld=withheld)
         self._note_po_overlap(result)
         suspect = self._check_key_shape(result)
@@ -431,6 +467,78 @@ class Intake:
             print(result.summary())
         return result
 
+
+    # ── Material identity ────────────────────────────────────────────────────
+
+    def _apply_supersessions(self, result: IntakeResult) -> None:
+        """
+        Make one material out of two numbers, everywhere at once.
+
+        "Everywhere at once" is the whole of it. Every join downstream is on `sku`, so
+        rewriting the number in the demand history and not in the stock report is
+        worse than leaving both alone: it produces a SKU with a forecast and no
+        position and another with a position and no forecast, and neither of them
+        raises anything.
+        """
+        # Routing is inferred, and for every other document a misroute is a wrong
+        # premise that the numbers can still be checked against. Here it is a rewrite
+        # of item identity that nothing downstream can see, so this is the one contract
+        # that does not act on a guess: below the confidence the summary already asks a
+        # human to confirm at, the pairs are reported and nothing is merged.
+        doc = result.get("substitution")
+        withheld = None
+        if doc is not None and doc.route_uncertain:
+            withheld = (
+                f"{doc.source_name} was routed to a substitution list on a thin margin "
+                f"({doc.route.confidence:.0%}). Merging item numbers rewrites every "
+                f"document and leaves no trace downstream, so it is not done on a "
+                f"guess. Confirm the file is a renumbering list and re-run."
+            )
+
+        smap = SupersessionMap.from_frames(
+            substitution_df=result.frame("substitution"),
+            item_master_df=result.frame("item_master"),
+            withheld=withheld,
+        )
+        result.supersessions = smap.report
+        if not smap:
+            return
+
+        # Asked before anything moves. Once the rewrite has happened the old number is
+        # not in any frame to be checked against, and the one declaration worth
+        # doubting is the one that has already been acted on.
+        smap.challenge({
+            dt: doc.frame for dt, doc in result.documents.items()
+            if dt != "substitution"
+        })
+
+        for doc_type, doc in result.documents.items():
+            if doc_type == "substitution":
+                continue
+            contract = self.contracts.get(doc_type)
+            before = len(doc.frame)
+            frame, records = smap.apply(doc.frame, contract, doc_type=doc_type)
+            if not records:
+                continue
+
+            doc.frame = frame
+            smap.report.records.extend(records)
+            moved = sum(r.rows for r in records)
+            doc.transform_log.append(TransformStep(
+                "sku", "superseded",
+                f"{moved:,} row(s) rewritten to their successor across "
+                f"{len(records)} pair(s); {before:,} -> {len(frame):,} rows",
+            ))
+
+            # The recombination is the pipeline's own work, so nothing else will catch
+            # it going wrong — and a broken grain is precisely the failure that stays
+            # quiet while every quantity downstream doubles.
+            grain = self.tester._grain_test(frame, contract)
+            if not grain.passed:
+                smap.report.problems.append(
+                    f"{doc_type}: merging left duplicate rows on "
+                    f"{contract.natural_key} — {grain.detail}"
+                )
 
     # Fewer distinct item numbers than this, in a document of any real size, is not an
     # item key. SAP line numbers land here — a purchase order rarely runs past line 60,

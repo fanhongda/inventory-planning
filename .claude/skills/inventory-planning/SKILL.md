@@ -67,6 +67,7 @@ every file automatically — do not ask the user to say which file is which.
 | `service_signal` | no | open sales orders | on-time delivery modelled, not measured |
 | `item_dimension` | no | item master **or** planner worksheet | suggested quantities not rounded to a real MOQ; obsolete items still replenished |
 | `planner_baseline` | no | planner worksheet | cannot say whether the safety stock in use is above or below what the data justifies |
+| `substitution_signal` | no | a substitution list — **only** this document merges anything | a part that changed number is planned as two items |
 
 **A pre-compiled SKU time series fully satisfies `demand_signal` on its own.** When a
 planner has already bucketed demand themselves, sales history is not needed — and the
@@ -111,6 +112,63 @@ determined by demand variability, lead time and a service level, so a hand-set v
 is a position to be compared, never an input — a pipeline that consumed it would agree
 with whatever it was shown. Say this if the user asks why their safety stock did not
 "take".
+
+### The third document: which item numbers are the same material
+
+A part renumbered from 7100014 to 7100015 arrives as two SKUs, and every figure that
+follows is wrong with no error anywhere — the old number holds stock and open POs
+against a history that stops, so it reads as dead stock with a year of cover; the new
+number has three months of history, is classified non-stocking, forecast flat, and
+given almost no safety stock. **Ask for this list whenever the planner mentions a part
+change, a phase-in, or an item that "used to be" something else.**
+
+A file with two item columns is enough — old and new, one row per pair. Optional
+columns, all of which change the answer:
+
+| Column | What it does |
+|---|---|
+| relation | `supersede` (renumbering — merge everything) or `phase` (both numbers trade at once — annotate, never merge). Absent means `supersede`. |
+| ratio | Quantity of the new number equal to one of the old. **Ask for it explicitly whenever the pack size or UoM changed** — the default of 1 is silently wrong by an order of magnitude if it did. |
+| effective_date | When the switch happened. Not needed to merge; it is what lets the run test the claim. |
+| rationale | Why these two are the same material. Required by convention, for the same reason every rule in `planning_parameters.md` carries one. |
+
+**Check the ERP before asking anyone to type it.** SAP already models this on the
+material's plant view — follow-up material `MARC-NFMAT`, effective-out date
+`MARC-AUSDT`, discontinuation indicator `MARC-KZAUS`. An item master carrying those
+columns saves the retyping, but it does **not** merge anything on its own: the run
+reads it and prints the pairs as a substitution list to check and hand back. Relay that
+list and ask whether it is right — that is the confirmation, and it is deliberate. The
+master was handed over for lead times and MOQs, that column is maintained years before
+anyone plans on it, and merging item numbers restructures every document in the run.
+
+What the run does with it, and what it will not do:
+
+- Every occurrence of the old number in **every** document is rewritten before anything
+  is computed, and rows that become duplicates are recombined. Quantities add; a master
+  row does not — two 90-day lead times are not a 180-day lead time, so the successor's
+  master row wins and the predecessor's only fills its gaps.
+- **Pairs are never inferred.** Do not offer to detect them from the data. Pairing a
+  SKU going to zero with one ramping up would be right often and wrong silently, and a
+  wrong pair adds two unrelated materials' stock and history together and produces a
+  complete, self-consistent, wrong report.
+- **Only a substitution list merges anything.** Not an item master, not a transfer
+  document, not a thin-margin route. If a run merged nothing and the planner expected
+  it to, the answer is always in the `Material supersessions` block — read it rather
+  than guessing. Never work around the gate by hand-editing frames after `load_all`.
+- A **split** (one number, two successors) or a **loop** is dropped and reported, never
+  resolved by choosing. The rest of the map still applies.
+- Declarations are **challenged, not trusted**: an old number still transacting after
+  its own effective date is reported. Relay that one — it usually means the pair is
+  really a phase pair and a live material has just been folded into another.
+- `output/<ts>/supersessions_<ts>.csv` records what each old number contributed to each
+  document. **Quote it when reporting on a merged SKU**: the stock is still on the shelf
+  under the old label and the open POs are still raised against it, so a buyer told to
+  order 400 needs to know how much of the cover is sitting under the number they will
+  not find in the report.
+
+`phase` pairs are read, counted and otherwise inert today — coexisting materials are
+not merged, and the phase-in/phase-out handling is not built yet. Say so rather than
+implying the annotation changed a recommendation.
 
 Accepts CSV or Excel (.xlsx / .xls / .xlsm).
 
@@ -164,6 +222,11 @@ contract tests. It prints an intake summary. **Read it and relay three things:**
    that is wrong produces a complete report full of zeroes and no error anywhere.
    **Stop and fix the mapping before running.** The warning names the column that
    would have joined instead; Step 2b is how to apply it.
+5. **The `Material supersessions` block**, when a substitution list was supplied. Say
+   which numbers were merged into which before quoting any figure about them — the
+   report will name only the survivor, and the planner is looking for the other one.
+   Relay any challenge or dropped pair under it verbatim; both mean the map, not the
+   data, needs a decision.
 
 Do **not** walk the user through column-by-column mapping confirmation. The mapping is
 inferred, tested and logged. Surface it only when a test fails, confidence is low, or
@@ -458,7 +521,7 @@ Data-shape knowledge lives in `inventory_planning/ingest/` and is also data, not
 
 | Location | What it holds |
 |---|---|
-| `ingest/contracts/*.yaml` | Canonical fields per document: type, grain, `derivable_from`, `never`, assertions, value domains. Change these to change what the pipeline *means* by a field. |
+| `ingest/contracts/*.yaml` | Canonical fields per document: type, grain, `derivable_from`, `never`, assertions, value domains. Change these to change what the pipeline *means* by a field. `substitution.yaml` is the one that declares identity rather than content — which item numbers are the same material. |
 | `ingest/adapters/<tenant>__<system>/*.yaml` | How one specific export satisfies a contract. Add a file here to support a new ERP — no code change. |
 
 **Adding a new ERP is a YAML file, not a code change.** Run once, review the drafted
@@ -517,6 +580,9 @@ output/<timestamp>/
 ├── parameter_suggestions_<ts>.csv   ← suggested parameters vs those in force, per SKU
 ├── suggested_rules_<ts>.md          ← the same as paste-able planning_parameters.md rules
 ├── source_crosscheck_<ts>.csv       ← where two sources disagree, and by how much
+├── supersessions_<ts>.csv           ← old number -> new, and what each contributed to
+                                       each document. Written only where a renumbering
+                                       was declared and matched something.
 ├── purchase_recommendations_<ts>.csv
 ├── inventory_projection_<ts>.csv
 ├── backlog_realization_<ts>.csv     ← per-SKU realization rate and the evidence

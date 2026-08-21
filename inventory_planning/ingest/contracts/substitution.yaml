@@ -1,0 +1,188 @@
+doc_type: substitution
+description: >
+  Declared relationships between two material numbers — one row per pair, maintained
+  by the planner or exported from the ERP's discontinuation fields (SAP: MARC-NFMAT
+  follow-up material, MARC-AUSDT effective-out date).
+
+  This document exists because material identity is the one thing the transactions
+  cannot establish. When 7100014 is renumbered to 7100015 the history splits in two
+  and every downstream number is wrong in a way that raises no error: the old number
+  looks like dead stock with a year of cover, the new one looks like a new item with
+  three months of history and is classified non-stocking, so the forecast is flat and
+  the safety stock is nearly nothing. Both readings are confident and both are wrong.
+
+  It is deliberately *declared*, never inferred. A rule that pairs a SKU going to zero
+  with one ramping up in the same month would be right often and wrong silently, and
+  the two errors do not cost the same: missing a pair leaves the status quo, while
+  inventing one adds two unrelated materials' stock and history together and produces
+  a complete, self-consistent, wrong report. Only a planner knows.
+
+  Two relations live in one table because a planner maintains one list:
+
+    supersede   the old number is gone; merge everything and keep the new one
+    phase       both numbers trade at once; annotate, never merge
+
+  Only `supersede` is acted on today. `phase` rows are read, counted and reported so
+  the list can be maintained as a whole, and are otherwise inert.
+grain: pair
+natural_key: [old_sku]
+capabilities: [substitution_signal]
+
+# Nothing else in the contract set carries two item columns, so the pair *is* the
+# identity. Without this an item master exported with a follow-up-material column
+# scores on `new_sku` alone and lands here, taking the item dimension with it.
+identifying_any:
+  - [old_sku]
+  - [new_sku]
+
+value_domains:
+
+  relation:
+    canonical: [supersede, phase]
+    default: supersede
+    # A pair with no stated relation is a renumbering. That is the overwhelmingly
+    # common case, it is what the ERP discontinuation fields mean, and it is also the
+    # reading that gets *checked* — a wrongly-defaulted supersede shows up as both
+    # numbers still trading after the effective date, which the run reports. A wrongly
+    # defaulted `phase` would merge nothing and say nothing.
+    map:
+      "supersede": supersede
+      "supersession": supersede
+      "supercede": supersede
+      "superseded": supersede
+      "replace": supersede
+      "replaced": supersede
+      "replacement": supersede
+      "renumber": supersede
+      "renumbered": supersede
+      "rename": supersede
+      "full": supersede
+      "discontinued": supersede
+      "discontinuation": supersede
+      "obsolete": supersede
+      "1": supersede
+      "完全替代": supersede
+      "物料号更新": supersede
+      "替代": supersede
+      "phase": phase
+      "phase in": phase
+      "phase out": phase
+      "phase-in/phase-out": phase
+      "phase in/phase out": phase
+      "pipo": phase
+      "coexist": phase
+      "coexisting": phase
+      "parallel": phase
+      "partial": phase
+      "并存": phase
+      "新老交替": phase
+
+fields:
+
+  # `from material` / `to material` are deliberately NOT aliases here, and must not be
+  # added back. A material-to-material stock transfer (SAP movement type 309) is headed
+  # exactly that way, carries no other column this contract recognises, and routed here
+  # at 83% — one 309 posting would have merged two live materials permanently. The
+  # aliases that remain all say *old* or *new*, which a movement document never does.
+  # Same reason `current material` is absent: it appears on cross-references and price
+  # lists that have nothing to do with identity.
+  old_sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: material_number
+    description: >
+      The number being retired. Every occurrence of it in every other document is
+      rewritten to `new_sku` before anything is computed.
+    aliases: [old sku, old material, old material number, old part number, old part no,
+              old item, old item number, old item code, old product code, old number,
+              old code, predecessor, predecessor material,
+              replaced material, replaced sku, replaced item, discontinued material,
+              discontinued sku, obsolete material, superseded material, superseded sku,
+              previous material, previous sku, former material, 旧物料, 旧物料号, 原物料号]
+    never:
+      sap: [item, itm, item no, position, pos, line item, 项目]
+
+  new_sku:
+    type: string
+    role: identifier
+    required: true
+    normalize: material_number
+    description: >
+      The number that survives. Planning runs on this one; the merge report says what
+      the old number contributed, because the physical stock on the shelf and the open
+      POs at the supplier are still labelled with it.
+    aliases: [new sku, new material, new material number, new part number, new part no,
+              new item, new item number, new item code, new product code, new number,
+              new code, successor, successor material,
+              follow up material, followup material, follow-up material, nfmat,
+              replacement material, replacement sku, replacement item, replacing material,
+              新物料, 新物料号, 后继物料]
+    never:
+      sap: [item, itm, item no, position, pos, line item, 项目]
+
+  relation_raw:
+    type: string
+    role: dimension
+    value_domain: relation
+    description: >
+      Whether the two numbers are one material under two names (`supersede`) or two
+      materials trading side by side (`phase`). The distinction decides whether the
+      data is merged, and merging the wrong pair cannot be undone downstream.
+    aliases: [relation, relationship, substitution type, substitution kind, type, kind,
+              replacement type, change type, mode, category, 替代类型, 关系]
+
+  ratio:
+    type: decimal
+    role: measure
+    description: >
+      Quantity of the new number equivalent to one of the old — `qty_new = qty_old ×
+      ratio`. Defaults to 1, which is the usual case and the dangerous one to assume:
+      a renumbering that also changed the pack size (loose piece to a ten-pack) makes
+      every merged quantity wrong by an order of magnitude with nothing to catch it.
+      Where the ratio is not 1, quantities are scaled and per-unit costs are divided
+      by it, so the money is left where it was.
+    aliases: [ratio, conversion ratio, conversion factor, factor, qty ratio,
+              quantity ratio, uom ratio, pack ratio, multiplier, umrez, 换算比, 比例]
+    assertions:
+      - expr: "ratio > 0"
+        severity: error
+        description: A zero or negative conversion ratio cannot scale a quantity
+
+  effective_date:
+    type: date
+    role: dimension
+    description: >
+      When the switch took effect. Not needed to merge — a supersession merges the
+      whole history either way — but it is what lets the run check the declaration
+      against the transactions: an old number still shipping months after its own
+      effective date is a claim the data does not support, and worth a question
+      before the merge is trusted.
+    aliases: [effective date, effective from, effective on, valid from, valid on,
+              switch date, changeover date, cutover date, cut over date,
+              discontinuation date, discontinued date, obsolete date, end date,
+              phase out date, ausdt, 生效日期, 切换日期]
+
+  rationale:
+    type: string
+    role: dimension
+    description: >
+      Why these two numbers are the same material. Required by convention rather than
+      by the parser, for the same reason every rule in `planning_parameters.md` carries
+      one: merging two item numbers is the most consequential single statement anybody
+      makes to this pipeline, and in three months nobody will remember who decided it
+      or on what evidence.
+    aliases: [rationale, reason, note, notes, comment, comments, remark, remarks,
+              justification, description, 原因, 说明, 备注]
+
+assertions:
+  - expr: "not_null(old_sku)"
+    severity: error
+  - expr: "not_null(new_sku)"
+    severity: error
+  - expr: "old_sku != new_sku"
+    severity: error
+    description: >
+      A pair mapping a number to itself is a maintenance error, not an identity. Left
+      in, it survives chain resolution as a self-loop and reports a merge that did
+      nothing.

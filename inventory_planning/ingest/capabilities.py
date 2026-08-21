@@ -170,6 +170,25 @@ CAPABILITIES: Dict[str, Capability] = {
             "on master data",
         ],
     ),
+    "substitution_signal": Capability(
+        name="substitution_signal",
+        description=(
+            "Declared relationships between material numbers — which old number "
+            "became which new one, and which pairs merely coexist"
+        ),
+        required=False,
+        # Only the document whose purpose is to declare identity supplies this. An
+        # item master's follow-up-material column is read and proposed, never applied,
+        # so a run holding one has *not* had its renumberings handled — and a ✓ here
+        # would say it had.
+        suppliers=["substitution"],
+        fallback="every material number is taken to be a distinct material",
+        degrades=[
+            "A part that changed number is planned as two items — the old number as "
+            "dead stock against a history that stopped, the new one as a new item on "
+            "too little history to forecast or to stock",
+        ],
+    ),
     "customer_dimension": Capability(
         name="customer_dimension",
         description="Customer attribution of demand",

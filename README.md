@@ -458,6 +458,76 @@ is a different question that `service` and `diagnostics.forward` already answer,
 mixing the two would let a reliable planner buying from a late supplier read as a
 control failure.
 
+### Material identity is declared, and the merge happens before anything is computed
+
+A part renumbered from 7100014 to 7100015 is one planning problem that arrives as two,
+and nothing in the transactions says so. Left alone it produces two confident answers,
+both wrong, and no error anywhere:
+
+```
+7100014   150 on hand, 500 on order, demand history stops in March
+          → a year of cover, no forward demand: dead stock, push out the PO
+7100015   three months of history, no receipts
+          → non-stocking, forecast flat, safety stock ≈ 0
+```
+
+So the rewrite happens at intake, before any analysis, and — this is the part that
+matters — **in every document at once**. Every join here is on `sku`, so rewriting the
+demand history and not the stock report is worse than leaving both alone: it gives one
+SKU a forecast with no position and another a position with no forecast.
+
+Rows that become duplicates of each other afterwards are recombined, or the grain the
+pipeline itself just broke double-counts everything downstream. **How they combine
+follows from the key, not from the document's name.** A natural key of `[sku]` alone
+means one row per material of its standing attributes, so two such rows are two
+descriptions of one thing: the successor's row wins and the predecessor's only fills
+its gaps. Adding them would make a 180-day lead time out of two 90-day ones. Every
+other key in the contract set carries an event or a period alongside the SKU, so
+quantities add — and a per-unit price is quantity-weighted, never summed and never
+flat-averaged.
+
+Where the renumbering also changed the pack size, a conversion ratio scales the
+quantities and divides the per-unit money, so the total value does not move. The
+default of 1 is the common case and the dangerous one: a loose piece becoming a
+ten-pack is wrong by an order of magnitude with nothing to catch it.
+
+**The pairs are never inferred.** The data does contain a tempting signal — one SKU
+going to zero in the same month another ramps up — and a rule built on it would be
+right often. The two ways of being wrong do not cost the same. A missed pair leaves the
+status quo. An invented pair adds two unrelated materials' stock and history together
+and produces a complete, self-consistent, wrong report. Only a planner knows, so only a
+planner declares it.
+
+**And declaring it takes an act, not an attribute.** Exactly one document causes a
+merge: a substitution list, whose entire purpose is to state identity. This is the one
+place the pipeline does not treat a stated value as something to rank and cross-check,
+because identity cannot be ranked against anything — merging restructures every
+document in the run, no figure downstream carries a trace of it, and there is nothing
+left to disagree with afterwards.
+
+That gate has three teeth. An **item master's follow-up-material column** is read and
+proposed, never applied: SAP maintains one (`MARC-NFMAT`, with `MARC-AUSDT` and
+`MARC-KZAUS`), it is maintained at the moment of a phase-out decision and consulted
+years later, and the master was handed over to supply lead times. The run turns whatever
+it finds there into a substitution list to check and hand back — the confirmation, and
+the saving of the retyping, at once. A **thin-margin route** merges nothing and says so;
+for every other document a misroute is a wrong premise the numbers can still be checked
+against, but here it is a rewrite of identity that nothing downstream can see. And the
+**aliases refuse ambiguity**: `From Material` / `To Material` are not aliases here,
+because a material-to-material stock transfer is headed exactly that way and routed here
+at 83% until they were removed — one movement posting would have merged two live
+materials.
+
+What the pipeline *does* do is test the declaration, the same way a stated lead time is
+tested: an old number still transacting after its own effective date is reported, because
+that is a claim the transactions do not support and the merge has just folded a live
+material into another one. A split — one number with two successors — and a loop are
+dropped and reported rather than resolved by choosing; the rest of the map still applies,
+since one mistyped row should not cost the other forty merges.
+
+Coexisting pairs are a different problem with different arithmetic and are not merged.
+They are read and counted; the phase-in / phase-out handling is not built yet.
+
 ### Smaller decisions
 
 **Croston's method for intermittent demand.** ETS and ARIMA on sparse demand (6 active
@@ -547,6 +617,7 @@ transformed by an adapter and verified by contract tests before it reaches the a
 | `service_signal` | no | open sales orders |
 | `item_dimension` | no | item master **or** planner worksheet |
 | `planner_baseline` | no | planner worksheet |
+| `substitution_signal` | no | a substitution list — only this document causes a merge |
 
 A planner-supplied SKU × period matrix satisfies `demand_signal` by itself; the wide
 layout is recognised from the header, so no separate loader has to be called.
@@ -634,6 +705,8 @@ output/
 ├── parameter_suggestions_<ts>.csv       suggested parameters vs those in force, per SKU
 ├── suggested_rules_<ts>.md              the same, as paste-able planning_parameters.md rules
 ├── source_crosscheck_<ts>.csv           where two sources disagree, and by how much
+├── supersessions_<ts>.csv               old item number -> new, and what each old
+│                                        number contributed to each document
 ├── purchase_recommendations_<ts>.csv
 ├── inventory_projection_<ts>.csv
 ├── backlog_realization_<ts>.csv         per-SKU realization rate and the evidence

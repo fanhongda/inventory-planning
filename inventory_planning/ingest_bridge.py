@@ -115,6 +115,12 @@ class IngestBridge:
         )
 
         for doc_type, doc in result.documents.items():
+            # The substitution list is not a planning input — it has already done its
+            # work at intake, rewriting the item numbers in every frame below. Running
+            # it through `_prepare` would stamp it with a location and count it among
+            # the documents that took the placeholder.
+            if doc_type == "substitution":
+                continue
             frame = self._prepare(doc.frame.copy(), doc_type, fx)
             if doc_type == "inventory":
                 out["inventory_df"] = frame

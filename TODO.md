@@ -33,6 +33,45 @@ Until then: `consolidate_to_planning_grain` prints how many SKUs were merged fro
 than one location, and `stock_locations` on the inventory outputs lists the codes that
 went in, so the exposure is at least visible.
 
+## Phase-in / phase-out (P1)
+
+The `substitution` contract carries two relations and only one is acted on.
+`supersede` — a renumbering — merges everything. `phase` — two numbers trading side by
+side while one ramps up and the other winds down — is read, counted, and otherwise
+inert. That is deliberate: the two have different arithmetic and merging a phase pair
+folds a live material into another one. But an annotation that changes nothing is just
+a label, and there are four specific things it should change:
+
+- **A phase-in item must not be classified non-stocking.** Short rising history is what
+  the classifier reads as a small item, so the new product is systematically
+  under-stocked at exactly the moment it is ramping. The annotation says the short
+  history is not evidence of a small item; the forecast should be marked unreliable
+  rather than returned flat.
+- **A phase-out item's excess is not an ordering failure.** It lands in over-ordering
+  and slow burn today, which puts a product decision on the buyer's KPI. It belongs in
+  its own section — planned obsolescence — with the run-out or write-off as the action,
+  not a push-out.
+- **Cap the buy on a phase-out item** at what is needed before the phase-out date. This
+  is the one item on the list that saves money this week, and it is why a phase pair
+  needs an end date rather than just a start.
+- **Report the pair adjacent**, with combined cover as a *reported* figure only.
+
+Explicitly not in scope: pooling. Phase-in/phase-out is not interchangeability. If the
+old customers only buy the old number, the two stocks cannot cover for each other and
+combining their σ is wrong. True interchangeability is a third relation, with the
+risk-pooling arithmetic that goes with it, and it needs its own declaration.
+
+Two smaller pieces left over from the supersede work:
+
+- **Action lines should name the number the buyer will find in the ERP.** Planning runs
+  on the survivor, correctly, but an open PO to push out was raised against the old
+  number and that is what the PO says. `supersessions_<ts>.csv` answers the question;
+  the recommendation row should carry it directly.
+- `Adapter._apply_rollup` sums every numeric measure, including `unit_cost`. Wrong for
+  a per-unit price and for a lead time — `supersede.py::_recombine` works out the right
+  aggregation from the field's declared unit, and the rollup path should use the same
+  rule.
+
 ## Smaller items
 
 - `IFR` (item fill rate) service metric — `config/stocking_policy.json` documents

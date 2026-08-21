@@ -17,6 +17,11 @@ grain: sku
 natural_key: [sku]
 capabilities: [lead_time_signal, cost_signal, item_dimension]
 
+# `substitution_signal` is deliberately NOT declared here even though `successor_sku`
+# below is read. A follow-up material found on this document is *proposed*, never
+# applied — see `supersede.py::from_frames` — so a run holding an item master has not
+# had its renumberings handled, and a satisfied capability would say it had.
+
 # Item master looks like an inventory snapshot on headers alone — both are one row
 # per SKU with descriptive columns. The difference is that a master carries planning
 # parameters and no stock position. Requiring a planning parameter to be present, and
@@ -199,6 +204,42 @@ fields:
       still shows demand history should not be replenished against that history.
     aliases: [status, item status, material status, lifecycle status, life cycle,
               active, obsolete flag, discontinued, mrp status, plant status]
+
+  successor_sku:
+    type: string
+    role: dimension
+    normalize: material_number
+    description: >
+      The number this one was renumbered to — SAP's follow-up material (MARC-NFMAT),
+      and its equivalents elsewhere. Where it is maintained, the renumbering map is an
+      export rather than a list somebody retypes, which is the difference between a
+      map that exists and one that does not.
+
+      Read, and reported as a proposal — never acted on from here. Merging two item
+      numbers restructures every document in the run and leaves no trace in any figure
+      downstream, so it takes an act rather than an attribute: this master was handed
+      over to supply lead times and MOQs, and this column came along with it. The run
+      turns whatever it finds here into a substitution list the planner can check and
+      hand back, which is both the confirmation and the saving of the retyping.
+
+      It is also the column most likely to be stale. A follow-up material is maintained
+      at the moment of a phase-out decision and consulted years later, if ever.
+    aliases: [successor, successor material, successor sku, follow up material,
+              followup material, follow-up material, nfmat, replacement material,
+              replaced by, superseded by, new material number, 后继物料]
+    never:
+      sap: [item, itm, item no, position, pos, line item, 项目]
+
+  discontinued_date:
+    type: date
+    role: dimension
+    description: >
+      Effective-out date of the renumbering — SAP's MARC-AUSDT. Not needed to merge,
+      but it is what lets the run test the claim: an item still shipping months after
+      its own discontinuation date has not in fact been superseded.
+    aliases: [discontinuation date, discontinued date, effective out date,
+              effective-out date, ausdt, obsolete date, valid to, valid until,
+              end of life, eol date, 失效日期]
 
   planner_code:
     type: string

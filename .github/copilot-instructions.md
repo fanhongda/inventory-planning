@@ -37,17 +37,17 @@ works but requires the caller to know the answer already.
 
 Outputs land in `output_dir`: `kpi_review_*.html` is the review, plus CSVs
 (`purchase_recommendations_*`, `parameter_suggestions_*`, `inventory_projection_*`,
-`forecast_detail_*`, `supplier_params`, `sku_planning_params`) and
-`suggested_rules_*.md`. There is no longer an `inventory_report_*.html` — the older
-forecast-oriented report was removed, and three skill evals went on asserting its
-existence for months afterwards.
+`forecast_detail_*`, `supplier_params`, `sku_planning_params`, `supersessions_*` where
+material numbers were merged) and `suggested_rules_*.md`. There is no longer an
+`inventory_report_*.html` — the older forecast-oriented report was removed, and three
+skill evals went on asserting its existence for months afterwards.
 
 The review covers, in order: service (OTD split four ways, plus OTD by month), inventory
 against policy, ordering behaviour, replenishment cadence, forward risk, then the work
 list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 566 tests, all should pass
+python3 -m pytest tests/ -q        # 610 tests, all should pass
 ```
 
 Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
@@ -120,6 +120,49 @@ line-number field so `Item` has somewhere to go, and a column holding 10, 20, 30
 refused as an item key even in the rescue pass for a required field. **Never "fix" a
 `required_field:sku` failure by mapping `sku` to `Item`.** Leaving it unmapped stops the
 run; mapping it produces a complete report of zeroes and no error at all.
+
+**A renumbered material becomes one SKU at intake, in every document at once**
+(`ingest/supersede.py`, called from `intake.py::_apply_supersessions`). A part that was
+7100014 and is now 7100015 is one planning problem arriving as two: the old number
+holds stock against a history that stopped, the new one has too little history to
+forecast or to stock, and both readings are confident and wrong. The rewrite therefore
+happens before any analysis and before every cross-document check — and a *partial*
+rewrite is worse than none, because every join here is on `sku`, so a SKU can end up
+with a forecast in one document and its position in another. After the rewrite, rows
+that now share the contract's natural key are recombined, or the grain the pipeline
+just broke double-counts everything downstream.
+
+**Two rows for one material combine by what the key says they are.** A natural key of
+`[sku]` alone means one row per material of its *standing attributes*, so the successor
+row wins and the predecessor only fills its gaps — adding them makes a 180-day lead time
+out of two 90-day ones. Every other key carries an event or a period, so quantities add;
+per-unit money is quantity-weighted, never summed and never flat-averaged.
+
+**Substitution pairs are declared, never inferred.** A rule pairing a SKU going to zero
+with one ramping up would be right often and wrong silently, and the two errors do not
+cost the same: a missed pair leaves the status quo, an invented one adds two unrelated
+materials together and produces a complete report with no error in it anywhere. What
+the pipeline *may* do is test a declaration somebody already made — an old number still
+transacting after its own effective date is reported, not acted on. A split (one number,
+two successors) or a loop is dropped and reported; it is never resolved by choosing.
+
+**Exactly one document causes a merge, and it takes an act rather than an attribute.**
+A substitution list, whose whole purpose is to declare identity. Everywhere else a
+stated value is ranked below measurement and cross-checked; identity cannot be ranked
+against anything, because merging leaves no trace in any figure downstream and nothing
+to disagree with afterwards. Three consequences, each with a test:
+- An **item master's `successor_sku`** (SAP `MARC-NFMAT`) is read and *proposed*, never
+  applied — the master was handed over for lead times, that column is maintained years
+  before anyone plans on it, and it is routinely stale. The run emits the pairs as a
+  substitution list to hand back. `item_master.yaml` therefore does **not** declare
+  `substitution_signal`; a ✓ there would say the renumberings had been handled.
+- A **thin-margin route merges nothing** (`intake.py::_apply_supersessions`, gated on
+  `LoadedDocument.route_uncertain`). Elsewhere a misroute is a wrong premise the numbers
+  can still be checked against.
+- **`from material` / `to material` are not aliases** on `substitution.yaml` and must
+  not be added back. A material-to-material stock transfer (SAP movement 309) is headed
+  exactly that way and routed to substitution at 83% until they were removed — one
+  posting would have permanently merged two live materials.
 
 **Every CSV is written UTF-8 *with a BOM*, and read by sniffing, not by a ladder**
 (`ingest/encoding.py`). Without the BOM Excel decodes using the system codepage, so a

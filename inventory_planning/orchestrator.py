@@ -406,6 +406,8 @@ class InventoryPlanner:
         self._intake_plan = inputs.pop("_intake_plan", None)
         self._fx = inputs.pop("_fx", None)
 
+        self._write_supersession_record()
+
         if not plan.can_run:
             missing = ", ".join(c.name for c in plan.missing_required)
             raise ValueError(
@@ -445,6 +447,30 @@ class InventoryPlanner:
             "status": "OK" if not plan.degradations else "WARNINGS",
         })
         return inputs
+
+    def _write_supersession_record(self) -> Optional[Path]:
+        """
+        Write down what the merge did, because the merge is invisible in every other
+        output by design.
+
+        After it, the run reports on 7100015 and says nothing about 7100014 — which is
+        correct, they are one material. But the stock on the shelf is still labelled
+        with the old number, the open POs at the supplier are still raised against it,
+        and a buyer told to order 400 of the new one needs to know that 150 of the
+        cover already counted is sitting under the old label. That question has one
+        answer and this file is it.
+        """
+        if self._intake is None:
+            return None
+        report = self._intake.supersessions
+        if not report.records:
+            return None
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        path = self.output_dir / f"supersessions_{stamp}.csv"
+        write_csv(report.to_frame(), path)
+        print(f"    Merged item numbers : {path}")
+        return path
 
     # ------------------------------------------------------------------
     # Phase 2: Analytics Pipeline (sequential)

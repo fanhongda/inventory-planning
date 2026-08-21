@@ -110,5 +110,6 @@ class OpenPOReader(BaseReader):
             )
             grp = grp.merge(inco.rename("incoterm"), on="sku", how="left")
 
-        grp["location_id"] = df["location_id"].iloc[0] if "location_id" in df.columns else "DC-01"
+        grp["location_id"] = (df["location_id"].iloc[0] if "location_id" in df.columns
+                              else self.location_id)
         return grp

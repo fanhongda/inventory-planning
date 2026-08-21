@@ -92,7 +92,8 @@ class POHistoryReader(BaseReader):
             results.append({
                 "sku": sku,
                 "supplier": supplier,
-                "location_id": grp["location_id"].iloc[0] if "location_id" in grp.columns else "DC-01",
+                "location_id": (grp["location_id"].iloc[0] if "location_id" in grp.columns
+                                else self.location_id),
                 "wma_lead_time_days": round(wma_lt, 1),
                 "lt_std_days": round(lt_std, 1),
                 "sample_count": n,

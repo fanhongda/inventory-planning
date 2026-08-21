@@ -23,6 +23,7 @@ import pandas as pd
 
 from .fx import FxSummary, FxTable, convert_money
 from .ingest.intake import Intake, IntakeResult
+from .node import load_planning_node
 
 
 # Canonical field -> the name the existing analytics expect.
@@ -50,7 +51,10 @@ class IngestBridge:
     def __init__(self, config_dir: Union[str, Path] = None, verbose: bool = True):
         self.config_dir = Path(config_dir) if config_dir else Path(__file__).parent.parent / "config"
         self.verbose = verbose
+        self.node = load_planning_node(self.config_dir)
         self.location_id = self._load_location_id()
+        # doc_types that carried no location of their own and took the stamp
+        self._stamped: set = set()
         self.fx = FxTable.load(self.config_dir, reporting_currency=self._load_reporting_currency())
         self._warn_currency_mismatch()
 
@@ -61,7 +65,7 @@ class IngestBridge:
         return {}
 
     def _load_location_id(self) -> str:
-        return self._node_config().get("location_id", "DC-01")
+        return self.node.location_id
 
     def _load_reporting_currency(self) -> Optional[str]:
         """
@@ -131,6 +135,15 @@ class IngestBridge:
                 out["timeseries_pivot"] = pivot
                 out["timeseries_meta"] = meta
 
+        # Said once, after every document is in, because the answer depends on all of
+        # them: a placeholder stamped on a file that had no plant column is worth
+        # knowing about, and silence about it is what made `DC-01` look like data.
+        stamp_note = self.node.stamp_note(self._stamped)
+        if stamp_note:
+            result.notes.append(stamp_note)
+            if self.verbose:
+                print(stamp_note)
+
         out["_intake"] = result
         out["_intake_plan"] = result.plan
         out["_fx"] = fx
@@ -160,11 +173,13 @@ class IngestBridge:
             fx.reports[doc_type] = report
 
         df = df.rename(columns=_DOWNSTREAM_RENAMES.get(doc_type, {}))
-        # Every downstream output carries location_id for multi-echelon readiness;
-        # only the inventory contract sources it from the data, so the rest inherit
-        # the configured node.
+        # Every downstream output carries location_id for multi-echelon readiness. It
+        # is read from the source wherever the export names a plant, and stamped from
+        # the configured node only where none does — the two are tracked apart because
+        # the stamped one is a value the pipeline invented.
         if "location_id" not in df.columns:
             df["location_id"] = self.location_id
+            self._stamped.add(doc_type)
         else:
             df["location_id"] = df["location_id"].fillna(self.location_id)
         return df

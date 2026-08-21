@@ -24,6 +24,13 @@ kpi     = planner.run_kpi_review(policy, sales_df=inputs['sales_df'],
                                  po_history_df=inputs['po_history_df'])
 ```
 
+**There are two read paths and they must agree.** `ingest/` (contracts + adapters, via
+`load_all`) is the one to change; `readers/` + `schema.py` is the legacy per-document
+path, still reachable through `load_sales_history()` and friends. A fix applied to one
+and not the other is how `Item` went on being read as the SKU for months after
+`ingest/` had learned better — so `readers/` now imports the contracts' rules rather
+than keeping its own copy. Do not restate a rule in `schema.py` that a contract states.
+
 `load_all` identifies each file itself — do not ask which file is which, and do not
 reintroduce per-document loader calls. The legacy `load_sales_history()` style still
 works but requires the caller to know the answer already.
@@ -40,7 +47,7 @@ against policy, ordering behaviour, replenishment cadence, forward risk, then th
 list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 459 tests, all should pass
+python3 -m pytest tests/ -q        # 566 tests, all should pass
 ```
 
 Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
@@ -113,6 +120,19 @@ line-number field so `Item` has somewhere to go, and a column holding 10, 20, 30
 refused as an item key even in the rescue pass for a required field. **Never "fix" a
 `required_field:sku` failure by mapping `sku` to `Item`.** Leaving it unmapped stops the
 run; mapping it produces a complete report of zeroes and no error at all.
+
+**Every CSV is written UTF-8 *with a BOM*, and read by sniffing, not by a ladder**
+(`ingest/encoding.py`). Without the BOM Excel decodes using the system codepage, so a
+supplier written correctly as 深圳市华强电子 opens as 娣卞湷甯傚崕寮虹數瀛 on a Chinese
+install. On the read side, `latin-1` maps all 256 byte values and therefore never
+raises — a try-until-one-works ladder with latin-1 in it can never reach a CJK codec,
+so a GBK export became mojibake with no error. Use `write_csv`, never bare `to_csv`.
+
+**`location_id` is read from the source wherever the export names a plant** (contracts
+declare it on every transactional document, not just inventory) **and the configured
+node is stamped only where none does.** `DC-01` is the placeholder `node_config.json`
+ships with; when it reaches a row it is reported as a placeholder rather than passed
+off as a warehouse. Never write the literal in a reader — read `self.location_id`.
 
 **A key too coarse to be an item number is reported, and is not evidence against
 anything else** (`intake.py::_check_key_shape`). The agreement check skips documents

@@ -25,6 +25,7 @@ from .adapter import Adapter, TransformStep
 from .capabilities import CapabilityResolver, IntakePlan
 from .contract import ContractRegistry, DocContract, default_registry
 from .contract_tests import ContractTester, ContractTestReport
+from .encoding import describe_choice, sniff_encoding
 from .profiler import TableProfile
 from .registry import AdapterRegistry, RouteResult
 
@@ -114,13 +115,12 @@ def load_sheets(path: Union[str, Path]) -> List[Tuple[str, pd.DataFrame]]:
     suffix = path.suffix.lower()
 
     if suffix == ".csv":
-        for encoding in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
-            try:
-                return [("", pd.read_csv(path, encoding=encoding, dtype=str,
-                                         keep_default_na=False, na_values=[""]))]
-            except UnicodeDecodeError:
-                continue
-        raise ValueError(f"Cannot decode {path.name} with any known encoding")
+        # `sniff_encoding` rather than a try-until-it-works ladder: latin-1 decodes
+        # every possible byte, so the old loop could never reach a CJK codec and a GBK
+        # export became mojibake without raising. See ingest/encoding.py.
+        encoding = sniff_encoding(path)
+        return [("", pd.read_csv(path, encoding=encoding, dtype=str,
+                                 keep_default_na=False, na_values=[""]))]
 
     if suffix in (".xlsx", ".xls", ".xlsm"):
         book = pd.ExcelFile(path)
@@ -380,6 +380,14 @@ class Intake:
                 result.failures.append((path.name, f"could not read: {exc}"))
                 unrecognised.append(path.name)
                 continue
+
+            # A codec that had to be guessed decides what every supplier and customer
+            # name in the file says, so say which one was used. Silence here is how a
+            # GBK export became mojibake and the mojibake became the data.
+            if path.suffix.lower() == ".csv":
+                note = describe_choice(sniff_encoding(path), path.name)
+                if note:
+                    result.notes.append(note)
 
             hint = hints.get(path.name) or hints.get(str(path))
             # Only qualify the name when the workbook actually has several sheets;

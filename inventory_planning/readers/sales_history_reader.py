@@ -76,7 +76,8 @@ class SalesHistoryReader(BaseReader):
             total_cycles = len(series)
             stats.append({
                 "sku": sku,
-                "location_id": df["location_id"].iloc[0] if "location_id" in df.columns else "DC-01",
+                "location_id": (df["location_id"].iloc[0] if "location_id" in df.columns
+                                else self.location_id),
                 "demand_mean": series[series > 0].mean() if active else 0,
                 "demand_std": series.std(),
                 "demand_cv": series.std() / series.mean() if series.mean() > 0 else np.nan,

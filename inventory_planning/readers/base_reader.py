@@ -3,7 +3,6 @@ Base reader: file loading, schema detection, column mapping, data quality checks
 All five document readers inherit from this.
 """
 
-import json
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -12,6 +11,10 @@ from typing import Union, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from ..ingest.contract import default_registry
+from ..ingest.encoding import sniff_encoding
+from ..ingest.profiler import Profiler
+from ..node import load_planning_node
 from ..schema import ALL_SCHEMAS, REQUIRED_FIELDS
 
 
@@ -20,19 +23,64 @@ def _normalize(s: str) -> str:
     return re.sub(r"[\s_\-]+", " ", str(s).lower().strip())
 
 
-def _detect_mapping(df_cols: List[str], schema: Dict[str, List[str]]) -> Tuple[Dict[str, str], List[str]]:
+def _disqualified_item_keys(raw: pd.DataFrame, doc_type: str) -> Dict[str, str]:
+    """
+    Columns that must not become `sku`, mapped to the reason why.
+
+    The rules and the header lists are the contracts' — imported rather than restated,
+    because two copies of "which spellings mean a line number" is how the two paths
+    came to disagree in the first place. `ingest/` learned that `Item` is SAP's
+    position within a document and never the material; this path had not, and its
+    first-match-wins loop had `item` ranked second for `sku`, ahead of `material`.
+
+    Returns an empty mapping when the frame cannot be profiled. A guard that raises on
+    an odd file would be worse than the bug it prevents.
+    """
+    try:
+        profile = Profiler().profile(raw, source_name="")
+        spec = default_registry().get(doc_type).fields.get("sku")
+    except Exception:
+        return {}
+    if spec is None:
+        return {}
+
+    banned, banned_tokens = spec.forbidden_headers(profile.system)
+    out: Dict[str, str] = {}
+    for col in profile.columns:
+        if banned and (col.normalized in banned
+                       or frozenset(col.normalized.split()) in banned_tokens):
+            out[col.name] = f"{profile.system.upper()} uses it for the document line number"
+        elif col.is_small_ordinal:
+            out[col.name] = "its values are a series (10, 20, 30 …), not identifiers"
+    return out
+
+
+def _detect_mapping(
+    df_cols: List[str],
+    schema: Dict[str, List[str]],
+    disqualified: Dict[str, str] = None,
+) -> Tuple[Dict[str, str], List[str]]:
     """
     Auto-detect column mapping from df columns to canonical field names.
     Returns (mapping: {canonical -> df_col}, unmapped_canonicals).
+
+    First match wins, so alias order is a ranking — see `schema.py`. `disqualified`
+    names columns `sku` may not take whatever their name suggests; passing it is what
+    stops an SAP `Item` column from keying the document when no better one exists.
     """
     norm_to_original = {_normalize(c): c for c in df_cols}
+    disqualified = disqualified or {}
     mapping: Dict[str, str] = {}
 
     for canonical, aliases in schema.items():
         for alias in aliases:
-            if _normalize(alias) in norm_to_original:
-                mapping[canonical] = norm_to_original[_normalize(alias)]
-                break
+            col = norm_to_original.get(_normalize(alias))
+            if col is None:
+                continue
+            if canonical == "sku" and col in disqualified:
+                continue
+            mapping[canonical] = col
+            break
 
     unmapped = [f for f in schema if f not in mapping]
     return mapping, unmapped
@@ -43,13 +91,10 @@ def load_file(path: Union[str, Path]) -> pd.DataFrame:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        # Try common encodings
-        for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
-            try:
-                return pd.read_csv(path, encoding=enc, dtype=str)
-            except UnicodeDecodeError:
-                continue
-        raise ValueError(f"Cannot decode {path} with known encodings")
+        # Not a try-until-it-works ladder: latin-1 decodes every possible byte, so the
+        # loop this replaces could never reach a CJK codec and a GBK export became
+        # mojibake without raising anything. See ingest/encoding.py.
+        return pd.read_csv(path, encoding=sniff_encoding(path), dtype=str)
     elif suffix in (".xlsx", ".xls", ".xlsm"):
         return pd.read_excel(path, dtype=str)
     else:
@@ -81,13 +126,8 @@ class BaseReader(ABC):
         self.config_dir = Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
         self.schema = ALL_SCHEMAS[self.doc_type]
         self.required = REQUIRED_FIELDS[self.doc_type]
-        self.location_id = self._load_node_config()
-
-    def _load_node_config(self) -> str:
-        cfg = self.config_dir / "node_config.json"
-        if cfg.exists():
-            return json.loads(cfg.read_text(encoding="utf-8")).get("location_id", "DC-01")
-        return "DC-01"
+        self.node = load_planning_node(self.config_dir)
+        self.location_id = self.node.location_id
 
     def read(self, path: Union[str, Path], interactive: bool = True) -> Tuple[pd.DataFrame, Dict]:
         """
@@ -97,7 +137,16 @@ class BaseReader(ABC):
         """
         path = Path(path)
         raw = load_file(path)
-        mapping, unmapped = _detect_mapping(list(raw.columns), self.schema)
+        disqualified = _disqualified_item_keys(raw, self.doc_type)
+        mapping, unmapped = _detect_mapping(list(raw.columns), self.schema, disqualified)
+        refused = {c: why for c, why in disqualified.items() if c in raw.columns}
+        if refused and "sku" not in mapping:
+            names = ", ".join(f"{c!r} ({why})" for c, why in sorted(refused.items()))
+            raise ValueError(
+                f"{path.name}: no column can serve as the item key. Refused {names}. "
+                f"The material number is in a column this reader does not recognise — "
+                f"name it, or load the file through Intake and freeze an adapter."
+            )
 
         if interactive:
             print_mapping_preview(self.doc_type, mapping, unmapped, list(raw.columns))
@@ -110,10 +159,22 @@ class BaseReader(ABC):
         # Only stamp the configured node where the source did not carry a location of
         # its own. Overwriting a real warehouse code destroys the one column that
         # explains why a SKU appears more than once.
+        #
+        # Which of the two happened is recorded, because the stamped value is invented
+        # and the read one is not. Until every document declared `location_id`, four of
+        # the five could only ever be stamped — the plant column was dropped at mapping
+        # time and `DC-01` went out on every row regardless of what the export said.
         if "location_id" in df.columns:
+            quality["location_source"] = "source"
             df["location_id"] = df["location_id"].fillna(self.location_id)
         else:
+            quality["location_source"] = "configured node"
             df["location_id"] = self.location_id
+            if self.node.is_placeholder:
+                quality.setdefault("issues", []).append(
+                    f"location_id set to the placeholder {self.location_id!r} — neither "
+                    f"this export nor config/node_config.json names a warehouse"
+                )
         return df, quality
 
     def _confirm_mapping(self, mapping: Dict[str, str], unmapped: List[str], df_cols: List[str]) -> Dict[str, str]:

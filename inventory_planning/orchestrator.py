@@ -24,6 +24,7 @@ from .analytics.safety_stock import SafetyStockCalculator
 from .analytics.inventory_projector import InventoryProjector
 from .analytics.forecaster import Forecaster
 from .analytics.purchase_recommender import PurchaseRecommender
+from .ingest.encoding import write_csv
 
 
 class InventoryPlanner:
@@ -193,7 +194,7 @@ class InventoryPlanner:
 
         if len(crosscheck.all_disagreements):
             xc_path = self.output_dir / f"source_crosscheck_{stamp}.csv"
-            crosscheck.frame().to_csv(xc_path, index=False)
+            write_csv(crosscheck.frame(), xc_path)
             print(f"    Source disagreements: {xc_path}")
 
         out = {
@@ -679,15 +680,15 @@ class InventoryPlanner:
         out = self.output_dir
 
         # ── CSV outputs ───────────────────────────────────────────────────────
-        results["supplier_lt"].to_csv(out / "supplier_params.csv", index=False)
-        results["classified_demand"].to_csv(out / "sku_planning_params.csv", index=False)
-        results["projection"].to_csv(out / f"inventory_projection_{ts_str}.csv", index=False)
-        results["forecast_detail"].to_csv(out / f"forecast_detail_{ts_str}.csv", index=False)
-        results["recommendations"].to_csv(out / f"purchase_recommendations_{ts_str}.csv", index=False)
+        write_csv(results["supplier_lt"], out / "supplier_params.csv")
+        write_csv(results["classified_demand"], out / "sku_planning_params.csv")
+        write_csv(results["projection"], out / f"inventory_projection_{ts_str}.csv")
+        write_csv(results["forecast_detail"], out / f"forecast_detail_{ts_str}.csv")
+        write_csv(results["recommendations"], out / f"purchase_recommendations_{ts_str}.csv")
 
         realization = results.get("backlog_realization")
         if realization is not None and len(realization.per_sku):
-            realization.per_sku.to_csv(out / f"backlog_realization_{ts_str}.csv", index=False)
+            write_csv(realization.per_sku, out / f"backlog_realization_{ts_str}.csv")
 
         # Save planning snapshot for next-month feedback comparison
         try:

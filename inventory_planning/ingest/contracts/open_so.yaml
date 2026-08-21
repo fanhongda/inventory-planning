@@ -33,6 +33,19 @@ fields:
     never:
       sap: [item, itm, item no, position, pos, line item, 项目]
 
+  location_id:
+    type: string
+    role: dimension
+    normalize: upper_strip
+    description: >
+      Plant / warehouse the line belongs to. Optional, and read from the source
+      wherever it exists rather than assumed: only `inventory` used to declare this
+      field, so every other document fell through to the configured planning node and
+      arrived stamped `DC-01` no matter what plant the export actually named.
+    aliases: [location, location id, location code, warehouse, warehouse code,
+              warehouse id, plant, storage location, sloc, site, dc, wh, wrh, branch,
+              facility, stock location, werks, receiving plant, supplying plant]
+
   customer:
     type: string
     role: dimension

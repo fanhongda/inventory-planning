@@ -37,7 +37,8 @@ class OpenSOReader(BaseReader):
         for col in ("backlog_due_qty", "backlog_past_due_qty"):
             grp[col] = grp[col].fillna(0.0)
 
-        grp["location_id"] = df["location_id"].iloc[0] if "location_id" in df.columns else "DC-01"
+        grp["location_id"] = (df["location_id"].iloc[0] if "location_id" in df.columns
+                              else self.location_id)
         return grp
 
     @staticmethod

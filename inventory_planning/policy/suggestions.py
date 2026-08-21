@@ -41,6 +41,7 @@ import pandas as pd
 
 from .parameters import ParameterSet, Rule
 from .should_be import ShouldBeCalculator, _z_from_service_level
+from ..ingest.encoding import write_csv
 
 DAYS_PER_MONTH = 30.0
 DAYS_PER_YEAR = 365.0
@@ -253,8 +254,7 @@ class SuggestionResult:
     # ── Outputs ──────────────────────────────────────────────────────────────
 
     def to_csv(self, path: Path) -> Path:
-        self.frame.to_csv(path, index=False)
-        return Path(path)
+        return write_csv(self.frame, path)
 
     def to_rules_markdown(self, path: Path = None) -> str:
         """

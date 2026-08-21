@@ -3,13 +3,21 @@ Canonical column schemas for all five input documents.
 Each schema maps canonical field names to lists of known aliases.
 Readers use these to auto-detect and remap columns regardless of ERP source format.
 Aliases are normalized (lowercase, collapsed whitespace) at match-time.
+
+Order is significant: `_detect_mapping` takes the first alias that matches a column,
+so the list is a ranking, not a set. `item` is last in every `sku` list for that
+reason — it used to sit second, ahead of `material`, and an SAP extract carrying both
+therefore keyed the whole document on the line number. Ordering alone is not the whole
+guard (see `_disqualified_item_keys`), but putting the most specific spellings first
+is what makes it unnecessary in the ordinary case.
 """
 
 from typing import List
 
 SALES_HISTORY_SCHEMA = {
-    "sku":                  ["sku", "item", "item code", "item_code", "item no", "material",
-                             "product_code", "part_no", "part number", "article"],
+    "sku":                  ["sku", "material", "material number", "part number", "part_no",
+                             "product_code", "product code", "article", "matnr", "matl",
+                             "item code", "item_code", "item no", "item"],
     "order_date":           ["order_date", "order date", "so date", "sales order date",
                              "created date", "created_date", "doc date"],
     "ship_date":            ["ship_date", "ship date", "shipped date", "actual ship date",
@@ -23,11 +31,15 @@ SALES_HISTORY_SCHEMA = {
                              "line amount", "extended amount", "invoice amount"],
     "customer":             ["customer", "customer name", "sold to", "sold-to", "account", "client"],
     "uom":                  ["uom", "unit", "unit of measure", "base unit"],
+    "location_id":          ["location_id", "location", "location code", "warehouse",
+                             "warehouse code", "plant", "storage location", "sloc",
+                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
 }
 
 PO_HISTORY_SCHEMA = {
-    "sku":                  ["sku", "item", "item code", "item_code", "material",
-                             "product_code", "part_no", "part number"],
+    "sku":                  ["sku", "material", "material number", "part number", "part_no",
+                             "product_code", "product code", "article", "matnr", "matl",
+                             "item code", "item_code", "item no", "item"],
     "supplier":             ["supplier", "supplier name", "vendor", "vendor name", "creditor"],
     "po_date":              ["po_date", "po date", "order date", "purchase order date",
                              "doc date", "created date"],
@@ -41,11 +53,15 @@ PO_HISTORY_SCHEMA = {
     "incoterm":             ["incoterm", "inco term", "inco terms", "delivery term", "trade term"],
     # Pre-computed LT (days) present in some ERP exports — captured as a bonus field
     "lt_days_precalc":      ["lt", "lead time", "lt days", "lead time days"],
+    "location_id":          ["location_id", "location", "location code", "warehouse",
+                             "warehouse code", "plant", "storage location", "sloc",
+                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
 }
 
 OPEN_SO_SCHEMA = {
-    "sku":                  ["sku", "item", "item code", "item_code", "material",
-                             "product_code", "part_no"],
+    "sku":                  ["sku", "material", "material number", "part number", "part_no",
+                             "product_code", "product code", "article", "matnr", "matl",
+                             "item code", "item_code", "item no", "item"],
     "customer":             ["customer", "customer name", "sold to", "account"],
     "customer_request_date":["customer_request_date", "request date", "crd",
                              "customer request date", "req date",
@@ -60,11 +76,15 @@ OPEN_SO_SCHEMA = {
                              "remaining amount", "outstanding amount"],
     "so_number":            ["so_number", "so number", "sales order", "order number",
                              "document number"],
+    "location_id":          ["location_id", "location", "location code", "warehouse",
+                             "warehouse code", "plant", "storage location", "sloc",
+                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
 }
 
 OPEN_PO_SCHEMA = {
-    "sku":                  ["sku", "item", "item code", "item_code", "material",
-                             "product_code", "part_no"],
+    "sku":                  ["sku", "material", "material number", "part number", "part_no",
+                             "product_code", "product code", "article", "matnr", "matl",
+                             "item code", "item_code", "item no", "item"],
     "supplier":             ["supplier", "supplier name", "vendor", "vendor name"],
     "order_qty":            ["order_qty", "order quantity", "ordered qty", "ordered quantity",
                              "po qty", "po quantity"],
@@ -82,11 +102,15 @@ OPEN_PO_SCHEMA = {
     "incoterm":             ["incoterm", "inco term", "inco terms", "delivery term"],
     "closed_status":        ["closed_status", "closed status", "status", "po status"],
     "order_date":           ["order_date", "order date", "po date", "doc date"],
+    "location_id":          ["location_id", "location", "location code", "warehouse",
+                             "warehouse code", "plant", "storage location", "sloc",
+                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
 }
 
 INVENTORY_SCHEMA = {
-    "sku":                  ["sku", "item", "item code", "item_code", "material",
-                             "product_code", "part_no"],
+    "sku":                  ["sku", "material", "material number", "part number", "part_no",
+                             "product_code", "product code", "article", "matnr", "matl",
+                             "item code", "item_code", "item no", "item"],
     "qty_on_hand":          ["qty_on_hand", "on hand", "on-hand", "stock qty",
                              "available qty", "unrestricted stock", "physical stock",
                              "inventory on hand", "inventory  on hand"],
@@ -95,8 +119,9 @@ INVENTORY_SCHEMA = {
     "open_po_qty_inv":      ["openpo quantity", "openpo qty", "openpo", "open po qty",
                              "openpoquantity", "open po quantity"],
     "uom":                  ["uom", "unit", "unit of measure", "base unit"],
-    "location_id":          ["location_id", "location", "warehouse", "plant",
-                             "storage location", "dc", "wrh", "wh"],
+    "location_id":          ["location_id", "location", "location code", "warehouse",
+                             "warehouse code", "plant", "storage location", "sloc",
+                             "site", "dc", "wrh", "wh", "branch", "facility", "werks"],
     "snapshot_date":        ["snapshot_date", "snapshot date", "report date",
                              "as of date", "date"],
 }

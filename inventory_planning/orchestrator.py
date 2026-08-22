@@ -545,7 +545,13 @@ class InventoryPlanner:
 
         # Step 4: Forecast — must run before safety stock to supply forecast RMSE
         print("\n[4/6] Forecasting demand (6 months)...")
-        forecast_detail = self.forecaster.forecast_all(ts, classified=classified)
+        # MTS competes its models; MTO goes straight to Croston. The policy is the
+        # ERP's, from the planner worksheet — not the pipeline's inferred class.
+        policy = (planning_master_df[["sku", "stocking_policy"]]
+                  if planning_master_df is not None
+                  and "stocking_policy" in planning_master_df.columns else None)
+        forecast_detail = self.forecaster.forecast_all(ts, classified=classified,
+                                                       policy=policy)
         forecast_summary_df = self.forecaster.summary(forecast_detail)
         if not forecast_detail.empty:
             model_counts = forecast_detail.drop_duplicates("sku")["model_used"].value_counts().to_dict()
@@ -715,6 +721,10 @@ class InventoryPlanner:
         write_csv(results["classified_demand"], out / "sku_planning_params.csv")
         write_csv(results["projection"], out / f"inventory_projection_{ts_str}.csv")
         write_csv(results["forecast_detail"], out / f"forecast_detail_{ts_str}.csv")
+        sheet = self.forecaster.history_and_forecast(
+            results["time_series"], results["forecast_detail"])
+        if len(sheet):
+            write_csv(sheet, out / f"forecast_{ts_str}.csv")
         write_csv(results["recommendations"], out / f"purchase_recommendations_{ts_str}.csv")
 
         realization = results.get("backlog_realization")

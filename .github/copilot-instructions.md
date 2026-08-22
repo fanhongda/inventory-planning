@@ -47,7 +47,7 @@ against policy, ordering behaviour, replenishment cadence, forward risk, then th
 list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 642 tests, all should pass
+python3 -m pytest tests/ -q        # 659 tests, all should pass
 ```
 
 Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
@@ -180,6 +180,16 @@ supplier written correctly as 深圳市华强电子 opens as 娣卞湷甯傚崕�
 install. On the read side, `latin-1` maps all 256 byte values and therefore never
 raises — a try-until-one-works ladder with latin-1 in it can never reach a CJK codec,
 so a GBK export became mojibake with no error. Use `write_csv`, never bare `to_csv`.
+
+**A forecasting model is chosen by competition, for make-to-stock items**
+(`forecaster.py::_select_by_backtest`). Candidates are refitted on a rolling origin and
+scored on periods they have not seen; lowest error wins, and a **naive forecast is
+always an entrant** so "best of five" can be recognised as worse than repeating last
+month (`vs_naive`; 35 of 178 on the PL30 extract are exactly that). Make-to-order goes
+straight to Croston and is not backtested — nothing is stocked against a forecast there.
+The policy is the ERP's `stocking_policy`, not the inferred `stocking_class`; where a
+SKU has none, the old pattern routing still applies. Backtest three steps ahead, not
+one: a one-step score cannot see a model walking away from the data.
 
 **Covering the period in front of you outranks rebalancing the position**
 (`inventory_projector.py::supply_gap`). The position is a total and says nothing about

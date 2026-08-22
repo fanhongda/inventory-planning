@@ -37,7 +37,12 @@ path below is relative to the repository root — run from there.** All logic is
 1. **Stocking classification** — high-service / med-service / non-stocking per SKU
 2. **Safety stock** — combined demand × lead-time variability formula
 3. **Inventory projection** — should-be vs current position (on-hand + GIT + open PO)
-4. **6-month ARIMA/ETS forecast** per SKU
+4. **6-month forecast** per SKU, plus `forecast_<ts>.csv` — one row per SKU with its
+   history and the six months that follow, side by side, and the model that produced
+   them. For make-to-stock items the model is chosen by backtest; make-to-order items
+   use Croston. `vs_naive` on the row says whether the model beat repeating last
+   month — where it reads 1.00, it did not, and the forecast deserves no more trust
+   than that.
 5. **Purchase recommendations** — EXPEDITE-INBOUND / PURCHASE-REQUEST /
    ORDER-FOR-BACKLOG / PUSH-OUT-OPEN-PO / HOLD / NO-ACTION. **Relay every
    `EXPEDITE-INBOUND` first and by name.** It means the shelf runs dry before the

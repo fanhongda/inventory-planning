@@ -101,8 +101,21 @@ class InventoryProjector:
                 (df["inventory_status"] == "EXCESS") &
                 df["sku"].isin(open_po_skus)
             )
-            df["pushout_open_po_qty"] = df.apply(
-                lambda r: r["total_open_po_qty"] if r["pushout_candidate"] else 0, axis=1
+            # Only the part that is genuinely surplus, never the whole order. Pushing
+            # out everything inbound is not a smaller version of the right advice, it
+            # is the opposite one: a renumbered part here held 37 units against 14,398
+            # a month with 79,500 on the way, and the run said to delay all 79,500 —
+            # two hours of cover, and a stockout by the end of the day.
+            #
+            # `surplus_deficit` is exactly how far the position sits above the reorder
+            # point, so deferring that much lands the position *on* the reorder point,
+            # which is where it is supposed to be. Capped at what is actually inbound,
+            # because stock already on the shelf cannot be pushed out.
+            df["pushout_open_po_qty"] = np.where(
+                df["pushout_candidate"],
+                np.minimum(df["surplus_deficit"], df["total_open_po_qty"])
+                  .clip(lower=0).round(1),
+                0.0,
             )
         else:
             df["pushout_candidate"] = False

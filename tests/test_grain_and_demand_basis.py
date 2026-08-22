@@ -216,6 +216,60 @@ class TestExcessIsNotDeclaredOverAShortage:
         assert row["inventory_status"] == "slightly-over"
 
 
+class TestPushOutDefersTheSurplusNotTheOrder:
+    """
+    Push-out quantity was the whole open PO, whatever the surplus actually was.
+
+    The case that found it: a part renumbered from 7100014, so its real demand only
+    appears once the two numbers are merged — 14,398 a month, 37 units on the shelf,
+    79,500 on the way against a reorder point of 54,598. The position is genuinely
+    24,939 over, so EXCESS is right and deferring something is right. The run said to
+    defer all 79,500, which leaves two hours of cover and a stockout the same day.
+
+    That is not a smaller version of the right advice, it is the opposite one. The
+    surplus is exactly how far the position sits above the reorder point, so deferring
+    that much lands it *on* the reorder point — where it is meant to be.
+    """
+
+    @staticmethod
+    def _case(on_hand, open_po, safety_stock=29786.3, dlt=24811.8, demand=14397.6):
+        stock = pd.DataFrame({
+            "sku": ["SKU-A"], "qty_on_hand": [on_hand], "qty_in_transit_adj": [0.0],
+            "total_open_po_qty": [open_po], "effective_position": [on_hand + open_po],
+        })
+        ss = pd.DataFrame({
+            "sku": ["SKU-A"], "location_id": ["DC-01"],
+            "stocking_class": ["stocking-high"], "service_level": [0.95],
+            "demand_mean_rolling": [demand], "wma_lead_time_days": [51.7],
+            "safety_stock": [safety_stock], "demand_during_lt": [dlt],
+        })
+        return InventoryProjector(CONFIG_DIR).project(ss, stock, stock).iloc[0]
+
+    def test_only_the_surplus_is_deferred(self):
+        row = self._case(37.0, 79500.0)
+        assert row["pushout_candidate"]
+        assert row["pushout_open_po_qty"] == pytest.approx(row["surplus_deficit"], rel=1e-6)
+        assert row["pushout_open_po_qty"] < row["total_open_po_qty"]
+
+    def test_what_is_left_lands_on_the_reorder_point(self):
+        """The property, rather than the number: defer the surplus, keep the cover."""
+        row = self._case(37.0, 79500.0)
+        kept = row["qty_on_hand"] + row["total_open_po_qty"] - row["pushout_open_po_qty"]
+        assert kept == pytest.approx(row["should_be_inventory"], rel=1e-6)
+
+    def test_it_cannot_defer_more_than_is_inbound(self):
+        """Stock already on the shelf is not deferrable, however far over it puts you."""
+        row = self._case(200000.0, 5000.0)
+        assert row["surplus_deficit"] > row["total_open_po_qty"]
+        assert row["pushout_open_po_qty"] == 5000.0
+
+    def test_nothing_is_deferred_when_there_is_no_surplus(self):
+        row = self._case(0.0, 9000.0, safety_stock=6302.2, dlt=2877.8, demand=1905.83)
+        assert row["surplus_deficit"] < 0
+        assert not row["pushout_candidate"]
+        assert row["pushout_open_po_qty"] == 0
+
+
 # ── 2. Backlog realization ───────────────────────────────────────────────────
 
 

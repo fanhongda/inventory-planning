@@ -362,6 +362,72 @@ class TestKPIReport:
 
 # ── Charts and the sections built on them ────────────────────────────────────
 
+class TestStockingPolicyToReview:
+    """
+    The items whose ERP policy and whose demand point different ways, in the report a
+    planner actually opens.
+
+    Both directions, and the make-to-order half first: those have a customer waiting a
+    full lead time for something the demand says should have been on the shelf. The
+    other half is money sitting. Neither is applied — a policy is a decision someone
+    made for reasons no extract records.
+    """
+
+    @staticmethod
+    def _attributes(rows):
+        return pd.DataFrame(rows)
+
+    def test_both_directions_are_shown(self, tmp_path):
+        attrs = self._attributes([
+            {"sku": "A", "stocking_policy": "MTO", "suggested_stocking_policy": "MTS",
+             "policy_basis": "demand in 11/12 months", "annual_value": 500_000.0},
+            {"sku": "B", "stocking_policy": "MTS", "suggested_stocking_policy": "MTO",
+             "policy_basis": "demand in 2/12 months", "annual_value": 9_000.0},
+        ])
+        html = KPIReport().render(attributes=attrs, output_path=tmp_path / "r.html")
+        assert "Stocking policy to review" in html
+        assert "Bought to order, but the demand recurs" in html
+        assert "Held as stock, but the demand is sporadic" in html
+
+    def test_it_ranks_by_what_is_at_stake(self, tmp_path):
+        """A change has to be worth the argument, so the big number goes first."""
+        attrs = self._attributes([
+            {"sku": "SMALL", "stocking_policy": "MTO", "suggested_stocking_policy": "MTS",
+             "policy_basis": "x", "annual_value": 1_000.0},
+            {"sku": "BIG", "stocking_policy": "MTO", "suggested_stocking_policy": "MTS",
+             "policy_basis": "x", "annual_value": 900_000.0},
+        ])
+        html = KPIReport().render(attributes=attrs, output_path=tmp_path / "r.html")
+        assert html.index("BIG") < html.index("SMALL")
+
+    def test_the_value_column_carries_the_value(self):
+        """
+        The first version recomputed `annual_value` from a demand column that is not on
+        the attributes frame, overwriting the real one with NaN. Every row rendered as
+        a dash and the ranking did nothing.
+        """
+        attrs = self._attributes([
+            {"sku": "A", "stocking_policy": "MTO", "suggested_stocking_policy": "MTS",
+             "policy_basis": "x", "annual_value": 1_351_069.0},
+        ])
+        html = KPIReport().render(attributes=attrs)
+        assert "1,351,069" in html
+
+    def test_agreement_is_said_rather_than_left_blank(self):
+        attrs = self._attributes([
+            {"sku": "A", "stocking_policy": "MTS", "suggested_stocking_policy": "MTS",
+             "policy_basis": "x", "annual_value": 10.0},
+        ])
+        html = KPIReport().render(attributes=attrs)
+        assert "agrees with what its demand did" in html
+
+    def test_no_suggestion_column_means_no_section(self):
+        """An extract with no planner worksheet must not grow an empty heading."""
+        attrs = self._attributes([{"sku": "A", "annual_value": 10.0}])
+        html = KPIReport().render(attributes=attrs)
+        assert "Stocking policy to review" not in html
+
+
 class TestMonthlyOTD:
     """
     A single OTD figure hides when it changed, which is the question that decides

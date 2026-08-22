@@ -1060,17 +1060,87 @@ class KPIReport:
         if forward is None:
             parts.append("<div class='card'><p class='empty'>No forward projection "
                          "available.</p></div>")
+            # Whether a policy matches its demand is answered from history, so it
+            # survives a run that could not project anything forward.
+            parts.append(self._policy_disagreements(attributes))
             return "".join(parts)
 
         parts.append(self._stockout_section(forward))
         parts.append(self._slow_burn_section(forward))
         parts.append(self._actions_section(recommendations, open_po, forward, attributes))
+        parts.append(self._policy_disagreements(attributes))
         parts.append(self._suggestions_section(suggestions, attributes))
         if frontier is not None:
             parts.append(self._frontier_section(frontier))
         return "".join(parts)
 
     # ── Parameter suggestions ────────────────────────────────────────────────
+
+    def _policy_disagreements(self, attributes) -> str:
+        """
+        Items the ERP plans one way and the demand argues for the other.
+
+        Both directions are shown, and the MTO-with-recurring-demand half is put first
+        because it is the one with a customer on the end of it: the item is bought to
+        order, so every request waits a full lead time that stock would have absorbed.
+        The other half is money — held as make-to-stock against demand that turns up
+        twice a year, which is stock sitting.
+
+        Neither is applied. A policy is a decision someone made, often years before
+        anyone planned on the item and for reasons no extract records — a sole-supplier
+        risk, a shelf life, a customer contract. What the run can say is what the demand
+        did, and where that and the policy point different ways.
+        """
+        if attributes is None or not len(attributes):
+            return ""
+        need = {"stocking_policy", "suggested_stocking_policy"}
+        if not need <= set(attributes.columns):
+            return ""
+
+        work = attributes.dropna(subset=list(need)).copy()
+        work = work[work["stocking_policy"] != work["suggested_stocking_policy"]]
+        if not len(work):
+            return ("<h3>Stocking policy to review</h3><div class='card'><p class='empty'>"
+                    "Every item's policy agrees with what its demand did.</p></div>")
+
+        # `annual_value` is already assembled upstream, against the demand basis the
+        # rest of the report ranks on. Recomputing it here from unit cost would be a
+        # second definition of the same number — and the first attempt at it silently
+        # overwrote the real column with NaN, which showed up as a table of dashes.
+        # Absent value is not zero; those rows sort last rather than being dropped.
+        if "annual_value" not in work.columns:
+            work["annual_value"] = np.nan
+        work["annual_value"] = pd.to_numeric(work["annual_value"], errors="coerce")
+
+        out = [f"<h3>Stocking policy to review — {len(work):,} items</h3>"]
+        for held, suggested, heading, why in (
+            ("MTO", "MTS", "Bought to order, but the demand recurs",
+             "Every order waits a full lead time. These are the candidates to stock."),
+            ("MTS", "MTO", "Held as stock, but the demand is sporadic",
+             "Stock is sitting against demand that rarely comes. These are candidates "
+             "to stop holding."),
+        ):
+            rows = work[(work["stocking_policy"] == held)
+                        & (work["suggested_stocking_policy"] == suggested)]
+            if not len(rows):
+                continue
+            rows = rows.sort_values("annual_value", ascending=False, na_position="last")
+            value = rows["annual_value"].sum(skipna=True)
+            sub = (f"<p class='sub'><strong>{len(rows):,}</strong> items — {why}"
+                   + (f" Worth {_money(value)} a year." if value > 0 else "")
+                   + "</p>")
+            out.append(f"<h4>{_esc(heading)}</h4>{sub}")
+            out.append(self._table(
+                "", rows.head(12),
+                [("sku", "SKU", "sku"), ("abc_class", "ABC", "text"),
+                 ("stocking_policy", "In force", "text"),
+                 ("suggested_stocking_policy", "Demand says", "text"),
+                 ("policy_basis", "Why", "text"),
+                 ("annual_value", "Annual value", "money")],
+                note="Ranked by the annual value of the demand, so the list starts "
+                     "where a change is worth the argument. Nothing is applied.",
+            ))
+        return "".join(out)
 
     def _suggestions_section(self, suggestions, attributes) -> str:
         """

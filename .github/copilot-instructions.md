@@ -47,7 +47,7 @@ against policy, ordering behaviour, replenishment cadence, forward risk, then th
 list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 668 tests, all should pass
+python3 -m pytest tests/ -q        # 673 tests, all should pass
 ```
 
 Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
@@ -197,7 +197,7 @@ counts of SKUs, not one choice for the run.
 suggestion with the evidence attached, on the same tier boundary the rest of the
 pipeline uses. It sits beside the ERP's policy rather than overwriting it: that is
 a decision in force, this is what twelve months did, and the disagreement is the
-finding. 84% agree on the PL30 extract. Backtest three steps ahead, not
+finding. 84% agree on the PL30 extract; the 160 that do not are a section of the KPI report, both directions, ranked by annual value. Backtest three steps ahead, not
 one: a one-step score cannot see a model walking away from the data.
 
 **Covering the period in front of you outranks rebalancing the position**

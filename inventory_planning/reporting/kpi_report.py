@@ -1057,11 +1057,15 @@ class KPIReport:
                         open_po=None, attributes=None, suggestions=None) -> str:
         parts = ["<h2>Chapter 2 · What is coming</h2><hr class='chapter-rule'>"]
 
+        # Ahead of the forward projection, and outside the branch that gives up
+        # without one. Both come from what is on the shelf against what is on order,
+        # so a run that could not project anything forward still has them to report —
+        # and the supply gap is the most urgent thing in the run either way.
+        parts.append(self._supply_gaps(recommendations, attributes))
+
         if forward is None:
             parts.append("<div class='card'><p class='empty'>No forward projection "
                          "available.</p></div>")
-            # Whether a policy matches its demand is answered from history, so it
-            # survives a run that could not project anything forward.
             parts.append(self._policy_disagreements(attributes))
             return "".join(parts)
 
@@ -1244,6 +1248,61 @@ class KPIReport:
         if not rendered:
             return ""
         return "<h3>What to change — the head of the list</h3>" + "".join(rendered)
+
+    def _supply_gaps(self, recommendations, attributes) -> str:
+        """
+        Items whose shelf runs dry before the next delivery lands. First, and loudly.
+
+        These do not survive the work list below it, which ranks by the money an action
+        moves — and an expedite moves none. The order is already placed; what is missing
+        is a date, so `suggested_po_qty` is zero, the row values at zero, and all of them
+        sort under everything else and fall off the end of the table. The most urgent
+        thing in the run was the one thing invisible in it.
+
+        Ranked by how long the shelf is bare rather than by value, because this is a
+        service question before it is a money one: the customer waiting on an empty
+        shelf does not care what the part costs. Value is shown, not sorted on.
+
+        The ask is not a purchase order. It is a ship date confirmed with the supplier,
+        chased daily, and a price for the air freight if the date will not move.
+        """
+        if recommendations is None or not len(recommendations):
+            return ""
+        if "supply_gap" not in recommendations.columns:
+            return ""
+        gaps = recommendations[recommendations["supply_gap"] == True].copy()
+        if not len(gaps):
+            return ""
+
+        if attributes is not None and "annual_value" in getattr(attributes, "columns", []):
+            value = attributes.drop_duplicates("sku").set_index("sku")["annual_value"]
+            gaps["annual_value"] = gaps["sku"].map(value)
+        gaps = self._with_policy(gaps, attributes)
+        gaps = gaps.sort_values("supply_gap_days", ascending=False)
+
+        late = gaps[gaps.get("inbound_past_due_qty", 0) > 0]
+        head = (
+            f"<h3>Supply gap — {len(gaps):,} items run dry before the next delivery</h3>"
+            f"<p class='sub'>The shelf empties before anything arrives"
+            + (f", and on <strong>{len(late):,}</strong> of them supply is already past "
+               f"its committed date" if len(late) else "")
+            + ". The order exists; what is missing is a delivery date. Confirm the ship "
+              "date with the supplier daily and price the air freight — a purchase "
+              "order is not the answer to any of these.</p>"
+        )
+        return head + self._table(
+            "", gaps.head(12),
+            [("sku", "SKU", "sku"), ("stocking_policy", "Policy", "policy"),
+             ("on_hand_cover_days", "Cover left (d)", "num0"),
+             ("supply_gap_days", "Days bare", "num0"),
+             ("days_to_next_arrival", "Next arrival (d)", "num0"),
+             ("inbound_past_due_qty", "Past due", "num0"),
+             ("period_demand", "Demand this period", "num0"),
+             ("annual_value", "Annual value", "money")],
+            note="Ranked by how long the shelf is bare, not by value — an empty shelf "
+                 "is a service failure whatever the part costs. Value is shown so the "
+                 "call about air freight can be made against it.",
+        )
 
     def _materials_to_adjust(self, recommendations, attributes) -> str:
         if recommendations is None or not len(recommendations):

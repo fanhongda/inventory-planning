@@ -362,6 +362,74 @@ class TestKPIReport:
 
 # ── Charts and the sections built on them ────────────────────────────────────
 
+class TestSupplyGapIsTheFirstThingInTheActions:
+    """
+    An expedite moves no money, and the work list ranks by the money an action moves —
+    so all 53 of them sorted under everything else and fell off the end of a table
+    capped at twelve. The most urgent thing in the run was the one thing invisible in
+    the report.
+    """
+
+    @staticmethod
+    def _recs(rows):
+        return pd.DataFrame(rows)
+
+    def test_the_gaps_get_their_own_block(self, tmp_path):
+        recs = self._recs([{
+            "sku": "A", "recommended_action": "EXPEDITE-INBOUND", "supply_gap": True,
+            "supply_gap_days": 80.0, "on_hand_cover_days": 4.0,
+            "days_to_next_arrival": 84.0, "inbound_past_due_qty": 600.0,
+            "period_demand": 140.0, "suggested_po_qty": 0.0, "pushout_open_po_qty": 0.0,
+        }])
+        html = KPIReport().render(recommendations=recs, forward=None,
+                                  output_path=tmp_path / "r.html")
+        assert "Supply gap" in html
+        assert "run dry before the next delivery" in html
+
+    def test_it_survives_a_work_list_it_would_lose(self):
+        """
+        A gap worth nothing, against a push-out worth a fortune. Ranking by value puts
+        the gap last; it still has to appear.
+        """
+        recs = self._recs([
+            {"sku": "GAP", "recommended_action": "EXPEDITE-INBOUND", "supply_gap": True,
+             "supply_gap_days": 40.0, "on_hand_cover_days": 0.0,
+             "days_to_next_arrival": 40.0, "inbound_past_due_qty": 0.0,
+             "period_demand": 10.0, "suggested_po_qty": 0.0, "pushout_open_po_qty": 0.0},
+            *[{"sku": f"BIG{i}", "recommended_action": "PUSH-OUT-OPEN-PO",
+               "supply_gap": False, "supply_gap_days": 0.0, "on_hand_cover_days": 400.0,
+               "days_to_next_arrival": 5.0, "inbound_past_due_qty": 0.0,
+               "period_demand": 1.0, "suggested_po_qty": 0.0,
+               "pushout_open_po_qty": 99_999.0} for i in range(20)],
+        ])
+        html = KPIReport().render(recommendations=recs, forward=None)
+        assert "GAP" in html
+
+    def test_it_ranks_by_days_bare_not_by_money(self):
+        """An empty shelf is a service failure whatever the part costs."""
+        recs = self._recs([
+            {"sku": "CHEAP-LONG", "recommended_action": "EXPEDITE-INBOUND",
+             "supply_gap": True, "supply_gap_days": 100.0, "on_hand_cover_days": 1.0,
+             "days_to_next_arrival": 101.0, "inbound_past_due_qty": 0.0,
+             "period_demand": 1.0, "suggested_po_qty": 0.0, "pushout_open_po_qty": 0.0},
+            {"sku": "DEAR-SHORT", "recommended_action": "EXPEDITE-INBOUND",
+             "supply_gap": True, "supply_gap_days": 2.0, "on_hand_cover_days": 30.0,
+             "days_to_next_arrival": 32.0, "inbound_past_due_qty": 0.0,
+             "period_demand": 9999.0, "suggested_po_qty": 0.0, "pushout_open_po_qty": 0.0},
+        ])
+        html = KPIReport().render(recommendations=recs, forward=None)
+        assert html.index("CHEAP-LONG") < html.index("DEAR-SHORT")
+
+    def test_a_run_with_no_gaps_grows_no_heading(self):
+        recs = self._recs([{
+            "sku": "A", "recommended_action": "HOLD-OK", "supply_gap": False,
+            "supply_gap_days": 0.0, "on_hand_cover_days": 90.0,
+            "days_to_next_arrival": 5.0, "inbound_past_due_qty": 0.0,
+            "period_demand": 10.0, "suggested_po_qty": 0.0, "pushout_open_po_qty": 0.0,
+        }])
+        assert "Supply gap" not in KPIReport().render(recommendations=recs, forward=None)
+
+
 class TestStockingPolicyToReview:
     """
     The items whose ERP policy and whose demand point different ways, in the report a

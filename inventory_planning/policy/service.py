@@ -274,6 +274,18 @@ class ServiceResult:
                 "value", "on_time_value", "otd_value_rate", "thin", "partial"]
         if self.lines.empty or "request_date" not in self.lines.columns:
             return pd.DataFrame(columns=cols)
+        # Not one delivery in the extract has an outcome — no shipped line carries both
+        # a ship date and a request date — so there is nothing to score and the answer
+        # is that it cannot be measured, which is what the headline rate also says.
+        #
+        # Without this the series still draws, because the open order book *does* carry
+        # request dates and no open line can be on time: every month comes out at 0%.
+        # That is the worst available answer. A blank chart reads as a metric of zero,
+        # and a chart of zeros reads as a service catastrophe. Bucketing on the request
+        # date is what exposed this; before it, the series ran off settled lines only
+        # and simply came back empty.
+        if self.completed.empty:
+            return pd.DataFrame(columns=cols)
 
         work = self.lines.assign(
             _req=pd.to_datetime(self.lines["request_date"], errors="coerce")

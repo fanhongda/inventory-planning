@@ -625,6 +625,64 @@ class TestMonthlyOTD:
             sales_history=sales, as_of=date(2026, 7, 14)).monthly_otd()
         assert bool(monthly.iloc[-1]["partial"])
 
+    def test_an_extract_with_no_settled_delivery_measures_nothing(self):
+        """
+        A sales history with no request dates and an order book that has them. Not one
+        delivery has an outcome, so there is nothing to score — and the open lines that
+        do carry dates can none of them be on time, so a series drawn off those alone
+        comes out at 0% every month.
+
+        A blank chart reads as a metric of zero; a chart of zeros reads as a service
+        catastrophe. Bucketing on the request date is what exposed this, and on the
+        PL30 extract it drew five months of 0% against 19,598 shipped lines that simply
+        could not be judged.
+        """
+        sales = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "qty": 1.0, "amount": 100.0,
+            "order_date": pd.Timestamp("2026-05-01"),
+            "ship_date": pd.Timestamp("2026-06-10"),
+        }] * 50)                                   # shipped, but no request date
+        open_so = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "open_qty": 1.0, "open_amount": 100.0,
+            "order_date": pd.Timestamp("2026-05-01"),
+            "customer_request_date": pd.Timestamp("2026-06-20"),
+        }] * 30)                                   # request dates, but never shipped
+        result = ServiceAnalyzer().analyze(sales_history=sales, open_so=open_so,
+                                           as_of=date(2026, 7, 31))
+        assert result.completed.empty
+        assert not len(result.monthly_otd()), "an unmeasurable extract must not draw zeros"
+
+    def test_the_report_says_so_rather_than_drawing_a_flat_line(self, tmp_path):
+        sales = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "qty": 1.0, "amount": 100.0,
+            "order_date": pd.Timestamp("2026-05-01"),
+            "ship_date": pd.Timestamp("2026-06-10"),
+        }] * 50)
+        result = ServiceAnalyzer().analyze(sales_history=sales, as_of=date(2026, 7, 31))
+        html = KPIReport().render(service=result, output_path=tmp_path / "r.html")
+        assert "Not measurable from this extract" in html
+
+    def test_a_month_of_open_lines_is_still_a_real_zero(self):
+        """
+        The guard is about the extract, not the month. Where deliveries *are* being
+        scored, a month whose orders all sat unshipped is 0% and should say so.
+        """
+        settled = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "qty": 1.0, "amount": 100.0,
+            "order_date": pd.Timestamp("2026-04-01"),
+            "customer_request_date": pd.Timestamp("2026-05-10"),
+            "ship_date": pd.Timestamp("2026-05-05"),
+        }] * 10)
+        stuck = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "open_qty": 1.0, "open_amount": 100.0,
+            "order_date": pd.Timestamp("2026-05-01"),
+            "customer_request_date": pd.Timestamp("2026-06-10"),
+        }] * 10)
+        monthly = ServiceAnalyzer().analyze(
+            sales_history=settled, open_so=stuck, as_of=date(2026, 7, 31)).monthly_otd()
+        june = monthly[monthly["period"].astype(str) == "2026-06"].iloc[0]
+        assert june["lines"] == 10 and june["otd_line_rate"] == 0.0
+
     def test_the_measured_window_is_reported(self, shipped):
         result = ServiceAnalyzer().analyze(sales_history=shipped, as_of=AS_OF)
         first, last = result.measured_window

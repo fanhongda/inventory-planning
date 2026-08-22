@@ -72,6 +72,49 @@ Two smaller pieces left over from the supersede work:
   aggregation from the field's declared unit, and the rollup path should use the same
   rule.
 
+## Replenishment quantity (P0)
+
+**The order quantity does not cover the lead time.** `lead_time` appears nowhere in
+`purchase_recommender.py`. The whole of it is:
+
+    gross_requirement = period_demand + safety_stock
+    net_requirement   = max(0, gross_requirement − effective_position)
+
+`period_demand` is one horizon of demand, 30 days. So the buy covers the next month and
+the safety stock, and nothing covers the time the supplier takes to deliver. On a SKU
+with a 51.7-day lead time and 14,398 a month, the order is sized at ~14,398 where the
+review period plus the lead time asks for ~39,200 — under-ordered 2.7x.
+
+The pipeline already knows better in the other half of the arithmetic. `should_be.py`
+sizes safety stock on **R + LT** exposure, and that is a documented invariant with tests
+behind it. The order-up-to level should follow the same clock: **S = demand over
+(review period + lead time) + safety stock**, order = S − inventory position. Two
+definitions of the same exposure in one pipeline is the defect.
+
+What is already right and should not be rebuilt:
+
+- **Backlog against forecast.** `period_demand = max(forecast, backlog_due × realization)`
+  — the larger of the two, never the sum, with the realization rate measured rather than
+  assumed. That is the rule "use backlog where it is reliable, the forecast where it is
+  not or where backlog is short", and it is implemented.
+- **The supply gap outranks it.** `EXPEDITE-INBOUND` is ranked ahead of the net
+  requirement on purpose: where the shelf runs dry before the next delivery, the order
+  already exists and a second one is not the answer. Any change here has to keep that
+  ordering.
+
+The open question is **what R is**, and it needs deciding before the arithmetic:
+
+- a fixed monthly cycle from config, or
+- `planner_review_period_days` from the planner worksheet — the field exists, is
+  carried into `sku_attributes`, and is used by the parameter *suggestions* but not by
+  the order quantity, or
+- the cadence `cadence.py` actually measures from PO history.
+
+They disagree per SKU, and the third is the only one that reflects how the buyer really
+orders. Suggest starting from the measured cadence and falling back to config, with the
+planner's figure reported as a comparison — the same ranking the rest of the pipeline
+uses for measured / stated / default.
+
 ## Smaller items
 
 - `IFR` (item fill rate) service metric — `config/stocking_policy.json` documents

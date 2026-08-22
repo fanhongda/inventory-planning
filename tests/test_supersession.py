@@ -589,3 +589,90 @@ def test_without_the_list_the_two_numbers_stay_apart(exports):
     assert set(inv["sku"]) >= {OLD, NEW}
     assert not result.supersessions.applied
     assert not result.plan.has("substitution_signal")
+
+
+# ── The key the rows are recombined on ───────────────────────────────────────
+
+
+def _two_despatches_months_apart():
+    """
+    One sales order, one line under each number, invoiced four months apart — and no
+    ship-date column, which is what the PL30 export looks like. `sales_history` keys on
+    `[so_number, sku, ship_date]`, so the absent field used to leave `[so_number, sku]`
+    and the two despatches became one row.
+    """
+    return pd.DataFrame({
+        "so_number":   ["303477453", "303477453", "303477453"],
+        "sku":         [OLD, NEW, "UNRELATED"],
+        "demand_date": pd.to_datetime(["2026-02-18", "2026-06-24", "2026-06-24"]),
+        "qty":         [2241.0, 4000.0, 7.0],
+    })
+
+
+def test_two_events_months_apart_are_not_one_event():
+    smap = build_map([{"old_sku": OLD, "new_sku": NEW}])
+    out, _ = smap.apply(_two_despatches_months_apart(), CONTRACTS.get("sales_history"))
+
+    moved = out[out["sku"] == NEW]
+    assert len(moved) == 2, "the two despatches were collapsed onto one date"
+    assert set(moved["demand_date"].dt.strftime("%Y-%m")) == {"2026-02", "2026-06"}
+
+
+def test_the_quantity_stays_in_the_month_it_happened():
+    """
+    The total survived the old behaviour, which is why nothing looked wrong. What
+    moved was the shape, and the shape is what the forecast reads.
+    """
+    smap = build_map([{"old_sku": OLD, "new_sku": NEW}])
+    df = _two_despatches_months_apart()
+    out, _ = smap.apply(df, CONTRACTS.get("sales_history"))
+
+    assert out["qty"].sum() == df["qty"].sum()
+    by_month = out.groupby(out["demand_date"].dt.strftime("%Y-%m"))["qty"].sum()
+    assert by_month["2026-02"] == 2241.0
+    assert by_month["2026-06"] == 4007.0
+
+
+def test_genuine_duplicates_on_one_date_still_combine():
+    """The substitute key must not stop the recombination it exists to make correct."""
+    smap = build_map([{"old_sku": OLD, "new_sku": NEW}])
+    same_day = pd.DataFrame({
+        "so_number":   ["303477453", "303477453"],
+        "sku":         [OLD, NEW],
+        "demand_date": pd.to_datetime(["2026-06-24", "2026-06-24"]),
+        "qty":         [2241.0, 4000.0],
+    })
+    out, _ = smap.apply(same_day, CONTRACTS.get("sales_history"))
+    assert len(out) == 1
+    assert out["qty"].iloc[0] == 6241.0
+
+
+def test_a_frame_with_no_time_dimension_is_left_alone():
+    """
+    Nothing present can tell two events apart, so they are not merged on a guess.
+    Recombining here would be the same defect with a different field missing.
+    """
+    smap = build_map([{"old_sku": OLD, "new_sku": NEW}])
+    undated = pd.DataFrame({
+        "so_number": ["303477453", "303477453"],
+        "sku":       [OLD, NEW],
+        "qty":       [2241.0, 4000.0],
+    })
+    out, _ = smap.apply(undated, CONTRACTS.get("sales_history"))
+    assert len(out) == 2
+    assert out["qty"].sum() == 6241.0
+
+
+def test_the_declared_key_is_used_when_the_export_carries_it():
+    """Where `ship_date` is present it is the key, exactly as the contract says."""
+    smap = build_map([{"old_sku": OLD, "new_sku": NEW}])
+    shipped = pd.DataFrame({
+        "so_number":   ["303477453", "303477453"],
+        "sku":         [OLD, NEW],
+        "ship_date":   pd.to_datetime(["2026-06-24", "2026-06-24"]),
+        "demand_date": pd.to_datetime(["2026-02-18", "2026-06-24"]),
+        "qty":         [2241.0, 4000.0],
+    })
+    out, _ = smap.apply(shipped, CONTRACTS.get("sales_history"))
+    assert len(out) == 1, "same order, same ship date — one row by the declared key"
+

@@ -455,10 +455,51 @@ class SupersessionMap:
         df["sku"] = original.where(~hit, mapped)
         df = self._scale(df, contract, original, hit)
 
-        key = [k for k in contract.natural_key if k in df.columns]
+        key = self._recombination_key(df, contract)
         if key and df.duplicated(subset=key).any():
             df = self._recombine(df, contract, key, hit)
         return df, records
+
+    @staticmethod
+    def _recombination_key(df: pd.DataFrame, contract: DocContract) -> List[str]:
+        """
+        The natural key to recombine on, when the export does not carry all of it.
+
+        Dropping the absent parts is what the obvious one-liner does, and it is safe
+        for every part except the one that carries time. `sales_history` keys on
+        `[so_number, sku, ship_date]`; an export with no ship-date column — this one
+        buckets on the invoice date instead — silently leaves `[so_number, sku]`, and
+        two despatches against the same order four months apart become one row. On the
+        renumbered part that merged four pairs of lines and moved 5,871 units into the
+        months of the later invoice. The total was preserved, which is why nothing
+        looked wrong, and the shape of the demand series is what the forecast reads.
+
+        Both contracts whose key names a date name an *optional* one, and `po_history`
+        says in its own description that SAP extracts routinely omit it, so this is the
+        ordinary case rather than an edge.
+
+        A present timestamp stands in for the absent one — the required one first,
+        since that is the field the pipeline actually buckets on. Where the frame has
+        no time dimension at all, there is no way to tell two events apart and the
+        rows are left alone rather than guessed at.
+        """
+        present = [k for k in contract.natural_key if k in df.columns]
+
+        def is_time(name: str) -> bool:
+            spec = contract.fields.get(name)
+            return spec is not None and spec.role == "timestamp"
+
+        lost_time = [k for k in contract.natural_key
+                     if k not in df.columns and is_time(k)]
+        if not lost_time or any(is_time(k) for k in present):
+            return present
+
+        stand_in = sorted(
+            (n for n, spec in contract.fields.items()
+             if spec.role == "timestamp" and n in df.columns and df[n].notna().any()),
+            key=lambda n: not contract.fields[n].required,
+        )
+        return present + stand_in[:1] if stand_in else []
 
     def _records(
         self, df: pd.DataFrame, moved: pd.Series, doc_type: str, contract: DocContract

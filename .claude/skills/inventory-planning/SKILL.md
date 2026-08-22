@@ -38,7 +38,13 @@ path below is relative to the repository root — run from there.** All logic is
 2. **Safety stock** — combined demand × lead-time variability formula
 3. **Inventory projection** — should-be vs current position (on-hand + GIT + open PO)
 4. **6-month ARIMA/ETS forecast** per SKU
-5. **Purchase recommendations** — PURCHASE-REQUEST / ORDER-FOR-BACKLOG / PUSH-OUT-OPEN-PO / HOLD / NO-ACTION
+5. **Purchase recommendations** — EXPEDITE-INBOUND / PURCHASE-REQUEST /
+   ORDER-FOR-BACKLOG / PUSH-OUT-OPEN-PO / HOLD / NO-ACTION. **Relay every
+   `EXPEDITE-INBOUND` first and by name.** It means the shelf runs dry before the
+   next delivery lands, so the ask is a ship date confirmed with the supplier —
+   daily — and a price for air freight, not a purchase order. The run prints the
+   days of cover left, how long the shelf is bare, and how much is already past
+   due; those three are what the buyer takes to the supplier.
 6. **Backlog realization rate** — measured share of the open order book that actually ships
    and, where an item master or planner worksheet is supplied, a source cross-check and a
    per-SKU comparison against the parameters the planner set by hand

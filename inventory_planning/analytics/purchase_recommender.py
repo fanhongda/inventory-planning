@@ -137,6 +137,14 @@ class PurchaseRecommender:
         def _action(row):
             if row["stocking_class"] == "non-stocking":
                 return "ORDER-FOR-BACKLOG" if row["backlog_shortfall"] > 0 else "NO-ACTION"
+            # Covering the period in front of you comes before every other verdict. A
+            # shelf that empties before the next delivery lands is not a position to be
+            # rebalanced, and the order already placed is not the answer to it — the
+            # answer is to get that order moving. Ranked first so it can overrule
+            # push-out, which is what it used to lose to on exactly these items.
+            if row.get("supply_gap"):
+                return ("EXPEDITE-INBOUND" if row["total_open_po_qty"] > 0
+                        else "PURCHASE-REQUEST")
             if row["pushout_candidate"]:
                 return "PUSH-OUT-OPEN-PO"
             if row["net_requirement"] > 0:
@@ -163,6 +171,8 @@ class PurchaseRecommender:
             "gross_requirement", "available_supply", "net_requirement",
             "suggested_po_qty", "pushout_open_po_qty",
             "inventory_status", "days_of_supply", "safety_stock", "should_be_inventory",
+            "on_hand_cover_days", "inbound_past_due_qty", "inbound_due_qty",
+            "days_to_next_arrival", "supply_gap", "supply_gap_days",
         ]
         return df[[c for c in cols if c in df.columns]].sort_values("recommended_action")
 

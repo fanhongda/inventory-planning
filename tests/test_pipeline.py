@@ -183,7 +183,7 @@ class TestEndToEnd:
         assert len(rec) > 0
         valid_actions = {
             "PURCHASE-REQUEST", "PUSH-OUT-OPEN-PO", "HOLD-OK",
-            "HOLD-EXCESS", "NO-ACTION", "ORDER-FOR-BACKLOG"
+            "HOLD-EXCESS", "NO-ACTION", "ORDER-FOR-BACKLOG", "EXPEDITE-INBOUND"
         }
         assert set(rec["recommended_action"]).issubset(valid_actions)
 

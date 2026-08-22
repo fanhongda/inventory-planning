@@ -84,10 +84,22 @@ class OpenPOReader(BaseReader):
         print(f"  Estimated committed delivery for {n_filled} open PO rows using WMA LT")
         return df
 
-    def inbound_schedule(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Open PO qty grouped by SKU, with total inbound value."""
-        agg = {"open_qty": "sum", "open_po_lines": ("open_qty", "count")}
+    def inbound_schedule(self, df: pd.DataFrame, as_of=None,
+                         horizon_days: int = 30) -> pd.DataFrame:
+        """
+        Open PO qty grouped by SKU — as a total, and phased by when it is due.
 
+        The total on its own is what let a SKU with an empty shelf be called excess:
+        summed against the reorder point, an order committed for four months' time
+        counts exactly as much as stock already on the rack. It is not the same supply,
+        and next month's demand cannot be met out of it.
+
+        So the quantity is split at two boundaries — already past its committed date,
+        due inside the horizon, due after it — and the date of the next arrival still
+        to come is carried alongside. Past due is kept apart from the rest rather than
+        folded into "arriving soon": supply that was owed three weeks ago has no date
+        on it any more, and the planner's job there is to chase it, not to plan on it.
+        """
         grp = df.groupby("sku").agg(
             total_open_po_qty=("open_qty", "sum"),
             open_po_lines=("open_qty", "count"),
@@ -99,6 +111,7 @@ class OpenPOReader(BaseReader):
                 dates.rename(columns={"min": "earliest_delivery", "max": "latest_delivery"}),
                 on="sku", how="left"
             )
+            grp = grp.merge(self._phase(df, as_of, horizon_days), on="sku", how="left")
 
         if "open_amount" in df.columns:
             amounts = df.groupby("sku")["open_amount"].sum().rename("total_open_po_amount")
@@ -113,3 +126,42 @@ class OpenPOReader(BaseReader):
         grp["location_id"] = (df["location_id"].iloc[0] if "location_id" in df.columns
                               else self.location_id)
         return grp
+
+    @staticmethod
+    def _phase(df: pd.DataFrame, as_of, horizon_days: int) -> pd.DataFrame:
+        """
+        Split each SKU's open quantity by when it is due, and name the next arrival.
+
+        With no `as_of` there is no boundary to split on, so everything is reported as
+        due inside the horizon — the same reading the pipeline had before, rather than
+        a silent zero that would make every SKU look starved.
+        """
+        due = pd.to_datetime(df["committed_delivery"], errors="coerce")
+        qty = pd.to_numeric(df["open_qty"], errors="coerce").fillna(0.0)
+
+        if as_of is None:
+            phased = df.assign(_past=0.0, _due=qty, _beyond=0.0, _next=due)
+        else:
+            now = pd.Timestamp(as_of)
+            cut = now + pd.Timedelta(days=horizon_days)
+            phased = df.assign(
+                _past=qty.where(due < now, 0.0),
+                _due=qty.where((due >= now) & (due <= cut), 0.0),
+                # An unknown date is not near-term supply. Estimated dates are filled in
+                # upstream, so what is left here is genuinely unschedulable.
+                _beyond=qty.where(due.isna() | (due > cut), 0.0),
+                _next=due.where(due >= now),
+            )
+
+        out = phased.groupby("sku").agg(
+            inbound_past_due_qty=("_past", "sum"),
+            inbound_due_qty=("_due", "sum"),
+            inbound_beyond_qty=("_beyond", "sum"),
+            next_arrival=("_next", "min"),
+        ).reset_index()
+
+        out["days_to_next_arrival"] = (
+            (out["next_arrival"] - pd.Timestamp(as_of)).dt.days if as_of is not None
+            else np.nan
+        )
+        return out

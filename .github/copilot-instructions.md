@@ -47,7 +47,7 @@ against policy, ordering behaviour, replenishment cadence, forward risk, then th
 list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 610 tests, all should pass
+python3 -m pytest tests/ -q        # 638 tests, all should pass
 ```
 
 Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
@@ -170,6 +170,19 @@ supplier written correctly as 深圳市华强电子 opens as 娣卞湷甯傚崕�
 install. On the read side, `latin-1` maps all 256 byte values and therefore never
 raises — a try-until-one-works ladder with latin-1 in it can never reach a CJK codec,
 so a GBK export became mojibake with no error. Use `write_csv`, never bare `to_csv`.
+
+**Covering the period in front of you outranks rebalancing the position**
+(`inventory_projector.py::supply_gap`). The position is a total and says nothing about
+*when* supply lands, so an order committed for four months' time counts in it exactly
+as much as stock on the rack. A shelf that empties before the next delivery — or that
+is empty while supply sits past due — is `EXPEDITE-INBOUND`, ranked ahead of push-out
+and never deferred. Open PO quantity is phased into past-due / due-in-horizon / beyond
+(`open_po_reader.inbound_schedule`); a past-due order is not near-term supply, because
+it no longer has a date on it.
+
+**Push-out defers the surplus, never the whole order.** `min(surplus_deficit,
+total_open_po_qty)` lands the position on the reorder point. Deferring everything
+inbound out of an empty shelf is the opposite advice, not a milder version of it.
 
 **`location_id` is read from the source wherever the export names a plant** (contracts
 declare it on every transactional document, not just inventory) **and the configured

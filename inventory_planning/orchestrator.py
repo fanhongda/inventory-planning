@@ -59,7 +59,8 @@ class InventoryPlanner:
         self.backlog_horizon_days = int(policy_cfg.get("backlog_horizon_days", 30))
         self.classifier    = DemandClassifier(self.config_dir)
         self.ss_calc       = SafetyStockCalculator(self.config_dir)
-        self.projector     = InventoryProjector(self.config_dir)
+        self.projector     = InventoryProjector(self.config_dir,
+                                                horizon_days=self.backlog_horizon_days)
         self.forecaster    = Forecaster(horizon=policy_cfg["forecast_horizon_months"])
         self.recommender   = PurchaseRecommender(
             demand_basis=policy_cfg.get("demand_basis", "forecast_consumption"),
@@ -562,7 +563,11 @@ class InventoryPlanner:
         print("\n[6/6] Projecting inventory & generating recommendations...")
         if open_po_df is not None:
             open_po_df = self.open_po_reader.fill_estimated_delivery(open_po_df, supplier_lt)
-        open_po_summary = self.open_po_reader.inbound_schedule(open_po_df) if open_po_df is not None else None
+        open_po_summary = (
+            self.open_po_reader.inbound_schedule(
+                open_po_df, as_of=as_of, horizon_days=self.recommender.horizon_days)
+            if open_po_df is not None else None
+        )
         open_so_summary = (
             self.open_so_reader.backlog_summary(
                 open_so_df, as_of=as_of, horizon_days=self.backlog_horizon_days
@@ -733,6 +738,28 @@ class InventoryPlanner:
         action_counts = recommendations["recommended_action"].value_counts()
         for action, count in action_counts.items():
             print(f"  {action:<30} {count:>5} SKUs")
+
+        # Named at the top of the summary, ranked by how long the shelf is bare, and
+        # with the ask spelled out. A supply gap is not a quantity to order — the order
+        # exists — it is a delivery date to go and get, and the planner has to know
+        # which supplier to ring before anything else in this report matters.
+        gap = recommendations[recommendations.get("supply_gap", False) == True]
+        if len(gap):
+            gap = gap.sort_values("supply_gap_days", ascending=False)
+            print()
+            print(f"  \033[91m*** SUPPLY GAP — {len(gap)} SKU(s) run dry before the next "
+                  f"delivery ***\033[0m")
+            print(f"  Confirm the ship date with the supplier daily and price the air freight; "
+                  f"expediting is the action, not a purchase order.")
+            for _, r in gap.head(10).iterrows():
+                late = (f", {r['inbound_past_due_qty']:,.0f} already past due"
+                        if r.get("inbound_past_due_qty", 0) > 0 else "")
+                nxt = (f"next arrival in {r['days_to_next_arrival']:.0f}d"
+                       if pd.notna(r.get("days_to_next_arrival")) else "no arrival scheduled")
+                print(f"    {str(r['sku']):<14} {r['on_hand_cover_days']:>6.1f}d on the shelf, "
+                      f"bare for {r['supply_gap_days']:>5.1f}d — {nxt}{late}")
+            if len(gap) > 10:
+                print(f"    … and {len(gap) - 10} more, in the recommendations CSV")
 
         purchase_skus = recommendations[recommendations["recommended_action"] == "PURCHASE-REQUEST"]
         if len(purchase_skus):

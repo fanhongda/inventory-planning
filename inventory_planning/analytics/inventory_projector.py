@@ -72,13 +72,24 @@ class InventoryProjector:
                 return "no-data"
             dos = row["days_of_supply"]
             surplus = row["surplus_deficit"]
-            # EXCESS: DOS exceeds policy threshold (not arbitrary % over ROP)
-            if pd.notna(dos) and dos > self.excess_dos_threshold:
+            # Shortage is judged first, and excess is gated on there being a surplus at
+            # all. The two measures answer different questions and used to be allowed to
+            # contradict each other: `should_be` is the reorder point, so it carries the
+            # safety stock and the lead time, while DOS divides the position by average
+            # demand and knows about neither. On a lumpy SKU that gap is the whole point
+            # — the variability that sizes the safety stock is exactly what holds the
+            # average down, so DOS reads *high* on the items whose cover is most needed.
+            #
+            # Trusting DOS alone put 19 SKUs on this extract in EXCESS while they sat
+            # below their reorder point, and sent 14 of them to push-out. One had 9,000
+            # units inbound against a 9,180 reorder point and nothing at all on the
+            # shelf, and the run advised delaying the delivery.
+            if surplus < -row["safety_stock"] * 0.5:
+                return "SHORTAGE-RISK"
+            if surplus > 0 and pd.notna(dos) and dos > self.excess_dos_threshold:
                 return "EXCESS"
             if surplus > 0:
                 return "slightly-over"
-            if surplus < -row["safety_stock"] * 0.5:
-                return "SHORTAGE-RISK"
             return "OK"
 
         df["inventory_status"] = df.apply(_status, axis=1)

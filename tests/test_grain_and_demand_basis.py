@@ -152,6 +152,70 @@ class TestInventoryGrain:
             InventoryProjector(CONFIG_DIR).project(safety_stock_frame, duplicated, None)
 
 
+class TestExcessIsNotDeclaredOverAShortage:
+    """
+    A position below the reorder point was being labelled EXCESS and pushed out.
+
+    Reported from an PL30 run: a SKU whose should-be was 68,629 against 37 units on
+    hand came back `excess`, `PUSH-OUT-OPEN-PO`. On the extract here, 19 SKUs carried
+    that contradiction and 14 of them were sent to push-out — one with 9,000 units
+    inbound against a 9,180 reorder point and nothing at all on the shelf.
+
+    The two measures answer different questions. `should_be` is the reorder point, so
+    it carries the safety stock and the lead time. Days of supply divides the position
+    by average demand and carries neither. On a lumpy SKU the gap between them is the
+    whole point of holding safety stock — the variability that sizes it is exactly what
+    holds the average down — so DOS reads *highest* on the items whose cover is least
+    disposable. Letting it decide excess on its own inverted the advice.
+    """
+
+    @staticmethod
+    def _position(qty, should_be_ss=6302.2, dlt=2877.8, demand=1905.83):
+        """One SKU whose cover looks long on the average but is short of its ROP."""
+        stock = pd.DataFrame({
+            "sku": ["SKU-A"], "qty_on_hand": [0.0], "qty_in_transit_adj": [0.0],
+            "total_open_po_qty": [qty], "effective_position": [qty],
+        })
+        ss = pd.DataFrame({
+            "sku": ["SKU-A"], "location_id": ["DC-01"],
+            "stocking_class": ["stocking-high"], "service_level": [0.95],
+            "demand_mean_rolling": [demand], "wma_lead_time_days": [51.7],
+            "safety_stock": [should_be_ss], "demand_during_lt": [dlt],
+        })
+        return InventoryProjector(CONFIG_DIR).project(ss, stock, stock)
+
+    def test_below_the_reorder_point_is_never_excess(self):
+        row = self._position(9000.0).iloc[0]
+        assert row["surplus_deficit"] < 0
+        assert row["days_of_supply"] > 90          # the reading that used to decide
+        assert row["inventory_status"] != "EXCESS"
+
+    def test_and_is_not_pushed_out(self):
+        """The consequence that matters: nothing inbound gets delayed on this basis."""
+        assert not self._position(9000.0).iloc[0]["pushout_candidate"]
+        assert self._position(9000.0).iloc[0]["pushout_open_po_qty"] == 0
+
+    def test_a_real_shortage_is_still_called_one(self):
+        row = self._position(2000.0).iloc[0]
+        assert row["inventory_status"] == "SHORTAGE-RISK"
+
+    def test_genuine_excess_is_still_excess(self):
+        """
+        The threshold has to keep working where it applies: above the reorder point
+        *and* holding more days than policy allows.
+        """
+        row = self._position(60000.0).iloc[0]
+        assert row["surplus_deficit"] > 0
+        assert row["inventory_status"] == "EXCESS"
+        assert row["pushout_candidate"]
+
+    def test_above_the_reorder_point_but_inside_the_threshold_is_not_excess(self):
+        row = self._position(9500.0, should_be_ss=100.0, dlt=200.0, demand=4000.0).iloc[0]
+        assert row["surplus_deficit"] > 0
+        assert row["days_of_supply"] <= 90
+        assert row["inventory_status"] == "slightly-over"
+
+
 # ── 2. Backlog realization ───────────────────────────────────────────────────
 
 

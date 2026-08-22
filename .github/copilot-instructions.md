@@ -47,7 +47,7 @@ against policy, ordering behaviour, replenishment cadence, forward risk, then th
 list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 659 tests, all should pass
+python3 -m pytest tests/ -q        # 668 tests, all should pass
 ```
 
 Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
@@ -188,7 +188,16 @@ always an entrant** so "best of five" can be recognised as worse than repeating 
 month (`vs_naive`; 35 of 178 on the PL30 extract are exactly that). Make-to-order goes
 straight to Croston and is not backtested — nothing is stocked against a forecast there.
 The policy is the ERP's `stocking_policy`, not the inferred `stocking_class`; where a
-SKU has none, the old pattern routing still applies. Backtest three steps ahead, not
+SKU has none, the old pattern routing still applies. **The winner is per SKU** —
+recorded in `model_used` on every row — and the run summary's model counts are
+counts of SKUs, not one choice for the run.
+
+**A stocking policy is suggested from demand and never applied**
+(`demand_classifier.py::_suggest_policy`). Any SKU with a series gets an MTS/MTO
+suggestion with the evidence attached, on the same tier boundary the rest of the
+pipeline uses. It sits beside the ERP's policy rather than overwriting it: that is
+a decision in force, this is what twelve months did, and the disagreement is the
+finding. 84% agree on the PL30 extract. Backtest three steps ahead, not
 one: a one-step score cannot see a model walking away from the data.
 
 **Covering the period in front of you outranks rebalancing the position**

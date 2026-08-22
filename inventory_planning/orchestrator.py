@@ -477,6 +477,52 @@ class InventoryPlanner:
     # Phase 2: Analytics Pipeline (sequential)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _report_policy_suggestion(classified: pd.DataFrame,
+                                  planning_master_df: pd.DataFrame) -> None:
+        """
+        What the demand says the stocking policy should be, against what the ERP holds.
+
+        Printed rather than applied. The policy decides whether stock is expected to sit
+        on the shelf at all, and a pipeline that rewrote it from twelve months of history
+        would be overruling a decision on evidence the person who made it may already
+        have weighed. The disagreement is the finding; acting on it is a person's call.
+        """
+        if classified is None or "suggested_stocking_policy" not in classified.columns:
+            return
+        suggested = classified.dropna(subset=["suggested_stocking_policy"])
+        if not len(suggested):
+            return
+
+        counts = suggested["suggested_stocking_policy"].value_counts()
+        print(f"      Suggested from demand: "
+              f"{counts.get('MTS', 0)} MTS, {counts.get('MTO', 0)} MTO "
+              f"(over {len(suggested)} SKUs with a demand series)")
+
+        if planning_master_df is None or "stocking_policy" not in getattr(
+                planning_master_df, "columns", []):
+            print("      No ERP policy to compare against — the suggestion stands alone")
+            return
+
+        erp = planning_master_df[["sku", "stocking_policy"]].dropna(subset=["stocking_policy"])
+        both = suggested.merge(erp, on="sku", how="inner")
+        if not len(both):
+            return
+        disagree = both[both["stocking_policy"] != both["suggested_stocking_policy"]]
+        agree_rate = 1 - len(disagree) / len(both)
+        print(f"      Against the ERP policy on {len(both)} of them: "
+              f"{agree_rate:.0%} agree")
+        for direction, label in (
+            (("MTO", "MTS"), "held as MTO, demand recurs — a candidate to stock"),
+            (("MTS", "MTO"), "held as MTS, demand is sporadic — stock may be sitting"),
+        ):
+            rows = disagree[(disagree["stocking_policy"] == direction[0])
+                            & (disagree["suggested_stocking_policy"] == direction[1])]
+            if len(rows):
+                names = ", ".join(rows["sku"].astype(str).head(4))
+                more = f" … +{len(rows) - 4}" if len(rows) > 4 else ""
+                print(f"        {len(rows):>4} {label}: {names}{more}")
+
     def run_planning(
         self,
         sales_df: pd.DataFrame,
@@ -542,6 +588,7 @@ class InventoryPlanner:
         print(f"      Stocking classes: {counts}")
         if pattern_counts:
             print(f"      Demand patterns: {pattern_counts}")
+        self._report_policy_suggestion(classified, planning_master_df)
 
         # Step 4: Forecast — must run before safety stock to supply forecast RMSE
         print("\n[4/6] Forecasting demand (6 months)...")
@@ -555,7 +602,10 @@ class InventoryPlanner:
         forecast_summary_df = self.forecaster.summary(forecast_detail)
         if not forecast_detail.empty:
             model_counts = forecast_detail.drop_duplicates("sku")["model_used"].value_counts().to_dict()
-            print(f"      Models used: {model_counts}")
+            # Counts of SKUs, not one choice for the run. Each SKU is scored on its
+            # own history and keeps its own winner; `model_used` on every row of
+            # forecast_detail and forecast_<ts>.csv says which.
+            print(f"      Model chosen per SKU — {model_counts}")
 
         # Step 5: Safety stock — uses forecast RMSE from step 4 as σDL
         print("\n[5/6] Calculating safety stock...")

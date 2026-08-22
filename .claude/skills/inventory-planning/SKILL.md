@@ -34,7 +34,11 @@ path below is relative to the repository root — run from there.** All logic is
 
 ## What this skill produces
 
-1. **Stocking classification** — high-service / med-service / non-stocking per SKU
+1. **Stocking classification** — high-service / med-service / non-stocking per SKU,
+   plus a suggested **MTS/MTO** for every SKU with a demand series, with the evidence
+   (`suggested_stocking_policy`, `policy_basis`). It is compared against the ERP's
+   policy and never overwrites it — relay the disagreements, both directions: held
+   as MTO but demand recurs, and held as MTS but demand is sporadic.
 2. **Safety stock** — combined demand × lead-time variability formula
 3. **Inventory projection** — should-be vs current position (on-hand + GIT + open PO)
 4. **6-month forecast** per SKU, plus `forecast_<ts>.csv` — one row per SKU with its

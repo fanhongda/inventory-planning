@@ -65,6 +65,9 @@ class DemandClassifier:
 
             tier = self._assign_tier(active, total_cycles)
             demand_pattern = self._demand_pattern(tier["name"], active, total_cycles, cv)
+            has_series = sku in ts.columns
+            suggested, basis = self._suggest_policy(
+                tier["name"], active, total_cycles, cv, has_series)
 
             rows.append({
                 **row.to_dict(),
@@ -81,8 +84,37 @@ class DemandClassifier:
                 "demand_pattern": demand_pattern,
                 "service_level": tier["service_level"],
                 "z_score": tier["z_score"],
+                "suggested_stocking_policy": suggested,
+                "policy_basis": basis,
             })
         return pd.DataFrame(rows)
+
+    def _suggest_policy(self, stocking_class: str, active: int, total: int,
+                        cv, has_series: bool):
+        """
+        MTS or MTO, from how the demand actually behaved.
+
+        The ERP carries a policy of its own and this does not overwrite it — the two
+        are different claims. `stocking_policy` is the decision in force, maintained by
+        a person and often years before anyone planned on it; this is what the last
+        twelve months did. Where they disagree that is the finding, which is why the
+        suggestion is emitted for every SKU with a series, including the ones the
+        planner worksheet has never heard of.
+
+        The boundary is not a new one. An item earns a stocking tier by having demand
+        in enough months — 6 of 12 for the lowest tier, from `stocking_policy.json` —
+        and that is the same question MTS asks: does this recur often enough to be
+        worth holding? So the tiers decide, and the evidence travels with the verdict
+        rather than the reader having to take the label on trust.
+        """
+        if not has_series:
+            return None, None
+        share = active / total if total else 0.0
+        evidence = (f"demand in {active}/{total} months"
+                    + (f", CV {cv:.2f}" if pd.notna(cv) else ", no CV (no demand)"))
+        if stocking_class == "non-stocking":
+            return "MTO", f"{evidence} — too sporadic to hold"
+        return "MTS", f"{evidence} — recurs in {share:.0%} of months"
 
     def _assign_tier(self, active_cycles: int, total_cycles: int) -> dict:
         for tier in self.tiers:

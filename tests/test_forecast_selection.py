@@ -194,3 +194,99 @@ class TestTheForecastSheet:
 
     def test_an_empty_forecast_is_an_empty_sheet_not_a_crash(self):
         assert Forecaster().history_and_forecast(pd.DataFrame(), pd.DataFrame()).empty
+
+
+class TestTheModelIsPerSkuNotPerRun:
+    """
+    Each SKU is scored on its own history and keeps its own winner. Stated as a test
+    because the run summary prints a count of models across SKUs, and that reads at a
+    glance as one choice for the whole run.
+    """
+
+    def test_two_skus_with_different_shapes_get_different_models(self):
+        ts = pd.DataFrame({
+            "RAMP": [float(v) for v in RAMP],
+            "LUMPY": [float(v) for v in LUMPY],
+        }, index=PERIODS)
+        policy = pd.DataFrame({"sku": ["RAMP", "LUMPY"], "stocking_policy": ["MTS", "MTS"]})
+        detail = Forecaster(horizon=6).forecast_all(ts, policy=policy)
+        chosen = detail[detail["is_next_period"]].set_index("sku")["model_used"]
+        assert chosen["RAMP"] != chosen["LUMPY"]
+
+    def test_the_winner_is_recorded_on_every_row_of_its_own_forecast(self):
+        """The record is per SKU per period, so nothing has to be inferred later."""
+        ts = pd.DataFrame({"A": [float(v) for v in LUMPY]}, index=PERIODS)
+        detail = Forecaster(horizon=6).forecast_all(
+            ts, policy=pd.DataFrame({"sku": ["A"], "stocking_policy": ["MTS"]}))
+        assert len(detail) == 6
+        assert detail["model_used"].nunique() == 1
+        assert detail["model_used"].iloc[0] in ("ETS", "ARIMA", "SMA", "Croston", "Naive")
+
+
+class TestVsNaive:
+    """
+    What the number means, since it decides how much of a forecast to believe.
+
+    It is the winner's backtest error divided by the naive forecast's, on the same
+    metric and the same folds. Below 1 the model earned something; at 1 it did not, and
+    that happens when Naive itself won — nothing in the pool beat repeating last month.
+    """
+
+    def test_one_means_no_model_beat_repeating_last_month(self):
+        noisy = 100 + np.random.default_rng(0).normal(0, 5, 22)
+        _, row = _run(noisy, "MTS")
+        assert row["model_used"] == "Naive"
+        assert row["vs_naive"] == 1.0
+
+    def test_below_one_is_the_share_of_the_naive_error_that_is_left(self):
+        _, row = _run(RAMP, "MTS")
+        assert 0 <= row["vs_naive"] < 1.0
+
+    def test_it_is_absent_where_the_naive_forecast_has_no_error_to_divide_by(self):
+        """A perfectly flat series: naive is exact, so the ratio is undefined, not zero."""
+        _, row = _run([100.0] * 22, "MTS")
+        assert pd.isna(row["vs_naive"])
+
+
+
+class TestAPolicyIsSuggestedWhereverThereIsASeries:
+    """
+    The ERP's `stocking_policy` is a decision in force, often set years before anyone
+    planned on the item. What the last twelve months did is a separate claim, and the
+    two disagreeing is the finding — so the suggestion is made for every SKU with a
+    series, including those the planner worksheet has never heard of, and it never
+    overwrites the ERP's value.
+    """
+
+    @staticmethod
+    def _classify(series_by_sku):
+        from inventory_planning.analytics.demand_classifier import DemandClassifier
+        ts = pd.DataFrame(series_by_sku, index=PERIODS[-12:])
+        summary = pd.DataFrame({"sku": list(series_by_sku),
+                                "demand_mean": 0.0, "demand_std": 0.0})
+        cfg = Path(__file__).parents[1] / "config"
+        return DemandClassifier(cfg).classify(summary, ts).set_index("sku")
+
+    def test_demand_in_most_months_suggests_mts(self):
+        out = self._classify({"A": [10.0] * 12})
+        assert out.loc["A", "suggested_stocking_policy"] == "MTS"
+
+    def test_sporadic_demand_suggests_mto(self):
+        out = self._classify({"A": [0.0] * 10 + [5.0, 7.0]})
+        assert out.loc["A", "suggested_stocking_policy"] == "MTO"
+
+    def test_the_evidence_travels_with_the_verdict(self):
+        """A label a planner cannot check is a label they have to take on trust."""
+        out = self._classify({"A": [0.0] * 10 + [5.0, 7.0]})
+        assert "2/12 months" in out.loc["A", "policy_basis"]
+
+    def test_a_sku_with_no_series_gets_no_suggestion(self):
+        """`有时间序列就给出建议` — and where there is none, silence rather than a guess."""
+        from inventory_planning.analytics.demand_classifier import DemandClassifier
+        ts = pd.DataFrame({"A": [10.0] * 12}, index=PERIODS[-12:])
+        summary = pd.DataFrame({"sku": ["A", "NO-SERIES"],
+                                "demand_mean": [10.0, 0.0], "demand_std": [0.0, 0.0]})
+        out = (DemandClassifier(Path(__file__).parents[1] / "config")
+               .classify(summary, ts).set_index("sku"))
+        assert out.loc["A", "suggested_stocking_policy"] == "MTS"
+        assert pd.isna(out.loc["NO-SERIES", "suggested_stocking_policy"])

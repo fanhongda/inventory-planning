@@ -47,7 +47,7 @@ against policy, ordering behaviour, replenishment cadence, forward risk, then th
 list — materials to act on, open POs to change, and parameter suggestions.
 
 ```bash
-python3 -m pytest tests/ -q        # 638 tests, all should pass
+python3 -m pytest tests/ -q        # 642 tests, all should pass
 ```
 
 Production runs **pandas 2.x**; the dev venv here is **pandas 3.x** and `pyproject.toml`
@@ -96,9 +96,19 @@ violated, and is evaluated against the cadence a lever *proposes*, not the curre
 **Safety stock exposure is R + LT**, not LT (`should_be.py::_safety`). Using LT alone
 understates it by √((R+LT)/LT) — 41% at monthly review with a 30-day lead time.
 
-**OTD is measured over completed deliveries only** (`service.py`). An open line past its
-request date could never have been on time, so including open lines drives the rate
-toward zero by construction. Past-due backlog is reported as its own metric.
+**OTD is measured over completed deliveries only** (`service.py`) — the *headline*
+rate. An open line past its request date could never have been on time, so including
+open lines drives the rate toward zero by construction. Past-due backlog is reported as
+its own metric.
+
+**The monthly OTD series deliberately does not follow that rule** (`monthly_otd`). It
+buckets on the **request** date and its denominator is every line due that month,
+open ones included: of what the customer asked for in July, what share went out on or
+before the date. Ship-date bucketing answers a throughput question instead — a line
+requested in March and shipped in July lands on July, and one requested in July that
+never shipped lands nowhere. The series reads lower than the headline, on purpose.
+**Nothing past `as_of` is drawn**: under request-date bucketing the order book supplies
+months that have not happened yet.
 
 **A line past due with stock on the shelf is not a supply failure.** It is an
 inventory-efficiency problem with a different owner. Never fold it into the OTD miss

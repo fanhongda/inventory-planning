@@ -416,6 +416,81 @@ class TestMonthlyOTD:
         monthly = ServiceAnalyzer().analyze(sales_history=sales, as_of=date(2025, 4, 1)).monthly_otd()
         assert list(monthly["thin"]) == [False, True]
 
+    def test_the_month_is_the_one_the_customer_asked_for(self):
+        """
+        A line requested in March and shipped in July is a March miss, not a July one.
+        Bucketing on the ship date put it in July, where it read as that month's
+        failure — and the month the promise was actually broken showed nothing.
+        """
+        sales = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "qty": 1.0, "amount": 100.0,
+            "order_date": pd.Timestamp("2026-02-01"),
+            "customer_request_date": pd.Timestamp("2026-03-15"),
+            "ship_date": pd.Timestamp("2026-07-20"),
+        }])
+        monthly = ServiceAnalyzer().analyze(
+            sales_history=sales, as_of=date(2026, 7, 31)).monthly_otd()
+        march = monthly[monthly["period"].astype(str) == "2026-03"].iloc[0]
+        assert march["lines"] == 1 and march["on_time_lines"] == 0
+        # July carries no row at all: the miss belongs to March and is counted once.
+        assert "2026-07" not in set(monthly["period"].astype(str))
+
+    def test_a_line_still_sitting_there_counts_against_the_month_it_was_due(self):
+        """
+        The rule this overrules: the headline leaves open lines out as backlog. Against
+        the request date they belong in the denominator — a promise not kept by the
+        date is not kept, whatever becomes of the line later.
+        """
+        sales = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "qty": 1.0, "amount": 100.0,
+            "order_date": pd.Timestamp("2026-06-01"),
+            "customer_request_date": pd.Timestamp("2026-07-10"),
+            "ship_date": pd.Timestamp("2026-07-05"),
+        }] * 400)
+        open_so = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "open_qty": 1.0, "open_amount": 100.0,
+            "order_date": pd.Timestamp("2026-06-01"),
+            "customer_request_date": pd.Timestamp("2026-07-20"),
+        }] * 100)
+        monthly = ServiceAnalyzer().analyze(
+            sales_history=sales, open_so=open_so, as_of=date(2026, 7, 31)).monthly_otd()
+        july = monthly[monthly["period"].astype(str) == "2026-07"].iloc[0]
+        assert july["lines"] == 500
+        assert july["on_time_lines"] == 400
+        assert july["otd_line_rate"] == pytest.approx(0.80)
+
+    def test_the_order_book_does_not_draw_months_that_have_not_happened(self):
+        """
+        Where the phantom future months came from. The book legitimately holds lines
+        requested for October; a rate over deliveries still to come is not a
+        measurement, it is a reading of how far ahead the book runs.
+        """
+        sales = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "qty": 1.0, "amount": 100.0,
+            "order_date": pd.Timestamp("2026-06-01"),
+            "customer_request_date": pd.Timestamp("2026-07-10"),
+            "ship_date": pd.Timestamp("2026-07-05"),
+        }] * 20)
+        open_so = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "open_qty": 1.0, "open_amount": 100.0,
+            "order_date": pd.Timestamp("2026-07-01"),
+            "customer_request_date": d,
+        } for d in [pd.Timestamp("2026-09-15")] * 25 + [pd.Timestamp("2026-11-01")] * 25])
+        monthly = ServiceAnalyzer().analyze(
+            sales_history=sales, open_so=open_so, as_of=date(2026, 7, 31)).monthly_otd()
+        assert monthly["period"].max() == pd.Period("2026-07", "M")
+
+    def test_a_month_the_extract_stops_inside_is_marked_partial(self):
+        sales = pd.DataFrame([{
+            "sku": "A", "customer": "Acme", "qty": 1.0, "amount": 100.0,
+            "order_date": pd.Timestamp("2026-06-01"),
+            "customer_request_date": pd.Timestamp("2026-07-05"),
+            "ship_date": pd.Timestamp("2026-07-03"),
+        }] * 10)
+        monthly = ServiceAnalyzer().analyze(
+            sales_history=sales, as_of=date(2026, 7, 14)).monthly_otd()
+        assert bool(monthly.iloc[-1]["partial"])
+
     def test_the_measured_window_is_reported(self, shipped):
         result = ServiceAnalyzer().analyze(sales_history=shipped, as_of=AS_OF)
         first, last = result.measured_window

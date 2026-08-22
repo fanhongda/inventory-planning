@@ -703,10 +703,18 @@ class KPIReport:
         thin_months = int(monthly["thin"].sum())
 
         note = (
-            f"Measured over the {int(monthly['lines'].sum()):,} lines whose delivery "
-            f"outcome is settled — an open line that is past due can never come out "
-            f"on time, so it is backlog rather than a miss, and is reported separately."
+            f"Each month is the {int(monthly['lines'].sum()):,} lines the customer asked "
+            f"for in it — shipped early, shipped late, or still open — and the rate is "
+            f"the share that went out on or before the requested date. A line still "
+            f"sitting there past its date counts against the month it was due, which is "
+            f"why this reads lower than the headline rate above: that one is measured "
+            f"over settled deliveries only. Nothing past the latest date in the data is "
+            f"drawn — the order book runs months ahead, and a rate over deliveries still "
+            f"to come is not a measurement."
         )
+        if monthly["partial"].any():
+            note += (" The final month is drawn from an extract that stops part way "
+                     "through it, so lines are still to fall due in it.")
         if thin_months:
             note += (f" {thin_months} month(s) carry fewer than five lines and are drawn "
                      f"hollow; a rate over that few deliveries is not a measurement.")

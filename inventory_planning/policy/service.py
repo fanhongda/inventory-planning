@@ -230,35 +230,64 @@ class ServiceResult:
 
     def monthly_otd(self, min_lines: int = 5) -> pd.DataFrame:
         """
-        On-time delivery month by month, over exactly the lines the headline uses.
+        On-time delivery month by month, against the month the customer asked for.
 
         A single OTD figure answers "how did we do" and hides "when did it change",
         which is the question that decides whether anything needs fixing. 82% flat for
         two years and 82% because the last four months collapsed are the same number
         and different situations.
 
-        Bucketed on the **ship** date, not the request date: the month a delivery
-        succeeded or failed is the month it happened, and bucketing on the promise
-        would credit a late shipment to the month it was due rather than the month it
-        eventually moved.
+        **Bucketed on the request date, and the denominator is every line due that
+        month** — shipped early, shipped late, or still sitting there. So July reads
+        "of the 500 lines the customer wanted in July, 400 went out on or before the
+        date" = 80%.
+
+        This replaces bucketing on the ship date, and the two disagree on purpose. Ship
+        date answers "what did the warehouse get out of the door in July", which is a
+        throughput measure: a line requested in March and shipped in July counts as a
+        July failure, and a line requested in July that never shipped counts nowhere at
+        all. The customer's question is the other one, and it is the one a service
+        level is a promise about.
+
+        The cost of the change is stated rather than hidden. It **overrules the
+        "completed deliveries only" rule** that the headline `otd_line_rate` still
+        follows: a line past its request date and not yet shipped now counts against the
+        month it was due, where the headline leaves it out as backlog. That is why the
+        two numbers differ, and the monthly series will read lower. The reason the
+        headline excludes open lines — that they could never come out on time, so
+        including them drags the rate down by construction — is a real effect and it is
+        the point here: a promise that was not kept by the date is not kept, whatever
+        happens to the line afterwards.
+
+        Nothing past `as_of` is drawn. Under request-date bucketing the order book
+        supplies months that have not happened yet — a line requested for October is a
+        real row today — and a rate over a month whose deliveries are still to come is
+        not a measurement, it is an artefact of how far forward the book runs.
 
         `thin` marks months whose line count is too small for the rate to mean
         anything. They are returned rather than dropped — a month with three lines is
         itself a finding, and silently removing it leaves a gap the reader will
-        misread as zero.
+        misread as zero. `partial` marks a final month the extract stops part way
+        through, where lines are still to fall due.
         """
         cols = ["period", "lines", "on_time_lines", "otd_line_rate",
-                "value", "on_time_value", "otd_value_rate", "thin"]
-        settled = self.completed
-        if settled.empty or "actual_date" not in settled.columns:
+                "value", "on_time_value", "otd_value_rate", "thin", "partial"]
+        if self.lines.empty or "request_date" not in self.lines.columns:
             return pd.DataFrame(columns=cols)
 
-        work = settled.assign(_stamp=pd.to_datetime(settled["actual_date"], errors="coerce"))
-        work = work.dropna(subset=["_stamp"])
+        work = self.lines.assign(
+            _req=pd.to_datetime(self.lines["request_date"], errors="coerce")
+        ).dropna(subset=["_req"])
         if work.empty:
             return pd.DataFrame(columns=cols)
 
-        work["period"] = work["_stamp"].dt.to_period("M")
+        as_of_ts = pd.Timestamp(self.as_of)
+        horizon = as_of_ts.to_period("M")
+        work["period"] = work["_req"].dt.to_period("M")
+        work = work[work["period"] <= horizon]
+        if work.empty:
+            return pd.DataFrame(columns=cols)
+
         work["_on_time"] = work["service_state"] == ON_TIME
         work["_value"] = pd.to_numeric(work["line_value"], errors="coerce").fillna(0.0)
 
@@ -270,8 +299,8 @@ class ServiceResult:
                  on_time_value=("_value", lambda s: float(s[work.loc[s.index, "_on_time"]].sum())))
             .reset_index()
         )
-        # Every month between the first and last, so a month with no deliveries at all
-        # shows as a gap in the volume rather than as an absent point on the rate.
+        # Every month between the first and the last, so a month with nothing due shows
+        # as a gap in the volume rather than as an absent point on the rate.
         full = pd.period_range(out["period"].min(), out["period"].max(), freq="M")
         out = out.set_index("period").reindex(full).rename_axis("period").reset_index()
         for col in ("lines", "on_time_lines", "value", "on_time_value"):
@@ -280,6 +309,7 @@ class ServiceResult:
         out["otd_line_rate"] = np.where(out["lines"] > 0, out["on_time_lines"] / out["lines"], np.nan)
         out["otd_value_rate"] = np.where(out["value"] > 0, out["on_time_value"] / out["value"], np.nan)
         out["thin"] = out["lines"] < min_lines
+        out["partial"] = (out["period"] == horizon) & (as_of_ts < as_of_ts.to_period("M").end_time.normalize())
         return out[cols]
 
     # ── Attribution ──────────────────────────────────────────────────────────

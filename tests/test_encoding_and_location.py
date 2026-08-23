@@ -233,7 +233,7 @@ class TestLocationComesFromTheSourceWhereTheSourceHasOne:
     def test_a_purchase_history_keeps_its_own_plants(self, tmp_path):
         out = IngestBridge(verbose=False).load(self._files(tmp_path))
         assert sorted(out["po_history_df"]["location_id"].unique()) == \
-            ["PL20", "PL30", "PL40", "PL10"]
+            ["PL10", "PL20", "PL30", "PL40"]
 
     @pytest.mark.parametrize("doc_type", ["open_po", "open_so", "po_history",
                                           "sales_history", "inventory"])

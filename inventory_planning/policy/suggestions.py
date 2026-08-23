@@ -42,6 +42,7 @@ import pandas as pd
 from .parameters import ParameterSet, Rule
 from .should_be import ShouldBeCalculator, _z_from_service_level
 from ..ingest.encoding import write_csv
+from ..lot_sizing import economic_order_quantity
 
 DAYS_PER_MONTH = 30.0
 DAYS_PER_YEAR = 365.0
@@ -356,14 +357,22 @@ class SuggestionBuilder:
         # parameter file a week later.
         self._compiled = [r.as_rule() for r in self.rules]
 
-    def build(self, params: ParameterSet) -> SuggestionResult:
+    def build(self, params: ParameterSet,
+              recommendations: pd.DataFrame = None) -> SuggestionResult:
         """
         `params` is the resolved ParameterSet — it carries both the SKU attributes and
         the parameters currently in force, which is what the suggestions are compared
         against.
+
+        `recommendations` supplies the reorder point and order-up-to level the run
+        actually sized, so they land here as suggested min / max beside the planner's
+        own. That is the whole output for an item on (s, Q): the pipeline cannot watch
+        a position continuously, so what it has to give a low-value item is the setting
+        the ERP will run it on, not only this cycle's quantity.
         """
         df = params.frame.copy()
         notes: List[str] = []
+        df = self._attach_min_max(df, recommendations, notes)
 
         for col, default in (("lead_time_days", np.nan), ("lt_sigma_days", 0.0),
                              ("demand_mean", 0.0), ("demand_sigma", 0.0),
@@ -389,6 +398,32 @@ class SuggestionBuilder:
         return SuggestionResult(frame=self._select_columns(df), rules=self.rules,
                                 hits=hits, notes=notes)
 
+    @staticmethod
+    def _attach_min_max(df: pd.DataFrame, recommendations: pd.DataFrame,
+                        notes: List[str]) -> pd.DataFrame:
+        """Merge `suggested_min_qty` / `suggested_max_qty` from the planning run."""
+        wanted = ("suggested_min_qty", "suggested_max_qty")
+        if recommendations is None or "sku" not in getattr(recommendations, "columns", []):
+            for col in wanted:
+                df[col] = np.nan
+            return df
+
+        available = [c for c in wanted if c in recommendations.columns]
+        source = recommendations.drop_duplicates("sku").set_index("sku")
+        for col in wanted:
+            df[col] = (pd.to_numeric(df["sku"].map(source[col]), errors="coerce")
+                       if col in available else np.nan)
+
+        flat = df["suggested_max_qty"].notna() & df["suggested_min_qty"].notna() & np.isclose(
+            df["suggested_max_qty"].fillna(0), df["suggested_min_qty"].fillna(0))
+        if flat.any():
+            notes.append(
+                f"{int(flat.sum()):,} SKUs have max = min — no lot size applies to them "
+                f"(no unit cost for an EOQ, and no MOQ or order multiple stated), so the "
+                f"policy orders up to the reorder point"
+            )
+        return df
+
     # ── Economics: EOQ and the review period it implies ──────────────────────
 
     def _economics(self, df: pd.DataFrame, params: ParameterSet,
@@ -406,11 +441,8 @@ class SuggestionBuilder:
 
         annual_demand = (df["demand_mean"].fillna(0.0) * 12).clip(lower=0)
         unit_cost = df["unit_cost"]
-        holding_per_unit_year = unit_cost * holding_rate
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            eoq = np.sqrt(2 * annual_demand * order_cost / holding_per_unit_year)
-        eoq = pd.Series(eoq, index=df.index).replace([np.inf, -np.inf], np.nan)
+        eoq = economic_order_quantity(annual_demand, unit_cost, order_cost, holding_rate)
         df["eoq_qty"] = eoq.round(0)
 
         daily = annual_demand / DAYS_PER_YEAR
@@ -613,6 +645,7 @@ class SuggestionBuilder:
             # what the planner set by hand, and the gap to what the data supports
             "planner_safety_stock", "ss_vs_planner_qty", "ss_vs_planner_pct",
             "ss_vs_planner_value", "ss_verdict",
+            "suggested_min_qty", "suggested_max_qty",
             "planner_reorder_point", "planner_min_qty", "planner_max_qty",
             "planner_review_period_days", "planner_service_level", "planner_notes",
             # provenance

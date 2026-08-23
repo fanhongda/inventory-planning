@@ -136,39 +136,37 @@ class InventoryPlanner:
 
         `results` is the dict returned by `run_planning`.
         """
-        from .policy.assemble import build_sku_attributes
         from .policy.levers import LeverAnalyzer
-        from .policy.parameters import PlanningParameters
         from .policy.should_be import ShouldBeCalculator
         from .policy.suggestions import SuggestionBuilder
         from .policy.target import TargetPlanner
 
-        print("\n[7/7] Policy analysis — should-be, levers, target...")
+        print("\n[8/8] Policy analysis — should-be, levers, target...")
 
         inventory_df = consolidate_to_planning_grain(
             inventory_df, planning_location=self.inv_reader.location_id, verbose=False
         )
-        params_file = parameters_file or (self.config_dir / "planning_parameters.md")
-        planning_params = PlanningParameters(params_file)
-
-        attributes, crosscheck = build_sku_attributes(
-            classified_demand=results["classified_demand"],
-            supplier_lt=results.get("supplier_lt"),
-            inventory=inventory_df,
-            forecast_summary=results.get("forecast_summary"),
-            timeseries_meta=results.get("timeseries_meta"),
-            params=planning_params,
-            item_master=item_master_df if item_master_df is not None else results.get("item_master"),
-            planning_master=(planning_master_df if planning_master_df is not None
-                             else results.get("planning_master")),
-            po_history=results.get("po_history"),
-        )
-        if crosscheck.resolutions:
-            print()
-            print(crosscheck.summary())
-        resolved = planning_params.resolve(attributes)
-        print()
-        print(resolved.summary())
+        # The planning run already resolved these against the same file. Reusing them
+        # is not an optimisation — rebuilding would give the policy layer its own copy
+        # of every parameter, and the first time one of them drifted the report would
+        # disagree with the recommendation CSV a planner is holding.
+        attributes = results.get("sku_attributes")
+        resolved = results.get("parameters")
+        crosscheck = results.get("crosscheck")
+        if parameters_file is not None or attributes is None or resolved is None:
+            attributes, crosscheck, resolved, _ = self._resolve_policy(
+                classified_demand=results["classified_demand"],
+                supplier_lt=results.get("supplier_lt"),
+                inventory=inventory_df,
+                forecast_summary=results.get("forecast_summary"),
+                timeseries_meta=results.get("timeseries_meta"),
+                item_master=(item_master_df if item_master_df is not None
+                             else results.get("item_master")),
+                planning_master=(planning_master_df if planning_master_df is not None
+                                 else results.get("planning_master")),
+                po_history=results.get("po_history"),
+                parameters_file=parameters_file,
+            )
 
         calculator = ShouldBeCalculator(self.config_dir)
         should_be = calculator.calculate(resolved, actual=inventory_df)
@@ -183,7 +181,8 @@ class InventoryPlanner:
         # What the data says the parameters should be, next to what they are. Written
         # out, never applied — a parameter that changed because a script decided it
         # should is one nobody can defend in a review.
-        suggestions = SuggestionBuilder(self.config_dir).build(resolved)
+        suggestions = SuggestionBuilder(self.config_dir).build(
+            resolved, recommendations=results.get("recommendations"))
         print()
         print(suggestions.summary())
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -224,7 +223,8 @@ class InventoryPlanner:
 
         self._quality_log.append({
             "doc_type": "policy",
-            "file": str(params_file.name),
+            "file": str((parameters_file
+                         or (self.config_dir / "planning_parameters.md")).name),
             "rows_loaded": len(attributes),
             "issues": [str(h) for h in resolved.conflicts],
             "status": "WARNINGS" if resolved.conflicts else "OK",
@@ -556,7 +556,7 @@ class InventoryPlanner:
                   f"open order past due.")
 
         # Step 1: Demand time series + summary
-        print("\n[1/6] Building demand time series...")
+        print("\n[1/7] Building demand time series...")
         if timeseries_pivot is not None:
             ts = timeseries_pivot
             # Build demand summary from the pre-compiled pivot
@@ -568,7 +568,7 @@ class InventoryPlanner:
         print(f"      {len(ts.columns)} SKUs × {len(ts)} periods ({ts.index[0]} → {ts.index[-1]})")
 
         # Step 2: Supplier lead times
-        print("\n[2/6] Computing supplier lead times...")
+        print("\n[2/7] Computing supplier lead times...")
         supplier_lt = (
             self.po_reader.compute_supplier_lt(po_history_df)
             if po_history_df is not None and len(po_history_df)
@@ -581,7 +581,7 @@ class InventoryPlanner:
         )
 
         # Step 3: Demand classification
-        print("\n[3/6] Classifying demand (stocking policy + CV pattern)...")
+        print("\n[3/7] Classifying demand (stocking policy + CV pattern)...")
         classified = self.classifier.classify(demand_summary, ts)
         counts = classified["stocking_class"].value_counts().to_dict()
         pattern_counts = classified["demand_pattern"].value_counts().to_dict() if "demand_pattern" in classified.columns else {}
@@ -591,7 +591,7 @@ class InventoryPlanner:
         self._report_policy_suggestion(classified, planning_master_df)
 
         # Step 4: Forecast — must run before safety stock to supply forecast RMSE
-        print("\n[4/6] Forecasting demand (6 months)...")
+        print("\n[4/7] Forecasting demand (6 months)...")
         # MTS competes its models; MTO goes straight to Croston. The policy is the
         # ERP's, from the planner worksheet — not the pipeline's inferred class.
         policy = (planning_master_df[["sku", "stocking_policy"]]
@@ -607,28 +607,55 @@ class InventoryPlanner:
             # forecast_detail and forecast_<ts>.csv says which.
             print(f"      Model chosen per SKU — {model_counts}")
 
-        # Step 5: Safety stock — uses forecast RMSE from step 4 as σDL
-        print("\n[5/6] Calculating safety stock...")
-        ss_df = self.ss_calc.calculate(classified, supplier_lt,
-                                       forecast_summary=forecast_summary_df if not forecast_detail.empty else None)
+        # Step 5: Planning parameters and the policy each SKU is on.
+        #
+        # This runs before safety stock rather than after the plan because the review
+        # period is an input to both halves of the arithmetic. Resolving it afterwards
+        # is what left the recommender sizing orders on a hardcoded thirty days while
+        # the policy layer sized stock on R + LT.
+        print("\n[5/7] Resolving planning parameters & replenishment policy...")
+        open_so_summary = (
+            self.open_so_reader.backlog_summary(
+                open_so_df, as_of=as_of, horizon_days=self.backlog_horizon_days
+            )
+            if open_so_df is not None else None
+        )
+        attributes, crosscheck, resolved, profile = self._resolve_policy(
+            classified_demand=classified,
+            supplier_lt=supplier_lt,
+            inventory=inventory_df,
+            forecast_summary=forecast_summary_df if not forecast_detail.empty else None,
+            timeseries_meta=timeseries_meta,
+            item_master=item_master_df,
+            planning_master=planning_master_df,
+            po_history=po_history_df,
+            backlog=open_so_summary,
+        )
+        print()
+        print(profile.summary())
+
+        # Step 6: Safety stock — uses forecast RMSE from step 4 as σDL, over the
+        # exposure window the resolved review period implies.
+        print("\n[6/7] Calculating safety stock...")
+        ss_df = self.ss_calc.calculate(
+            classified, supplier_lt,
+            forecast_summary=forecast_summary_df if not forecast_detail.empty else None,
+            review_period_days=resolved.frame[["sku", "review_period_days"]]
+            if "review_period_days" in resolved.frame.columns else None,
+            exposure=str(resolved.convention("safety_stock_exposure", "review_plus_lt")),
+        )
         sigma_sources = ss_df["sigma_source"].value_counts().to_dict() if "sigma_source" in ss_df.columns else {}
         if sigma_sources:
             print(f"      σ source: {sigma_sources}")
 
         # Step 6: Effective inventory + projection + recommendations
-        print("\n[6/6] Projecting inventory & generating recommendations...")
+        print("\n[7/7] Projecting inventory & generating recommendations...")
         if open_po_df is not None:
             open_po_df = self.open_po_reader.fill_estimated_delivery(open_po_df, supplier_lt)
         open_po_summary = (
             self.open_po_reader.inbound_schedule(
                 open_po_df, as_of=as_of, horizon_days=self.recommender.horizon_days)
             if open_po_df is not None else None
-        )
-        open_so_summary = (
-            self.open_so_reader.backlog_summary(
-                open_so_df, as_of=as_of, horizon_days=self.backlog_horizon_days
-            )
-            if open_so_df is not None else None
         )
         eff_inv = self.inv_reader.effective_inventory(inventory_df, open_po_summary, supplier_lt)
         projection = self.projector.project(ss_df, eff_inv, open_po_summary)
@@ -648,7 +675,7 @@ class InventoryPlanner:
         forecast_summary = forecast_summary_df
         recommendations = self.recommender.recommend(
             projection, forecast_summary, open_so_summary, open_po_summary,
-            realization=realization,
+            realization=realization, parameters=resolved,
         )
 
         results = {
@@ -662,6 +689,10 @@ class InventoryPlanner:
             "forecast_detail": forecast_detail,
             "forecast_summary": forecast_summary,
             "recommendations": recommendations,
+            "sku_attributes": attributes,
+            "parameters": resolved,
+            "crosscheck": crosscheck,
+            "policy_profile": profile,
             "backlog_realization": realization,
             "inventory_consolidated": inventory_df,
             "item_master": item_master_df,
@@ -676,6 +707,49 @@ class InventoryPlanner:
         self._save_outputs(results)
         self._print_summary(recommendations)
         return results
+
+    def _resolve_policy(self, classified_demand, supplier_lt, inventory,
+                        forecast_summary=None, timeseries_meta=None,
+                        item_master=None, planning_master=None, po_history=None,
+                        backlog=None, parameters_file=None):
+        """
+        Build the per-SKU attribute frame, apply the rule engine, and profile the
+        replenishment policy each SKU ends up on.
+
+        One place, called once per run. The planning stage needs the review period to
+        size an order and the policy stage needs the same frame to say what stock ought
+        to be; deriving it twice is how the two come to disagree about a SKU nobody is
+        looking at.
+        """
+        from .policy.assemble import build_sku_attributes
+        from .policy.parameters import PlanningParameters
+        from .policy.profile import build_policy_profile
+
+        params_file = parameters_file or (self.config_dir / "planning_parameters.md")
+        planning_params = PlanningParameters(params_file)
+
+        attributes, crosscheck = build_sku_attributes(
+            classified_demand=classified_demand,
+            supplier_lt=supplier_lt,
+            inventory=inventory,
+            forecast_summary=forecast_summary,
+            timeseries_meta=timeseries_meta,
+            params=planning_params,
+            item_master=item_master,
+            planning_master=planning_master,
+            po_history=po_history,
+        )
+        if crosscheck.resolutions:
+            print()
+            print(crosscheck.summary())
+
+        resolved = planning_params.resolve(attributes)
+        print()
+        print(resolved.summary())
+
+        profile = build_policy_profile(resolved.frame, backlog=backlog,
+                                       inventory=inventory)
+        return attributes, crosscheck, resolved, profile
 
     @staticmethod
     def _fill_lead_time_from_masters(supplier_lt, skus, item_master_df, planning_master_df):
@@ -776,6 +850,10 @@ class InventoryPlanner:
         if len(sheet):
             write_csv(sheet, out / f"forecast_{ts_str}.csv")
         write_csv(results["recommendations"], out / f"purchase_recommendations_{ts_str}.csv")
+
+        profile = results.get("policy_profile")
+        if profile is not None and len(profile.frame):
+            write_csv(profile.frame, out / f"policy_profile_{ts_str}.csv")
 
         realization = results.get("backlog_realization")
         if realization is not None and len(realization.per_sku):

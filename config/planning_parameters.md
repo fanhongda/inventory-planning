@@ -46,7 +46,16 @@ days_per_year: 365
 
 ```yaml
 review_period_days: 30          # 默认月度 review
-replenishment_method: periodic  # periodic (R,S) | min_max (s,S) | reorder_point (s,Q)
+# 补货政策。决定订货量怎么算,不只是标签。
+#   periodic       (R, s, S)  每 R 天 review;IP <= s 才下单,订到 S。
+#                             s = (R+LT) 期间需求 + (R+LT) 期间安全库存
+#                             S = s + 批量(EOQ 经 order_multiple/min_order_qty 归整)
+#                             没有批量时 S = s,即订到 s —— 这是正确的退化,不是缺输入。
+#   reorder_point  (s, Q)     低值物料。s 同上,Q 由 EOQ 定。系统照常给出本期建议数量,
+#                             同时输出 min/max 参数交给 ERP 自己跑。
+#   make_to_order             不持有政策库存,只按已确认订单买。
+#   `min_max` 是 reorder_point 的旧名,仍可解析 —— 新规则请写 reorder_point。
+replenishment_method: periodic
 service_level: 0.95
 order_cost_usd: 350             # 每次下单的行政+跟单成本
 holding_cost_rate: 0.22         # 年持有成本率(资金+仓储+保险+呆滞)
@@ -113,12 +122,13 @@ date: 2026-08-02
 ```yaml
 scope: abc_class == "C" and unit_cost < 20
 set:
-  replenishment_method: min_max
+  replenishment_method: reorder_point
   review_period_days: 90
   service_level: 0.90
 rationale: >
-  低值物料的持有成本远低于管理成本,不值得频繁 review。min-max 由
-  EOQ 定批量,让系统自己跑,人工只看异常。
+  低值物料的持有成本远低于管理成本,不值得频繁 review。走 (s, Q):
+  s 照常由 (R+LT) 暴露期算,Q 由 EOQ 定,让系统自己跑,人工只看异常。
+  这类料仍旧出现在采购建议里并带数量,同时在参数输出里给出 min/max。
 owner: FHD
 date: 2026-08-02
 ```

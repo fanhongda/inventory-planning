@@ -65,9 +65,16 @@ class InventoryProjector:
     def project(self, safety_stock_df: pd.DataFrame, effective_inventory: pd.DataFrame,
                 open_po_df: pd.DataFrame) -> pd.DataFrame:
         """
-        should_be = demand_during_lt + safety_stock  (= ROP)
+        should_be = demand over the exposure window + safety_stock  (= ROP)
         surplus   = effective_position - should_be
         EXCESS    = DOS > excess_dos_threshold_days
+
+        The exposure window is R + LT under periodic review, which is what
+        `SafetyStockCalculator` puts in `demand_during_exposure`. An older frame that
+        only carries `demand_during_lt` still projects — against the lead time alone —
+        rather than failing, but the target it produces is then a different question
+        from the safety stock sitting next to it, and it will read as OK on items the
+        recommender is buying for.
         """
         # A left merge against a frame with repeated SKUs silently multiplies rows, and
         # the duplicates then carry the same open PO and the same backlog — which is how
@@ -89,7 +96,10 @@ class InventoryProjector:
         )
         df = self._attach_phasing(df, open_po_df)
 
-        df["should_be_inventory"] = df["demand_during_lt"] + df["safety_stock"]
+        exposure_demand = (df["demand_during_exposure"]
+                           if "demand_during_exposure" in df.columns
+                           else df["demand_during_lt"])
+        df["should_be_inventory"] = exposure_demand + df["safety_stock"]
         df["surplus_deficit"] = df["effective_position"] - df["should_be_inventory"]
 
         # Days of Supply — based on unconditional mean demand
@@ -200,7 +210,9 @@ class InventoryProjector:
         cols = [
             "sku", "location_id", "stocking_class", "service_level",
             "demand_mean_rolling", "wma_lead_time_days",
-            "safety_stock", "demand_during_lt", "should_be_inventory",
+            "safety_stock", "demand_during_lt", "demand_during_exposure",
+            "ss_exposure_days", "ss_exposure_basis", "review_period_days",
+            "should_be_inventory",
             "qty_on_hand", "qty_in_transit_adj", "total_open_po_qty", "effective_position",
             "surplus_deficit", "days_of_supply", "inventory_status",
             "on_hand_cover_days", "inbound_past_due_qty", "inbound_due_qty",

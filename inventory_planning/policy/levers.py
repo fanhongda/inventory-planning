@@ -28,6 +28,7 @@ import pandas as pd
 
 from .parameters import ParameterSet
 from .should_be import ShouldBeCalculator, ShouldBeResult
+from ..lot_sizing import economic_order_quantity
 
 # Levers are defined declaratively so adding one is a table entry, not a code path.
 # `apply` mutates a copy of the SKU frame; `cost` describes what it takes to get it.
@@ -433,13 +434,13 @@ class LeverAnalyzer:
         order_cost = float(params.defaults.get("order_cost_usd", 350))
         holding_rate = float(params.defaults.get("holding_cost_rate", 0.22))
         annual_demand = demand_mean * 12
-        holding_per_unit_year = float(unit_cost) * holding_rate
-        if holding_per_unit_year <= 0:
+        if float(unit_cost) * holding_rate <= 0:
             return None
 
-        eoq = float(np.sqrt(2 * annual_demand * order_cost / holding_per_unit_year))
+        eoq = float(economic_order_quantity(
+            [annual_demand], [unit_cost], order_cost, holding_rate).iloc[0])
         implied_order = demand_mean * review / 30.0
-        if implied_order <= 0 or eoq <= 0:
+        if implied_order <= 0 or not np.isfinite(eoq) or eoq <= 0:
             return None
 
         ratio = eoq / implied_order
@@ -460,18 +461,3 @@ class LeverAnalyzer:
             ),
         }
 
-
-def economic_order_quantity(
-    annual_demand: pd.Series, unit_cost: pd.Series, order_cost: float, holding_rate: float
-) -> pd.Series:
-    """
-    Classic EOQ: √(2·D·S / (H·C)).
-
-    Exposed separately because min-max policies genuinely do use it as the lot size —
-    the one place a planner orders to EOQ rather than to a cadence.
-    """
-    holding = pd.to_numeric(unit_cost, errors="coerce") * holding_rate
-    demand = pd.to_numeric(annual_demand, errors="coerce")
-    with np.errstate(divide="ignore", invalid="ignore"):
-        eoq = np.sqrt(2 * demand * order_cost / holding)
-    return pd.Series(eoq, index=demand.index).replace([np.inf, -np.inf], np.nan)

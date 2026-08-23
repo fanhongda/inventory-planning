@@ -72,48 +72,47 @@ Two smaller pieces left over from the supersede work:
   aggregation from the field's declared unit, and the rollup path should use the same
   rule.
 
-## Replenishment quantity (P0)
+## Replenishment quantity — what is left (P2)
 
-**The order quantity does not cover the lead time.** `lead_time` appears nowhere in
-`purchase_recommender.py`. The whole of it is:
+The order quantity now covers the lead time. `s = mu(R+LT) + SS(R+LT)`, the lot is EOQ
+raised to the MOQ and the order multiple, `S = s + lot`, and which arithmetic applies is
+decided per SKU by `replenishment_method` from the rule engine. `policy/profile.py`
+records the eight axes that decision rests on, with the evidence and the provenance
+behind each reading, and reports where the evidence disagrees with the rule rather than
+overwriting it. `analytics/safety_stock.py` sizes safety stock on the same R + LT
+exposure `should_be.py` always did, so the target stock and the order aiming at it no
+longer answer different questions.
 
-    gross_requirement = period_demand + safety_stock
-    net_requirement   = max(0, gross_requirement − effective_position)
+One correction to what this section used to predict: the gate was expected to produce
+*fewer* recommendation lines. It produces more, and larger ones. `IP <= s` was already
+implied by `net_requirement > 0`, so making it explicit changed nothing; what changed is
+that `s` now spans R + LT instead of thirty days, so more positions fall below it. That
+is the defect being fixed, not a side effect.
 
-`period_demand` is one horizon of demand, 30 days. So the buy covers the next month and
-the safety stock, and nothing covers the time the supplier takes to deliver. On a SKU
-with a 51.7-day lead time and 14,398 a month, the order is sized at ~14,398 where the
-review period plus the lead time asks for ~39,200 — under-ordered 2.7x.
+What remains:
 
-The pipeline already knows better in the other half of the arithmetic. `should_be.py`
-sizes safety stock on **R + LT** exposure, and that is a documented invariant with tests
-behind it. The order-up-to level should follow the same clock: **S = demand over
-(review period + lead time) + safety stock**, order = S − inventory position. Two
-definitions of the same exposure in one pipeline is the defect.
+- **The measured ordering cadence is still not offered as evidence for R.** R comes from
+  `review_period_days` in `config/planning_parameters.md` — a stated value, correctly,
+  because it is a decision rather than an observation. But `policy/cadence.py` measures
+  what the buyer actually does, and where the two disagree by a wide margin that is a
+  finding: either the rule is aspirational or the cadence is being overridden by
+  expediting. Report it beside the rule, on the same measured / stated / default ranking
+  the rest of the pipeline uses. Do not consume it.
+- **Slow movers are still sized on the Normal distribution.** MIT CTL §9 puts the
+  boundary at `mu(DL+R) < 10` units, below which Poisson is the right distribution and
+  the Normal understates the safety stock badly. The profile already records
+  `demand_continuity` per SKU, so the SKUs are identifiable; the arithmetic is not there.
+- **Only three of the five methods exist.** Periodic review, (s, Q) and order-on-demand
+  are implemented. Base stock — one-for-one replenishment — is a real policy for a very
+  high value, very short lead time item and is currently forced onto periodic review.
+  Single period (newsvendor) has no place in a rolling DC plan and is deliberately
+  absent; if a genuinely one-shot buy ever needs planning it needs the critical ratio,
+  not this pipeline.
 
-What is already right and should not be rebuilt:
-
-- **Backlog against forecast.** `period_demand = max(forecast, backlog_due × realization)`
-  — the larger of the two, never the sum, with the realization rate measured rather than
-  assumed. That is the rule "use backlog where it is reliable, the forecast where it is
-  not or where backlog is short", and it is implemented.
-- **The supply gap outranks it.** `EXPEDITE-INBOUND` is ranked ahead of the net
-  requirement on purpose: where the shelf runs dry before the next delivery, the order
-  already exists and a second one is not the answer. Any change here has to keep that
-  ordering.
-
-The open question is **what R is**, and it needs deciding before the arithmetic:
-
-- a fixed monthly cycle from config, or
-- `planner_review_period_days` from the planner worksheet — the field exists, is
-  carried into `sku_attributes`, and is used by the parameter *suggestions* but not by
-  the order quantity, or
-- the cadence `cadence.py` actually measures from PO history.
-
-They disagree per SKU, and the third is the only one that reflects how the buyer really
-orders. Suggest starting from the measured cadence and falling back to config, with the
-planner's figure reported as a comparison — the same ranking the rest of the pipeline
-uses for measured / stated / default.
+Explicitly decided and **not** to be built: inferring air versus sea freight to set the
+review period. There is no transport-mode field in any extract, and incoterm is not a
+proxy for one — EXW and FCA are mode-agnostic. Lengthening or shortening a review period
+for named materials is a rule the planner writes, which is what the rule engine is for.
 
 ## Smaller items
 

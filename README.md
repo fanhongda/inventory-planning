@@ -705,6 +705,11 @@ output/
 ├── parameter_suggestions_<ts>.csv       suggested parameters vs those in force, per SKU
 ├── suggested_rules_<ts>.md              the same, as paste-able planning_parameters.md rules
 ├── source_crosscheck_<ts>.csv           where two sources disagree, and by how much
+├── policy_profile_<ts>.csv              what each SKU *is* on eight axes — demand,
+│                                        lead time, review, locations, capacity,
+│                                        excess demand — the evidence behind each
+│                                        reading, and the replenishment policy it
+│                                        implies next to the one in force
 ├── supersessions_<ts>.csv               old item number -> new, and what each old
 │                                        number contributed to each document
 ├── purchase_recommendations_<ts>.csv

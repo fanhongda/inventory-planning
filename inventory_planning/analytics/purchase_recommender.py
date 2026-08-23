@@ -34,6 +34,26 @@ on that policy. An order-on-demand item holds no policy stock at all and buys ag
 firm backlog only. `replenishment_method` in `config/planning_parameters.md` decides
 which, per SKU, by rules a planner writes and can defend.
 
+## Where the order book sits, and why it is not in the position
+
+`effective_position` is on hand + in transit + open PO. It deliberately does **not**
+net out backorders, which is a departure from the textbook inventory position
+(IP = IOH + IOO − BO − CO, MIT CTL §10). The order book enters on the demand side
+instead, through `period_demand = max(forecast, backlog_due × realization)` — it raises
+the level being aimed at rather than lowering the position aiming at it.
+
+Doing both would buy the same demand twice, and the error would grow with how much
+backlog is carried, which is exactly when the buy matters most. One side or the other,
+and this pipeline chose the demand side because the forecast is fitted on shipments and
+those shipments came from backlog — so the two are already two estimates of one demand
+and belong in the same `max()`. This is a decision, not an oversight; changing it means
+changing forecast consumption at the same time.
+
+The one thing it leaves on the table: past-due backlog is demand already missed, and it
+reaches the requirement only through that `max()` rather than as a debt subtracted from
+the position. Where a planner wants it treated as an outstanding obligation in its own
+right, that is a separate change with `backlog_past_due_qty` as its input.
+
 `reorder_point` here is not `should_be_inventory` from the projection, and the two are
 meant to differ. `should_be_inventory` is the policy target implied by demand *history*;
 `reorder_point` is this cycle's trigger, built on the forecast and the order book in

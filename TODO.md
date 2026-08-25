@@ -114,6 +114,16 @@ review period. There is no transport-mode field in any extract, and incoterm is 
 proxy for one — EXW and FCA are mode-agnostic. Lengthening or shortening a review period
 for named materials is a rule the planner writes, which is what the rule engine is for.
 
+## Data layer (decided, not built)
+
+Where the inputs should live — an append-only typed store plus an editable overrides
+layer, rather than an editable SQL database of SAP reports. The decision, the Snowflake
+and SAP reasoning, and the coverage worksheet are in [DATA_LAYER.md](DATA_LAYER.md).
+
+Two items above depend on master data the worksheet locates: the P0 topology needs
+`MARD-INSME` / `SPEME` to tell quarantine from sellable, and the P1 phase-out cap needs
+`MARC-AUSDT` for the end date. Next action is filling in the worksheet, not writing code.
+
 ## Smaller items
 
 - `IFR` (item fill rate) service metric — `config/stocking_policy.json` documents

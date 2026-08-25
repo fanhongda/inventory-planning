@@ -555,6 +555,17 @@ class InventoryPlanner:
                   f"ago — not today. Scoring this extract against today would mark every "
                   f"open order past due.")
 
+        # The shape of what was loaded, before anything is computed on it. Printed
+        # first because every silent mapping failure this pipeline has produced was
+        # visible in these totals and invisible everywhere else.
+        from .reporting.intake_summary import summarise_intake
+        intake = summarise_intake({
+            "sales_history": sales_df, "po_history": po_history_df,
+            "open_so": open_so_df, "open_po": open_po_df, "inventory": inventory_df,
+        }, anchor=as_of)
+        print()
+        print(intake.summary())
+
         # Step 1: Demand time series + summary
         print("\n[1/7] Building demand time series...")
         if timeseries_pivot is not None:
@@ -667,6 +678,26 @@ class InventoryPlanner:
         # How much of the open order book actually ships. Measured, not assumed — the
         # recommender needs it to net backlog against the forecast rather than add the
         # two together and buy the same demand twice.
+        # When each order-on-demand SKU's purchase order has to be *placed* to meet the
+        # dates on the book. Needs the measured lead time and the resolved review
+        # period, so it is built here rather than beside the backlog summary.
+        mto_schedule = (
+            self.open_so_reader.order_by_schedule(
+                open_so_df, lead_times=resolved.frame, as_of=as_of,
+                review_period_days=float(
+                    pd.to_numeric(resolved.frame.get("review_period_days"),
+                                  errors="coerce").median()
+                ) if "review_period_days" in resolved.frame.columns
+                else self.recommender.horizon_days,
+            )
+            if open_so_df is not None else None
+        )
+        if mto_schedule is not None and len(mto_schedule):
+            late = int((mto_schedule["mto_order_past_due_qty"].fillna(0) > 0).sum())
+            if late:
+                print(f"      {late} SKUs have order lines whose order-by date has "
+                      f"already passed — lead time no longer recoverable")
+
         realization = self._estimate_realization(open_so_df, inventory_df, as_of)
         print()
         print(realization.summary())
@@ -676,6 +707,7 @@ class InventoryPlanner:
         recommendations = self.recommender.recommend(
             projection, forecast_summary, open_so_summary, open_po_summary,
             realization=realization, parameters=resolved,
+            mto_schedule=mto_schedule,
         )
 
         results = {
@@ -694,6 +726,7 @@ class InventoryPlanner:
             "crosscheck": crosscheck,
             "policy_profile": profile,
             "backlog_realization": realization,
+            "intake_summary": intake,
             "inventory_consolidated": inventory_df,
             "item_master": item_master_df,
             "planning_master": planning_master_df,

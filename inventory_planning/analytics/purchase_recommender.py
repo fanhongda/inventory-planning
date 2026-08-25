@@ -130,11 +130,17 @@ class PurchaseRecommender:
 
     def recommend(self, projection: pd.DataFrame, forecast_summary: pd.DataFrame,
                   open_so: pd.DataFrame, open_po_df: pd.DataFrame,
-                  realization=None, parameters: pd.DataFrame = None) -> pd.DataFrame:
+                  realization=None, parameters: pd.DataFrame = None,
+                  mto_schedule: pd.DataFrame = None) -> pd.DataFrame:
         """
         `realization` is a `RealizationResult` from `BacklogRealizationEstimator`.
         When absent, the backlog is taken at face value — an unmeasured discount is
         never applied silently.
+
+        `mto_schedule` is `OpenSOReader.order_by_schedule` — when each SKU's order has
+        to be *placed* to meet the dates on the book, given its lead time. It is what an
+        order-on-demand item is bought against; without it the order book is scoped to a
+        flat horizon and a long lead time goes unseen until it is too late to act on.
 
         `parameters` is the resolved per-SKU frame from `PlanningParameters.resolve`:
         review period, replenishment method, MOQ and order multiple, as the planner's
@@ -230,10 +236,22 @@ class PurchaseRecommender:
 
         df["order_quantity"] = self._order_quantity(df)
 
-        # For an order-on-demand SKU there is no policy stock to plan, so the buy is
-        # whatever the realizable order book needs beyond what is already on the way.
+        # ── What an order-on-demand item has to buy ───────────────────────────
+        #
+        # There is no policy stock to plan, so the buy is whatever the realizable order
+        # book needs beyond what is already on the way. The question is which part of
+        # the book counts, and the answer is not "the part wanted soon" — it is the part
+        # whose *order date* has arrived. Those differ by exactly the lead time, and on
+        # a long-lead-time item they differ by more than the horizon, which is how a
+        # line that needed ordering a fortnight ago reads as nothing to do.
+        df = self._attach_mto_schedule(df, mto_schedule)
+        df["mto_demand_qty"] = (
+            df["mto_actionable_qty"].where(df["mto_actionable_qty"].notna(),
+                                           df["backlog_due_qty"])
+            * df["backlog_realization_rate"]
+        ).round(1)
         df["backlog_shortfall"] = (
-            df["firm_demand_qty"] - df["available_supply"].fillna(0)
+            df["mto_demand_qty"] - df["available_supply"].fillna(0)
         ).clip(lower=0).round(1)
 
         def _action(row):
@@ -269,6 +287,8 @@ class PurchaseRecommender:
             "forecast_next_period", "forecast_avg_monthly", "forecast_horizon_qty",
             "backlog_qty", "backlog_due_qty", "backlog_past_due_qty",
             "backlog_realization_rate", "firm_demand_qty",
+            "mto_order_by", "mto_order_status", "mto_actionable_qty",
+            "mto_order_past_due_qty", "mto_demand_qty", "backlog_shortfall",
             "demand_basis", "demand_driver", "period_demand",
             "replenishment_method", "policy_source", "review_period_days",
             "wma_lead_time_days", "coverage_days", "coverage_basis",
@@ -364,6 +384,48 @@ class PurchaseRecommender:
             df["coverage_basis"] = np.where(lt.notna(), "review_plus_lt",
                                             "review_period_only")
         df["coverage_days"] = df["coverage_days"].fillna(float(self.horizon_days))
+        return df
+
+    _MTO_COLUMNS = ("mto_actionable_qty", "mto_order_past_due_qty",
+                    "mto_order_by", "mto_next_request")
+
+    @staticmethod
+    def _attach_mto_schedule(df: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
+        """
+        Merge the order-by schedule and state, per SKU, what it says about the deadline.
+
+        `mto_order_status` is the reading a buyer acts on:
+
+          order-past-due   the order date has gone. The customer date is already at
+                           risk and no amount of ordering today recovers the lead time.
+          order-now        the date falls inside this review period. Wait for the next
+                           review and it joins the row above.
+          scheduled        there is a commitment, but its order date is beyond this
+                           review. Nothing to do yet, and worth seeing that it exists.
+          none             no open book.
+
+        A frame with no schedule reports `unscoped` rather than `none`: the difference
+        between "no backlog" and "no visibility of when the backlog must be ordered" is
+        exactly what this column exists to keep.
+        """
+        if schedule is not None and "sku" in getattr(schedule, "columns", []):
+            keep = ["sku"] + [c for c in PurchaseRecommender._MTO_COLUMNS
+                              if c in schedule.columns]
+            df = df.merge(schedule[keep].drop_duplicates("sku"), on="sku", how="left")
+        for col in PurchaseRecommender._MTO_COLUMNS:
+            if col not in df.columns:
+                df[col] = pd.NaT if col in ("mto_order_by", "mto_next_request") else np.nan
+
+        has_schedule = df["mto_actionable_qty"].notna()
+        past_due = df["mto_order_past_due_qty"].fillna(0.0) > 0
+        actionable = df["mto_actionable_qty"].fillna(0.0) > 0
+        booked = df["backlog_qty"].fillna(0.0) > 0
+
+        df["mto_order_status"] = np.select(
+            [~has_schedule, past_due, actionable, booked],
+            ["unscoped", "order-past-due", "order-now", "scheduled"],
+            default="none",
+        )
         return df
 
     @staticmethod

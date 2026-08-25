@@ -82,6 +82,11 @@ class FxQuote:
     effective_from: pd.Timestamp
     rate: float
     source: str = ""
+    # A rate nobody measured. It converts, so the run completes and the figures are the
+    # right order of magnitude — but it is reported on every run that uses it, because
+    # a placeholder that goes unnoticed is the same failure as defaulting to 1.0, only
+    # harder to spot: the numbers look reasonable.
+    placeholder: bool = False
 
 
 class FxTable:
@@ -141,6 +146,10 @@ class FxTable:
     def _parse_rates(raw: Dict[str, Any]) -> Dict[str, List[FxQuote]]:
         quotes: Dict[str, List[FxQuote]] = {}
         for code, spec in raw.items():
+            # Every config file in this repo documents itself with `_`-prefixed keys.
+            # Reading one as a currency turns a comment into a crash three stages later.
+            if str(code).startswith("_"):
+                continue
             code = str(code).strip().upper()
             if isinstance(spec, (int, float)):
                 entries = [FxQuote(pd.Timestamp.min, float(spec), "flat")]
@@ -155,6 +164,7 @@ class FxTable:
                         pd.Timestamp.min if pd.isna(start) else start,
                         float(rate),
                         str(item.get("source", "")),
+                        bool(item.get("placeholder", False)),
                     ))
                 entries.sort(key=lambda q: q.effective_from)
             if entries:
@@ -179,6 +189,11 @@ class FxTable:
         # A row older than the earliest quote takes that quote rather than nothing:
         # an approximate rate on a 2018 line beats blanking eight years of history.
         return (applicable[-1] if applicable else entries[0]).rate
+
+    def is_placeholder(self, currency: str) -> bool:
+        """True when every quote for this code is a stand-in rather than a measurement."""
+        entries = self.quotes.get(str(currency).strip().upper())
+        return bool(entries) and all(q.placeholder for q in entries)
 
     def rate_series(self, currency: pd.Series, when: pd.Series = None) -> pd.Series:
         """Vectorised `rate_for` — NaN wherever the code has no quote."""
@@ -236,6 +251,8 @@ class ConversionReport:
     rows_rate_rejected: int = 0      # export carried a rate that was not one
     rows_unrated: int = 0            # currency present, no rate — money blanked
     unrated: Dict[str, int] = dc_field(default_factory=dict)
+    # code -> lines converted at a rate nobody measured
+    placeholder_rates: Dict[str, int] = dc_field(default_factory=dict)
     value_before: Dict[str, float] = dc_field(default_factory=dict)
     value_after: Dict[str, float] = dc_field(default_factory=dict)
     assumed_reporting_currency: bool = False
@@ -253,8 +270,28 @@ class ConversionReport:
         if self.skipped:
             return []
         if self.assumed_reporting_currency:
-            return [f"  {self.doc_type}: no currency column — "
-                    f"assumed already in {self.reporting_currency}"]
+            # The one assumption this module makes silently, and the one that burned a
+            # real run: a CNY standard-cost column with no currency field beside it was
+            # taken for USD, and every figure built on unit cost — annual value, ABC
+            # class, EOQ, the whole report — inherited the error with nothing to show
+            # for it. Say the fix, not just the assumption.
+            return [f"  ⚠ {self.doc_type}: no currency column — assumed already in "
+                    f"{self.reporting_currency}. If this document is not in "
+                    f"{self.reporting_currency}, declare it in the adapter "
+                    f"(`defaults: {{currency: XXX}}`); nothing downstream can tell."]
+
+        lines_out = self._converted_lines()
+        if self.placeholder_rates:
+            detail = ", ".join(f"{code} ({n:,} lines)"
+                               for code, n in sorted(self.placeholder_rates.items()))
+            lines_out.append(
+                f"      ⚠ {detail} converted at a placeholder rate — a stand-in, not a "
+                f"measured or published rate. The magnitude is right and the figure is "
+                f"not. Replace it in config/fx_rates.json."
+            )
+        return lines_out
+
+    def _converted_lines(self) -> List[str]:
 
         lines = [
             f"  {self.doc_type}: {self.rows_converted:,} of {self.rows_total:,} lines "
@@ -367,6 +404,13 @@ def convert_money(
     report.rows_converted = int((~unrated & ~domestic).sum())
     if report.rows_unrated:
         report.unrated = codes[unrated].value_counts().to_dict()
+
+    converted_codes = codes[~unrated & ~domestic]
+    if len(converted_codes):
+        report.placeholder_rates = {
+            code: int(n) for code, n in converted_codes.value_counts().items()
+            if table.is_placeholder(code)
+        }
 
     for col in money_columns:
         values = pd.to_numeric(df[col], errors="coerce")

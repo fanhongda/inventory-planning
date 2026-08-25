@@ -31,8 +31,28 @@
     "planning rates your finance team publishes, and date each revision."
   ],
 
+  "_placeholder_note": [
+    "CNY and SGD below are marked placeholder: true. They are stand-ins so a run",
+    "completes and the magnitudes are right — they are NOT measured or published",
+    "rates, and every run that uses one says so. Derive the real rate the way the",
+    "seeds above were derived: take an export line's transaction value and SAP's own",
+    "converted value, and use their ratio. Then drop the placeholder flag.",
+    "",
+    "A rate alone does not convert a document that has no currency column — that",
+    "file is assumed to be in the reporting currency. Declare its currency in the",
+    "adapter instead:  defaults: {currency: CNY}"
+  ],
+
   "rates": {
     "USD": 1.0,
+
+    "CNY": [
+      { "effective_from": "2018-01-01", "rate": 0.14, "source": "placeholder — not measured", "placeholder": true }
+    ],
+
+    "SGD": [
+      { "effective_from": "2018-01-01", "rate": 0.75, "source": "placeholder — not measured", "placeholder": true }
+    ],
 
     "GBP": [
       { "effective_from": "2018-01-01", "rate": 1.3229, "source": "seed — SAP booked rate, PL30 Jul 2026 open PO export" }

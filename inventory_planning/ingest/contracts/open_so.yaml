@@ -11,7 +11,11 @@ grain: sales_order_line
 # sales history — which happens whenever both come from one ERP report run with a
 # different filter, and is otherwise unresolvable.
 discriminator: "is_null(ship_date)"
-natural_key: [so_number, sku]
+# The position within the document leads the key: `sales_order_line` is counted in lines, and
+# two lines of one document for the same material are two rows, not a duplicate to
+# roll up. `sku` stays after it so the key degrades to the old one — and no further —
+# on the many exports that carry no position column.
+natural_key: [so_number, so_line_number, sku]
 capabilities: [commitment_signal, service_signal]
 
 fields:

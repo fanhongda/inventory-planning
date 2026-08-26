@@ -17,7 +17,11 @@ grain: po_receipt_line
 discriminator:
   - "not_null(receive_date)"
   - "open_qty == 0"
-natural_key: [po_number, sku, receive_date]
+# The position within the document leads the key: `po_receipt_line` is counted in lines, and
+# two lines of one document for the same material are two rows, not a duplicate to
+# roll up. `sku` stays after it so the key degrades to the old one — and no further —
+# on the many exports that carry no position column.
+natural_key: [po_number, po_line_number, sku, receive_date]
 capabilities: [lead_time_signal, order_pattern_signal, cost_signal]
 
 # A capability is only real if the field behind it arrived. An SAP purchase-record
@@ -91,8 +95,25 @@ fields:
       filtered differently, arrives with the same column, and had nowhere to put it.
       It also establishes po_line grain, so the rollup note can name what makes the
       source finer than the contract.
-    aliases: [line, line no, line number, po line, sched. line, schedule line,
-              item, item no., position, pos, line item, seq, sequence]
+    aliases: [line, line no, line number, po line,               item, item no., position, pos, line item, seq, sequence]
+
+  po_schedule_line:
+    type: string
+    role: identifier
+    description: >
+      Delivery schedule row within a PO line — EKET-ETENR. A *finer* grain than
+      po_line_number, not a synonym for it: one PO line with three delivery dates is
+      three schedule rows, and the declared grain counts lines, not rows.
+
+      It used to be an alias of po_line_number, where the two competed for whichever
+      column the profile happened to favour. On a full export `Item` won; on a two-row
+      sample of that same export `Item` was constant and `Sched. Line` won, so the same
+      report keyed on two different columns depending on how much of it you had. A key
+      that moves is not a key. Giving the schedule line a field of its own settles it,
+      and `registry._detect_grain` already looks for this name when working out what
+      makes a frame finer than its contract — it just had nothing to find.
+    aliases: [sched. line, schedule line, schedule line no, sched line, etenr,
+              delivery schedule line, schedule no]
 
   po_date:
     type: date

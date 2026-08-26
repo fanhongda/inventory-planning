@@ -16,7 +16,11 @@ grain: po_line
 # of being a purchase order when it is evidence of nothing of the kind, and a
 # sales-order export started routing here.
 discriminator: "is_null(receive_date)"
-natural_key: [po_number, sku]
+# The position within the document leads the key: `po_line` is counted in lines, and
+# two lines of one document for the same material are two rows, not a duplicate to
+# roll up. `sku` stays after it so the key degrades to the old one — and no further —
+# on the many exports that carry no position column.
+natural_key: [po_number, po_line_number, sku]
 capabilities: [inbound_signal, order_pattern_signal]
 
 # An open-PO extract has to say something about *openness*. Without one of these it
@@ -149,7 +153,25 @@ fields:
       number while other systems use it for the material. Which one wins is decided
       by the data profile, not by alias order.
     aliases: [line, line no, line number, po line, item, item no., position, pos,
-              line item, seq, sequence, sched. line, schedule line]
+              line item, seq, sequence]
+
+  po_schedule_line:
+    type: string
+    role: identifier
+    description: >
+      Delivery schedule row within a PO line — EKET-ETENR. A *finer* grain than
+      po_line_number, not a synonym for it: one PO line with three delivery dates is
+      three schedule rows, and the declared grain counts lines, not rows.
+
+      It used to be an alias of po_line_number, where the two competed for whichever
+      column the profile happened to favour. On a full export `Item` won; on a two-row
+      sample of that same export `Item` was constant and `Sched. Line` won, so the same
+      report keyed on two different columns depending on how much of it you had. A key
+      that moves is not a key. Giving the schedule line a field of its own settles it,
+      and `registry._detect_grain` already looks for this name when working out what
+      makes a frame finer than its contract — it just had nothing to find.
+    aliases: [sched. line, schedule line, schedule line no, sched line, etenr,
+              delivery schedule line, schedule no]
 
   order_qty:
     type: decimal

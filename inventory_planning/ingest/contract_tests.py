@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .contract import DocContract, SEVERITY_ERROR, SEVERITY_WARN
+from .contract import DocContract, KeyStatus, SEVERITY_ERROR, SEVERITY_WARN
 from .expressions import Expression, ExpressionError
 from .profiler import TableProfile
 
@@ -80,6 +80,11 @@ class ContractTestReport:
     results: List[TestResult] = dc_field(default_factory=list)
     adapter_name: str = ""
     checked_at: str = dc_field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    # How much of the natural key survived the mapping. Not an assertion — the rows
+    # are perfectly plannable on a degraded key — so it is not one of `results` and
+    # does not count towards the warning tally. A fact store reads it to decide
+    # whether a later correction could be matched back to one row.
+    key_status: Optional[KeyStatus] = None
 
     @property
     def errors(self) -> List[TestResult]:
@@ -107,6 +112,8 @@ class ContractTestReport:
             f"{len(self.results) - len(self.errors) - len(self.warnings)} passed, "
             f"{len(self.warnings)} warned, {len(self.errors)} failed",
         ]
+        if self.key_status is not None and not self.key_status.storable:
+            lines.append(f"    · {self.key_status.describe()} — not storable")
         for r in self.results:
             if not r.passed:
                 lines.append(str(r))
@@ -120,6 +127,13 @@ class ContractTestReport:
             "row_count": self.row_count,
             "status": self.status,
             "checked_at": self.checked_at,
+            "key": {
+                "declared": self.key_status.declared,
+                "present": self.key_status.present,
+                "missing": self.key_status.missing,
+                "verdict": self.key_status.verdict,
+                "storable": self.key_status.storable,
+            } if self.key_status is not None else None,
             "failures": [
                 {
                     "layer": r.layer,
@@ -157,6 +171,7 @@ class ContractTester:
             row_count=len(df),
             adapter_name=adapter_name,
         )
+        report.key_status = contract.key_status(df.columns)
         report.results.extend(self._structural(df, contract, profile))
         report.results.extend(self._semantic(df, contract))
         report.results.extend(self._reconciliation(df, contract, profile, baseline))
@@ -218,19 +233,22 @@ class ContractTester:
         count. When it does not, the file is at a finer grain than declared and needs
         a rollup — silently summing it later would double-count supply.
         """
-        key = [k for k in contract.natural_key if k in df.columns]
+        status = contract.key_status(df.columns)
+        key = status.present
         if not key:
+            # Reported as a pass until now, which read as "the grain is fine" when what
+            # happened is that nothing was looked at. Every measure downstream is summed
+            # on this grain, so an unverified one is a warning, not a clean bill.
             return TestResult(
                 layer=LAYER_STRUCTURAL,
                 name=f"grain:{contract.grain}",
-                passed=True,
+                passed=False,
                 severity=SEVERITY_WARN,
-                detail=f"natural key {contract.natural_key} unavailable — grain unverified",
+                detail=f"{status.describe()} — grain unverified",
             )
 
         distinct = len(df.drop_duplicates(subset=key))
         duplicates = len(df) - distinct
-        ratio = duplicates / len(df) if len(df) else 0.0
 
         return TestResult(
             layer=LAYER_STRUCTURAL,
@@ -238,7 +256,7 @@ class ContractTester:
             passed=duplicates == 0,
             severity=SEVERITY_WARN,
             detail=(
-                f"{duplicates:,} rows share a natural key ({'+'.join(key)}) — "
+                f"{duplicates:,} rows share {status.describe()} — "
                 f"actual grain is finer than declared '{contract.grain}'. "
                 f"Set rollup_to in the adapter, or measures will be double-counted."
             ) if duplicates else "",

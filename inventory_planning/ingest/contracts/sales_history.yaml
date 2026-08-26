@@ -17,7 +17,11 @@ discriminator: "not_null(ship_date)"
 # history it actually was scored 68%.
 identifying_any:
   - [customer, so_number, ship_date, customer_request_date, amount, unit_price]
-natural_key: [so_number, sku, ship_date]
+# The position within the document leads the key: `sales_order_line` is counted in lines, and
+# two lines of one document for the same material are two rows, not a duplicate to
+# roll up. `sku` stays after it so the key degrades to the old one — and no further —
+# on the many exports that carry no position column.
+natural_key: [so_number, so_line_number, sku, ship_date]
 capabilities: [demand_signal, customer_dimension, revenue_dimension]
 
 value_domains:

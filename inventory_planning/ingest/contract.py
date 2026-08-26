@@ -212,6 +212,56 @@ class ValueDomain:
         return sorted(out)
 
 
+KEY_COMPLETE = "complete"
+KEY_DEGRADED = "degraded"
+KEY_UNAVAILABLE = "unavailable"
+
+
+@dataclass
+class KeyStatus:
+    """
+    How much of a contract's natural key actually survived into a frame.
+
+    Two different questions get asked of a key and they deserve different answers:
+
+      *Can this be planned?*  Yes, on a degraded key. A sales history with no order
+      number still forecasts — the rollup sums the lines and the demand curve is
+      intact, which is why every call site filters the key down to what is present
+      rather than refusing.
+
+      *Can this be stored?*  Only on a complete key. A store that supersedes a row
+      by its key cannot tell which of two rows a correction replaces when the part
+      that separated them never mapped. The failure is silent: the correction lands
+      as a second row and both are current.
+
+    So the degradation is preserved rather than prevented, and named. `storable` is
+    the gate a fact store applies; nothing in the planning path consults it.
+    """
+
+    declared: List[str] = dc_field(default_factory=list)
+    present: List[str] = dc_field(default_factory=list)
+    missing: List[str] = dc_field(default_factory=list)
+
+    @property
+    def verdict(self) -> str:
+        if not self.present:
+            return KEY_UNAVAILABLE
+        return KEY_DEGRADED if self.missing else KEY_COMPLETE
+
+    @property
+    def storable(self) -> bool:
+        """Whether this key identifies a row well enough to supersede it later."""
+        return self.verdict == KEY_COMPLETE
+
+    def describe(self) -> str:
+        if self.verdict == KEY_UNAVAILABLE:
+            return f"natural key {self.declared} — none of it mapped"
+        if self.verdict == KEY_COMPLETE:
+            return f"natural key {'+'.join(self.present)} — complete"
+        return (f"natural key {'+'.join(self.present)} — degraded, "
+                f"{'+'.join(self.missing)} did not map")
+
+
 @dataclass
 class DocContract:
     """Contract for one document type (open_po, inventory, ...)."""
@@ -334,6 +384,15 @@ class DocContract:
 
     def field(self, name: str) -> Optional[FieldContract]:
         return self.fields.get(name)
+
+    def key_status(self, columns) -> KeyStatus:
+        """Which parts of the natural key are present among `columns`."""
+        available = set(columns)
+        return KeyStatus(
+            declared=list(self.natural_key),
+            present=[k for k in self.natural_key if k in available],
+            missing=[k for k in self.natural_key if k not in available],
+        )
 
     def alias_index(self) -> Dict[str, str]:
         """Normalized alias -> canonical field name, for lexical detection."""

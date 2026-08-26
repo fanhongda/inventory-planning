@@ -211,4 +211,8 @@ class TestEndToEnd:
         }
         assert all(b["valid_time"] for b in batches)
         assert all(b["run_id"] == planner.run.run_id for b in batches)
+        # The parameter identity on a batch has to be the one the manifest records, or
+        # the two cannot be joined — which is the only reason it is on the batch.
+        assert all(b["config_fingerprint"] == manifest["config_fingerprint"]
+                   for b in batches)
         assert list((planner.store.history_dir).glob("*/snapshot_*.json"))

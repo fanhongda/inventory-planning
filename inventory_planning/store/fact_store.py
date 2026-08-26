@@ -150,13 +150,17 @@ class FactStore:
             }, indent=2), encoding="utf-8")
             return
         try:
-            found = json.loads(self.schema_path.read_text(encoding="utf-8"))["schema_version"]
-        except (OSError, json.JSONDecodeError, KeyError) as exc:
+            # The int() conversion belongs inside the guard: a version that is present
+            # but not integer-like — "v2", null, an object — used to raise ValueError or
+            # TypeError past this handler, so a caller catching StoreSchemaError (a
+            # migration tool, first of all) would not catch it.
+            found = int(json.loads(self.schema_path.read_text(encoding="utf-8"))["schema_version"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise StoreSchemaError(
                 f"{self.schema_path} is unreadable ({exc}). Refusing to write into a "
                 f"store whose layout cannot be confirmed."
             ) from exc
-        if int(found) != SCHEMA_VERSION:
+        if found != SCHEMA_VERSION:
             raise StoreSchemaError(
                 f"store at {self.root} is schema v{found}; this code writes v{SCHEMA_VERSION}. "
                 f"Migrate it, or point ${'INVENTORY_PLANNING_STORE'} elsewhere."
@@ -235,13 +239,25 @@ class FactStore:
         batch_id = f"{now.strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:6]}"
         path = self.batch_path(doc_type, batch_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Written under a temporary name and renamed once it is whole, so a failure
+        # partway — a full volume, an interrupt — leaves nothing behind. The store's
+        # invariant is that the ledger describes what is on disk, and a truncated file
+        # no line refers to breaks it in the direction a future reader would notice
+        # last: globbing the facts directory would pick it up as data.
+        staged = path.with_suffix(".parquet.partial")
         try:
-            frame.to_parquet(path, index=False)
+            frame.to_parquet(staged, index=False)
         except ImportError as exc:
+            staged.unlink(missing_ok=True)
             raise StoreUnavailable(
                 f"parquet support missing ({exc}). Install pyarrow, or the store cannot "
                 f"keep the column types that are the reason it is not CSV."
             ) from exc
+        except Exception:
+            staged.unlink(missing_ok=True)
+            raise
+        staged.replace(path)
 
         record = BatchRecord(
             batch_id=batch_id,
@@ -251,6 +267,7 @@ class FactStore:
             rows=len(frame),
             source_name=source_name,
             source_sha=sha,
+            config_fingerprint=config_fingerprint,
             content_key=key,
             run_id=run_id,
             key_verdict=key_verdict,
@@ -259,7 +276,13 @@ class FactStore:
             written_by=written_by,
             path=str(path.relative_to(self.root)),
         )
-        self.ledger.append(record)
+        try:
+            self.ledger.append(record)
+        except OSError:
+            # The other direction of the same invariant: a file with no line describing
+            # it is litter, a line describing a file that is not there is a broken read.
+            path.unlink(missing_ok=True)
+            raise
         return record
 
     # ── Reading ──────────────────────────────────────────────────────────────

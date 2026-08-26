@@ -51,6 +51,10 @@ class BatchRecord:
     # bytes observed to still hold a week later is a new observation, not a duplicate.
     # So: source bytes + the config that transformed them + the moment they describe.
     content_key: Optional[str] = None
+    # The readable half of `content_key`: which parameter set transformed the source
+    # into the frame stored here. Kept in the open so a batch can be joined back to the
+    # run manifest that carries the same value, rather than only compared inside a hash.
+    config_fingerprint: Optional[str] = None
     run_id: Optional[str] = None
     # From the contract tests. A batch loaded on a partial key is kept and marked, not
     # refused: it is a perfectly good record of what the file said. What it cannot do is

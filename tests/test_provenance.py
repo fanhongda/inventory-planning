@@ -151,13 +151,29 @@ class TestConfigFingerprint:
         after = _manifest(config_dir=cfg)
         assert before.config_fingerprint != after.config_fingerprint
 
-    def test_the_rules_in_force_are_part_of_it(self, tmp_path):
+    def test_recording_rules_does_not_move_it(self, tmp_path):
+        """
+        It used to. The rules are parsed well after the shadow write has stamped
+        batches with this value, so a fingerprint that included them was a different
+        number before and after — and every batch carried one that appeared nowhere in
+        the manifest.
+        """
         cfg = tmp_path / "config"; cfg.mkdir()
         (cfg / "stocking_policy.json").write_text('{"a": 1}', encoding="utf-8")
-        one, two = _manifest(config_dir=cfg), _manifest(config_dir=cfg)
-        one.record_rules(["R-001"])
-        two.record_rules(["R-001", "R-002"])
-        assert one.config_fingerprint != two.config_fingerprint
+        m = _manifest(config_dir=cfg)
+        before = m.config_fingerprint
+        m.record_rules(["R-001", "R-002"])
+        assert m.config_fingerprint == before
+        assert m.rule_ids == ["R-001", "R-002"]
+
+    def test_editing_the_rules_file_still_moves_it(self, tmp_path):
+        """Which is why dropping rule_ids from the hash covers nothing less."""
+        cfg = tmp_path / "config"; cfg.mkdir()
+        (cfg / "planning_parameters.md").write_text("rule_id: R-001\n", encoding="utf-8")
+        before = _manifest(config_dir=cfg).config_fingerprint
+        (cfg / "planning_parameters.md").write_text("rule_id: R-001\nrule_id: R-002\n",
+                                                    encoding="utf-8")
+        assert _manifest(config_dir=cfg).config_fingerprint != before
 
     def test_a_missing_config_directory_is_a_note_not_a_failure(self, tmp_path):
         m = _manifest(config_dir=tmp_path / "nope")

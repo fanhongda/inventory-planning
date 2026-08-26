@@ -94,6 +94,22 @@ class TestSchemaVersion:
         with pytest.raises(StoreSchemaError):
             FactStore(root)
 
+    @pytest.mark.parametrize("stamp", ['{"schema_version": "v2"}',
+                                       '{"schema_version": null}',
+                                       '{"schema_version": {"a": 1}}'])
+    def test_a_version_that_is_not_a_number_is_a_schema_error(self, tmp_path, stamp):
+        """
+        `int(found)` sat outside the guard, so these raised ValueError or TypeError
+        past it — invisible to anything catching StoreSchemaError, a migration tool
+        first of all. The existing unreadable-stamp test missed it by using text that
+        fails JSON parsing one line earlier.
+        """
+        root = tmp_path / "store"
+        FactStore(root)
+        (root / "_schema_version.json").write_text(stamp, encoding="utf-8")
+        with pytest.raises(StoreSchemaError):
+            FactStore(root)
+
 
 class TestWriting:
     def test_the_types_survive(self, store, frame):
@@ -167,6 +183,12 @@ class TestBatchIdentity:
         assert first is not None and second is not None
         assert len(store.batches("open_po")) == 2
 
+    def test_the_parameter_set_is_recorded_readably_not_only_hashed(self, store, frame):
+        """So a batch can be joined back to the run manifest carrying the same value."""
+        store.write_batch("open_po", frame, valid_time="2026-08-25",
+                          source_sha="abc", config_fingerprint="cfg1")
+        assert store.batches("open_po")[0]["config_fingerprint"] == "cfg1"
+
     def test_all_three_the_same_is_a_duplicate(self, store, frame):
         store.write_batch("open_po", frame, valid_time="2026-08-25",
                           source_sha="abc", config_fingerprint="cfg1")
@@ -203,6 +225,30 @@ class TestFrameHash:
         b.loc[200, "qty"] = 99.0
         store.write_batch("inventory", a, valid_time="2026-08-25")
         assert store.write_batch("inventory", b, valid_time="2026-08-25") is not None
+
+
+class TestABatchIsWholeOrAbsent:
+    def test_a_failed_write_leaves_nothing_behind(self, store, frame, monkeypatch):
+        """
+        The file used to be written under its final name before the ledger line was
+        appended, so a write that failed partway left a truncated parquet no line
+        referred to — invisible to `batches()` and picked up as data by anything that
+        globs the facts directory instead.
+        """
+        def boom(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(type(frame), "to_parquet", boom, raising=False)
+        with pytest.raises(OSError):
+            store.write_batch("inventory", frame, valid_time="2026-08-25")
+
+        assert store.batches("inventory") == []
+        assert list((store.facts_dir / "inventory").glob("*")) == []
+
+    def test_a_successful_write_leaves_no_temporary(self, store, frame):
+        batch = store.write_batch("inventory", frame, valid_time="2026-08-25")
+        written = sorted((store.facts_dir / "inventory").iterdir())
+        assert [f.name for f in written] == [f"{batch.batch_id}.parquet"]
 
 
 class TestTheLedgerIsAppendOnly:

@@ -223,10 +223,20 @@ class RunManifest:
 
     @property
     def config_fingerprint(self) -> str:
-        """The parameters and rules, which is what a scenario varies."""
+        """
+        The parameters, which is what a scenario varies.
+
+        Over the config *files* only, deliberately. `rule_ids` used to be mixed in as
+        well, which made this a moving value: the rules are parsed in `_resolve_policy`,
+        long after the shadow write has already stamped batches with the fingerprint,
+        so every batch carried a value that appeared nowhere in the manifest and could
+        never be joined back to it. Nothing was covered by including them either —
+        `planning_parameters.md` is itself one of the hashed files, so adding, removing
+        or editing a rule moves this fingerprint through the file digest. `rule_ids`
+        stays recorded, as the readable form of what that digest stood for.
+        """
         return _sha256_of(
-            [f"{name}:{digest}" for name, digest in sorted(self.config_files.items())]
-            + ["rules:" + ",".join(sorted(self.rule_ids))]
+            f"{name}:{digest}" for name, digest in sorted(self.config_files.items())
         )[:16]
 
     @property

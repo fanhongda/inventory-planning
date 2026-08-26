@@ -150,26 +150,39 @@ the store already has its gate recorded before it exists. Nothing here can fail 
 a missing git binary, an unreadable config, an input with no file behind it are each
 recorded as unknown.
 
-**Step 3 — the store**, on a branch behind a PR:
+**Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the
+root (`--store` / `$INVENTORY_PLANNING_STORE` / `$XDG_DATA_HOME` / `~/.local/share`),
+`ledger.py` is the append-only batch record, `fact_store.py` writes parquet under
+`<root>/facts/<doc_type>/<batch_id>.parquet`. Parquet rather than CSV because the store
+sits exactly where the type damage happens — a CSV round trip turns
+`000000000000123456` back into `123456`, which is the failure `normalize:
+material_number` exists to undo.
 
-- Move it outside the repository. `INVENTORY_PLANNING_STORE`, defaulting under
-  `XDG_DATA_HOME`. Not a convenience — the store is the one thing here that is *not*
-  regenerable, and inside the repo it is one `git clean -fdx` from gone, while a fresh
-  clone or a cloud session starts empty and reports that as normal.
-- **Close the `history/` split.** `feedback/snapshot.py` computes
-  `output_dir.parent / "history"`, so `--output output` (the CLI default) writes to a
-  git-**tracked** `history/` while `--output output/real` writes to a gitignored
-  `output/history/`. There are 2 snapshots in the first and 223 in the second, and
-  `feedback/drift.py` reads the second. The default is the branch that commits data.
-  Nothing real has leaked — both tracked snapshots are `SKU-001`-style sample runs — but
-  a real extract run with default arguments would push per-SKU planning parameters to
-  GitHub.
-- `_schema_version` in the store, checked at startup, refusing rather than guessing. Git
-  cannot reach a store outside the repo, but a code upgrade can still change what the
-  bytes mean, and that failure is silent.
-- **Shadow write first**: the pipeline keeps reading files, the store is written and read
-  by nobody. History not collected cannot be recovered, so writing starts before reading
-  does; the merge to `main` lands while it still changes nothing.
+Each batch carries both timestamps. `valid_time` comes from `latest_observed_date` —
+the newest date the data itself carries, a property of the content, unlike an mtime that
+a copy rewrites — and is refused rather than guessed when there is no anchor.
+`transaction_time` is the load. Re-loading the same bytes is a no-op, and a void appends
+a line rather than rewriting one.
+
+The `history/` split is closed: `SnapshotSaver` takes an explicit `history_root` and the
+orchestrator resolves it to the store, so the location no longer depends on the shape of
+`--output`. The two snapshots that were tracked at the repository root are untracked and
+`history/` is ignored; they stay on disk because `feedback.loss` reads a snapshot by
+path. The 223 under `output/history/` are untouched and still readable the same way.
+
+**Nothing reads the store yet, deliberately.** That is what makes this safe to merge:
+the pipeline goes on reading its files, and history starts accumulating now because
+history not collected cannot be recovered. What remains of the rollout:
+
+- **Phase two** — read from the store behind a flag, and compare a run's outputs field
+  by field against the file path.
+- **Phase three** — flip the default; keep the file path one release longer.
+- **Migration** — a `_schema_version` bump needs somewhere for migrations to live. There
+  is a version and a refusal, and no migration path yet; the first bump has to bring
+  one.
+- **Per-document `valid_time`.** One run anchor stands in for all five documents today.
+  An inventory snapshot date that differs from the sales anchor is real, and belongs
+  with the merge interface below rather than with a guess here.
 
 Then the Snowflake merge interface — `plan_merge` / `apply`, never a single `sync`, with
 the classification counts shown before anything is written. Those counts are the

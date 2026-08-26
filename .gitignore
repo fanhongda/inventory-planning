@@ -12,6 +12,14 @@ build/
 .venv/
 venv/
 
+# Planning snapshots that predate the fact store. `feedback/snapshot.py` derived this
+# path from `output_dir.parent`, so `--output output` — the CLI default — wrote here,
+# into a tracked directory, while `--output output/real` wrote to the ignored
+# `output/history/`. Two homes for one series, and the default was the committing one.
+# Snapshots now go to the fact store, outside the working tree; these are untracked
+# rather than deleted because `feedback.loss` still reads a snapshot by path.
+history/
+
 # Outputs (every run is reproducible from its inputs — don't commit)
 #
 # These used to carry `!output/supplier_params.csv` negations, intending to version

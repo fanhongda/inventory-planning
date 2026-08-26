@@ -163,12 +163,13 @@ class TestForecaster:
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
 class TestEndToEnd:
-    def test_full_pipeline(self):
+    def test_full_pipeline(self, tmp_path):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         planner = InventoryPlanner(
             config_dir=CONFIG_DIR,
             output_dir=OUTPUT_DIR,
             interactive=False,
+            store_root=tmp_path / "store",
         )
         sales_df,   _ = planner.load_sales_history(SAMPLE_DIR / "sales_history.csv")
         po_hist_df, _ = planner.load_po_history(SAMPLE_DIR / "po_history.csv")
@@ -201,3 +202,13 @@ class TestEndToEnd:
         assert all(i["sha256"] for i in manifest["inputs"])
         assert manifest["outputs"]
         assert manifest["input_fingerprint"] and manifest["config_fingerprint"]
+
+        # The run retained its facts, and the snapshot went to the store rather than
+        # to a directory derived from --output.
+        batches = planner.store.batches()
+        assert {b["doc_type"] for b in batches} == {
+            "sales_history", "po_history", "open_so", "open_po", "inventory"
+        }
+        assert all(b["valid_time"] for b in batches)
+        assert all(b["run_id"] == planner.run.run_id for b in batches)
+        assert list((planner.store.history_dir).glob("*/snapshot_*.json"))

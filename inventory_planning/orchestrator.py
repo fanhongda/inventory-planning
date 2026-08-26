@@ -35,7 +35,7 @@ class InventoryPlanner:
     """
 
     def __init__(self, config_dir: Union[str, Path] = None, output_dir: Union[str, Path] = None,
-                 interactive: bool = True):
+                 interactive: bool = True, store_root: Union[str, Path] = None):
         base = Path(__file__).parents[1]
         self.config_dir = Path(config_dir) if config_dir else base / "config"
         self.output_dir = Path(output_dir) if output_dir else base / "output"
@@ -49,6 +49,8 @@ class InventoryPlanner:
         # here rather than at save time so the config is fingerprinted before anything
         # has had a chance to be edited mid-run.
         self.run = RunManifest.begin(config_dir=self.config_dir, output_dir=self.output_dir)
+        self._store = None             # built on first use; see `store`
+        self.store_root = store_root   # None -> $INVENTORY_PLANNING_STORE, then XDG
 
         # Readers
         self.sales_reader   = SalesHistoryReader(self.config_dir)
@@ -383,6 +385,87 @@ class InventoryPlanner:
     # Phase 1b: Contract-driven intake (preferred)
     # ------------------------------------------------------------------
 
+    @property
+    def store(self):
+        """
+        The fact store, or None when it cannot be opened.
+
+        Built lazily and never allowed to raise into the pipeline. A store on a schema
+        this code does not understand, an unwritable directory, a missing parquet
+        library: each is a warning and a run that still produces a plan. The store is
+        written by this phase and read by nothing, so its absence costs history and
+        costs no correctness.
+        """
+        if self._store is not None:
+            return self._store or None
+        try:
+            from .store import FactStore
+            self._store = FactStore(self.store_root)
+            for note in self._store.notes:
+                print(f"  Note: {note}")
+        except Exception as e:
+            print(f"  Warning: fact store unavailable ({e}) — planning continues, "
+                  f"nothing is being retained")
+            self._store = False
+        return self._store or None
+
+    def _shadow_write(self, frames: dict, valid_time) -> None:
+        """
+        Write this run's facts to the store, which nothing reads yet.
+
+        Phase one of three. The pipeline goes on reading its files; only when a run's
+        outputs can be shown identical from either source does anything start reading
+        the store. Writing starts first regardless, because history not collected
+        cannot be recovered later — every week spent waiting for the read path is a
+        week of positions that can never be reconstructed.
+
+        `valid_time` is the run's anchor: the newest date the data itself carries, from
+        `latest_observed_date`. That is a property of the content, unlike a file's
+        mtime, which a copy or a re-download rewrites while the data keeps describing
+        whatever it described. Per-document valid times — an inventory snapshot date
+        that differs from the sales anchor — belong with the merge interface, which
+        needs a reviewed plan in front of a human anyway.
+        """
+        store = self.store
+        if store is None:
+            return
+        if valid_time is None:
+            print("  Note: no date anchor in the data — nothing retained, because a "
+                  "batch with a guessed valid_time is worse than no batch")
+            return
+
+        by_source = {i.doc_type: i for i in self.run.inputs}
+        seen_notes = len(store.notes)
+        written = 0
+        for doc_type, frame in frames.items():
+            if frame is None or not len(frame):
+                continue
+            record = by_source.get(doc_type)
+            try:
+                batch = store.write_batch(
+                    doc_type=doc_type,
+                    frame=frame,
+                    valid_time=valid_time,
+                    source_name=record.name if record else "",
+                    source_sha=record.sha256 if record else None,
+                    run_id=self.run.run_id,
+                    key_verdict=record.key_verdict if record else None,
+                    storable=record.storable if record else None,
+                    written_by="pipeline",
+                )
+            except Exception as e:
+                print(f"  Warning: {doc_type} not retained ({e})")
+                continue
+            if batch is not None:
+                written += 1
+        if written:
+            print(f"  Retained: {written} batch(es) as of {valid_time} -> {store.root}")
+        # A run that retained nothing is the normal case for a re-run of the same
+        # extract, and saying so is the difference between "already have this" and a
+        # store that has quietly stopped working.
+        for note in store.notes[seen_notes:]:
+            print(f"  Note: {note}")
+
     def load_all(
         self,
         paths: list,
@@ -578,6 +661,11 @@ class InventoryPlanner:
         }, anchor=as_of)
         print()
         print(intake.summary())
+
+        self._shadow_write({
+            "sales_history": sales_df, "po_history": po_history_df,
+            "open_so": open_so_df, "open_po": open_po_df, "inventory": inventory_df,
+        }, valid_time=as_of)
 
         # Step 1: Demand time series + summary
         print("\n[1/7] Building demand time series...")
@@ -909,7 +997,11 @@ class InventoryPlanner:
         # Save planning snapshot for next-month feedback comparison
         try:
             policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text(encoding="utf-8"))
-            snapshot_path = SnapshotSaver().save(results, policy_cfg, out)
+            store = self.store
+            snapshot_path = SnapshotSaver().save(
+                results, policy_cfg, out,
+                history_root=store.history_dir if store is not None else None,
+            )
             print(f"  Snapshot saved:   {snapshot_path.name}")
         except Exception as e:
             print(f"  Warning: snapshot save failed ({e})")

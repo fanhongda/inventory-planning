@@ -137,13 +137,18 @@ between a sample and its parent export; and `KeyStatus` separates *plannable* �
 degraded key still forecasts, and must keep doing so — from *storable*, which needs a
 complete one.
 
-**Step 2 — `run_id` and a run registry.** A run identity binding *(fact as-of, parameter
-version, config hash, code sha) → outputs*. This one binding is what four separate wants
-reduce to: drift is one entity across runs, scenario is one set of facts across parameter
-versions, feedback learning is a run's decisions against later facts, and a policy UI is
-a **diff of two runs** rather than a state view — `policy/parameters.py` already counts
-per-rule hits and skip reasons, then prints them and drops them. Verifiable in a single
-run, so it goes to `main` directly.
+**Step 2 — `run_id` and a run registry. Done.** `provenance.py` records what a run
+read, what it resolved and what code ran, and `RunRegistry` keeps a manifest per run
+plus an append-only index under `<output>/runs/`. Two fingerprints carry the weight:
+`input_fingerprint` over the source files, `config_fingerprint` over the config files
+and the rule ids in force. `compare()` uses them to name *why* two runs differ —
+`scenario` when only the parameters moved, `new_data` when only the facts did,
+`identical`, and `mixed` when more than one axis moved. That last verdict is the point
+of the exercise: a policy UI must refuse to attribute a difference when the facts moved
+underneath it too. The manifest also carries each input's key verdict from step 1, so
+the store already has its gate recorded before it exists. Nothing here can fail a run —
+a missing git binary, an unreadable config, an input with no file behind it are each
+recorded as unknown.
 
 **Step 3 — the store**, on a branch behind a PR:
 

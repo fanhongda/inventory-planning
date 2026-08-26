@@ -190,3 +190,14 @@ class TestEndToEnd:
         # Output files created
         assert (OUTPUT_DIR / "supplier_params.csv").exists()
         assert (OUTPUT_DIR / "sku_planning_params.csv").exists()
+
+        # The run recorded what produced those files
+        from inventory_planning.provenance import RunRegistry
+        manifest = RunRegistry(OUTPUT_DIR).get(planner.run.run_id)
+        assert manifest is not None
+        assert {i["doc_type"] for i in manifest["inputs"]} == {
+            "sales_history", "po_history", "open_so", "open_po", "inventory"
+        }
+        assert all(i["sha256"] for i in manifest["inputs"])
+        assert manifest["outputs"]
+        assert manifest["input_fingerprint"] and manifest["config_fingerprint"]

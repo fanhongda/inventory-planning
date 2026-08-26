@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .feedback.snapshot import SnapshotSaver
+from .provenance import RunManifest, RunRegistry
 from .readers.sales_history_reader import SalesHistoryReader
 from .readers.po_history_reader import POHistoryReader
 from .readers.open_so_reader import OpenSOReader
@@ -44,6 +45,10 @@ class InventoryPlanner:
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
         self._fx = None                # set by load_all(); which money was restated, and what could not be
+        # Identity for this run: what it read, what it resolved, what code ran. Started
+        # here rather than at save time so the config is fingerprinted before anything
+        # has had a chance to be edited mid-run.
+        self.run = RunManifest.begin(config_dir=self.config_dir, output_dir=self.output_dir)
 
         # Readers
         self.sales_reader   = SalesHistoryReader(self.config_dir)
@@ -75,31 +80,37 @@ class InventoryPlanner:
     # ------------------------------------------------------------------
 
     def load_sales_history(self, path: Union[str, Path]):
+        self.run.record_input(path, doc_type="sales_history")
         df, report = self.sales_reader.read(path, interactive=self.interactive)
         self._check_quality(report)
         return df, report
 
     def load_po_history(self, path: Union[str, Path]):
+        self.run.record_input(path, doc_type="po_history")
         df, report = self.po_reader.read(path, interactive=self.interactive)
         self._check_quality(report)
         return df, report
 
     def load_open_so(self, path: Union[str, Path]):
+        self.run.record_input(path, doc_type="open_so")
         df, report = self.open_so_reader.read(path, interactive=self.interactive)
         self._check_quality(report)
         return df, report
 
     def load_open_po(self, path: Union[str, Path]):
+        self.run.record_input(path, doc_type="open_po")
         df, report = self.open_po_reader.read(path, interactive=self.interactive)
         self._check_quality(report)
         return df, report
 
     def load_inventory(self, path: Union[str, Path]):
+        self.run.record_input(path, doc_type="inventory")
         df, report = self.inv_reader.read(path, interactive=self.interactive)
         self._check_quality(report)
         return df, report
 
     def load_timeseries(self, path: Union[str, Path], rolling_months: int = 36):
+        self.run.record_input(path, doc_type="demand_timeseries")
         """Load a pre-compiled wide-format time series file."""
         pivot, meta, report = self.ts_reader.read(
             path, rolling_months=rolling_months, interactive=self.interactive
@@ -406,6 +417,8 @@ class InventoryPlanner:
         self._intake = inputs.pop("_intake", None)
         self._intake_plan = inputs.pop("_intake_plan", None)
         self._fx = inputs.pop("_fx", None)
+        if self._intake is not None:
+            self.run.record_intake(self._intake)
 
         self._write_supersession_record()
 
@@ -760,6 +773,7 @@ class InventoryPlanner:
 
         params_file = parameters_file or (self.config_dir / "planning_parameters.md")
         planning_params = PlanningParameters(params_file)
+        self.run.record_rules(r.rule_id for r in planning_params.rules)
 
         attributes, crosscheck = build_sku_attributes(
             classified_demand=classified_demand,
@@ -900,7 +914,30 @@ class InventoryPlanner:
         except Exception as e:
             print(f"  Warning: snapshot save failed ({e})")
 
+        self._record_run(results, ts_str)
+
         print(f"\n  Outputs saved to: {out}")
+
+    def _record_run(self, results: dict, ts_str: str) -> None:
+        """
+        Bind this run's outputs to the facts, parameters and code behind them.
+
+        Wrapped because provenance must never be able to fail the run it documents —
+        an unwritable registry is worth a warning, not a lost plan.
+        """
+        try:
+            for path in sorted(self.output_dir.glob(f"*_{ts_str}.*")):
+                self.run.record_output(path)
+            for name in ("supplier_params.csv", "sku_planning_params.csv"):
+                path = self.output_dir / name
+                if path.exists():
+                    self.run.record_output(path)
+            manifest_path = RunRegistry(self.output_dir).save(self.run)
+            print()
+            print(self.run.summary())
+            print(f"    manifest {manifest_path.name}")
+        except Exception as e:
+            print(f"  Warning: run manifest not written ({e})")
 
     def _print_summary(self, recommendations: pd.DataFrame) -> None:
         print("\n" + "="*60)

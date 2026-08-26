@@ -50,21 +50,61 @@ class StoreUnavailable(RuntimeError):
 
 
 def _sha256_frame(frame) -> str:
-    """A content hash of the canonical frame, for batches with no file behind them."""
+    """
+    A content hash of the canonical frame, for batches with no file behind them.
+
+    Every row, through pandas' own row hasher. The first version hashed the column
+    names, the row count and `str(frame.head(50).to_dict())`, which agreed on two
+    frames differing only below row 50 — so a corrected extract with one quantity fixed
+    at row 200 was dropped as already stored. `str()` of a dict of values is also not a
+    stable serialisation across pandas versions, and this project runs pandas 3 in
+    development against pandas 2 in production, so the same frame could hash two ways
+    depending on where it was written.
+    """
+    import pandas as pd
+
     h = hashlib.sha256()
     h.update(",".join(map(str, frame.columns)).encode("utf-8"))
     h.update(str(len(frame)).encode("utf-8"))
     try:
-        h.update(str(frame.head(50).to_dict()).encode("utf-8"))
+        rows = pd.util.hash_pandas_object(frame, index=False)
+        h.update(rows.to_numpy().tobytes())
     except Exception:
-        pass
+        # A column pandas cannot hash (a nested object, say). Fall back to a full
+        # per-column string pass rather than to a partial one — a hash that silently
+        # covers part of the frame is what this function was fixed for.
+        for column in frame.columns:
+            h.update(frame[column].astype(str).str.cat(sep="\x00").encode("utf-8"))
     return h.hexdigest()
+
+
+def _content_key(source_sha: str, config_fingerprint: str, valid_time: str) -> str:
+    """What makes a batch this batch. See `BatchRecord.content_key`."""
+    return hashlib.sha256(
+        "\x00".join([source_sha or "", config_fingerprint or "", valid_time or ""])
+        .encode("utf-8")
+    ).hexdigest()
 
 
 def _as_iso_date(value) -> str:
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     return str(value)
+
+
+def history_root(explicit=None) -> Path:
+    """
+    Where planning snapshots go, resolved without opening the store.
+
+    Path resolution cannot fail; only the schema check can. Deriving the snapshot
+    location from a live `FactStore` therefore meant that a store this code refuses to
+    open — a future schema, an unwritable directory — sent snapshots back to
+    `output_dir.parent / "history"`, which is the split this change exists to close.
+    The series would then straddle two directories and `feedback.drift` would silently
+    compare across a gap.
+    """
+    root, _ = resolve_store_root(explicit)
+    return root / HISTORY_DIRNAME
 
 
 class FactStore:
@@ -153,6 +193,7 @@ class FactStore:
         valid_time,
         source_name: str = "",
         source_sha: str = None,
+        config_fingerprint: str = None,
         run_id: str = None,
         key_verdict: str = None,
         storable: bool = None,
@@ -164,6 +205,11 @@ class FactStore:
         `valid_time` is required and never defaulted to now: the moment data describes
         is a fact about the data, and the moment it was loaded is already recorded
         separately.
+
+        `config_fingerprint` joins the source bytes and the as-of date in deciding
+        whether this batch is already stored. The frame written here is the *canonical*
+        one, so the same file transformed under a different FX table is different
+        content and must be storable beside the first.
         """
         if valid_time is None:
             raise ValueError(
@@ -174,11 +220,14 @@ class FactStore:
             return None
 
         sha = source_sha or _sha256_frame(frame)
-        already = self.ledger.has_source(doc_type, sha)
+        valid = _as_iso_date(valid_time)
+        key = _content_key(sha, config_fingerprint, valid)
+        already = self.ledger.has_content(doc_type, key)
         if already:
             self.notes.append(
                 f"{doc_type}: already stored as batch {already['batch_id']} "
-                f"({already['transaction_time'][:16]}) — not written again"
+                f"({already['transaction_time'][:16]}) — same source, same parameters, "
+                f"same as-of date, not written again"
             )
             return None
 
@@ -197,11 +246,12 @@ class FactStore:
         record = BatchRecord(
             batch_id=batch_id,
             doc_type=doc_type,
-            valid_time=_as_iso_date(valid_time),
+            valid_time=valid,
             transaction_time=now.isoformat(timespec="seconds"),
             rows=len(frame),
             source_name=source_name,
             source_sha=sha,
+            content_key=key,
             run_id=run_id,
             key_verdict=key_verdict,
             storable=storable,

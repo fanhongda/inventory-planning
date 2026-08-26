@@ -12,6 +12,7 @@ no-op rather than a second copy.
 """
 
 import json
+import pathlib
 from datetime import datetime
 
 import pandas as pd
@@ -139,6 +140,71 @@ class TestWriting:
         assert batch.key_verdict == "degraded"
 
 
+class TestBatchIdentity:
+    """
+    Deduping on the source bytes alone was wrong in both directions: it dropped a
+    re-export of unchanged data at a later as-of date, and it dropped a re-run of the
+    same file after a parameter change. The frame stored is the canonical one, and the
+    source bytes do not determine it.
+    """
+
+    def test_the_same_file_at_a_later_as_of_date_is_a_new_observation(self, store, frame):
+        """Open POs unchanged for a week is evidence, not a duplicate."""
+        first = store.write_batch("open_po", frame, valid_time="2026-08-25",
+                                  source_sha="abc", config_fingerprint="cfg1")
+        second = store.write_batch("open_po", frame, valid_time="2026-09-01",
+                                   source_sha="abc", config_fingerprint="cfg1")
+        assert first is not None and second is not None
+        assert [b["valid_time"] for b in store.batches("open_po")] == \
+            ["2026-08-25", "2026-09-01"]
+
+    def test_the_same_file_under_changed_parameters_is_different_content(self, store, frame):
+        """A corrected FX rate makes the canonical frame different bytes."""
+        first = store.write_batch("open_po", frame, valid_time="2026-08-25",
+                                  source_sha="abc", config_fingerprint="fx_old")
+        second = store.write_batch("open_po", frame, valid_time="2026-08-25",
+                                   source_sha="abc", config_fingerprint="fx_new")
+        assert first is not None and second is not None
+        assert len(store.batches("open_po")) == 2
+
+    def test_all_three_the_same_is_a_duplicate(self, store, frame):
+        store.write_batch("open_po", frame, valid_time="2026-08-25",
+                          source_sha="abc", config_fingerprint="cfg1")
+        again = store.write_batch("open_po", frame, valid_time="2026-08-25",
+                                  source_sha="abc", config_fingerprint="cfg1")
+        assert again is None
+        assert len(store.batches("open_po")) == 1
+
+
+class TestFrameHash:
+    def test_it_reads_past_the_first_fifty_rows(self):
+        """It hashed `head(50)`, so a correction at row 200 was dropped as a duplicate."""
+        import pandas as pd
+        from inventory_planning.store.fact_store import _sha256_frame
+
+        a = pd.DataFrame({"sku": [f"S{i}" for i in range(300)], "qty": [1.0] * 300})
+        b = a.copy()
+        b.loc[200, "qty"] = 99.0
+        assert _sha256_frame(a) != _sha256_frame(b)
+
+    def test_an_identical_frame_hashes_the_same(self):
+        import pandas as pd
+        from inventory_planning.store.fact_store import _sha256_frame
+
+        a = pd.DataFrame({"sku": ["A", "B"], "qty": [1.0, 2.0]})
+        assert _sha256_frame(a) == _sha256_frame(a.copy())
+
+    def test_a_corrected_row_is_stored_rather_than_swallowed(self, store):
+        """The end of the path: no source_sha, so the frame hash is the identity."""
+        import pandas as pd
+
+        a = pd.DataFrame({"sku": [f"S{i}" for i in range(300)], "qty": [1.0] * 300})
+        b = a.copy()
+        b.loc[200, "qty"] = 99.0
+        store.write_batch("inventory", a, valid_time="2026-08-25")
+        assert store.write_batch("inventory", b, valid_time="2026-08-25") is not None
+
+
 class TestTheLedgerIsAppendOnly:
     def test_voiding_appends_rather_than_rewrites(self, store, frame):
         batch = store.write_batch("inventory", frame, valid_time="2026-08-25")
@@ -177,6 +243,22 @@ class TestHistoryHasOneHome:
     def test_it_hangs_off_the_store_not_the_output_directory(self, store):
         assert store.history_dir == store.root / "history"
 
+    def test_it_resolves_without_opening_the_store(self, tmp_path):
+        """
+        Path resolution cannot fail; only the schema check can. A store this code
+        refuses to open used to send snapshots back to `output_dir.parent / history`,
+        reopening the split across exactly the runs where the store was broken.
+        """
+        from inventory_planning.store.fact_store import history_root
+
+        root = tmp_path / "store"
+        FactStore(root)
+        (root / "_schema_version.json").write_text(json.dumps({"schema_version": 99}),
+                                                   encoding="utf-8")
+        with pytest.raises(StoreSchemaError):
+            FactStore(root)
+        assert history_root(root) == root / "history"
+
     def test_the_saver_writes_where_it_is_told(self, tmp_path):
         out = tmp_path / "out"; out.mkdir()
         history = tmp_path / "elsewhere"
@@ -188,3 +270,46 @@ class TestHistoryHasOneHome:
         out = tmp_path / "runs" / "out"; out.mkdir(parents=True)
         path = SnapshotSaver().save({}, {}, out)
         assert (tmp_path / "runs" / "history") in path.parents
+
+
+class TestWhatTheRunRetains:
+    """
+    The store has to hold what the source said, not what planning needed.
+
+    `run_planning` collapses the inventory to one row per SKU before it does anything
+    else — correctly, since every join downstream is on `sku` alone. Retaining that
+    collapsed frame put 140 units in location `01` when 100 were sellable in `01` and
+    40 were quarantined in `02`, against a contract whose natural key is
+    `[sku, location_id]`. Nothing later can undo it: the quantities are summed and only
+    the location *codes* survive, as a string.
+    """
+
+    def test_the_inventory_is_retained_before_its_locations_are_collapsed(self, tmp_path):
+        from inventory_planning.orchestrator import InventoryPlanner
+
+        captured = {}
+        planner = InventoryPlanner(output_dir=tmp_path / "out", interactive=False,
+                                   store_root=tmp_path / "store")
+        planner._shadow_write = lambda frames, valid_time: captured.update(frames)
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        sample = root / "sample_data"
+        sales, _ = planner.load_sales_history(sample / "sales_history.csv")
+        po_hist, _ = planner.load_po_history(sample / "po_history.csv")
+        open_so, _ = planner.load_open_so(sample / "open_so.csv")
+        open_po, _ = planner.load_open_po(sample / "open_po.csv")
+        inventory, _ = planner.load_inventory(sample / "inventory.csv")
+
+        # Same stock, split across a sellable location and a quarantine one.
+        quarantined = inventory.copy()
+        quarantined["location_id"] = "02"
+        quarantined["qty_on_hand"] = 7.0
+        inventory = inventory.assign(location_id="01")
+        two_location = pd.concat([inventory, quarantined], ignore_index=True)
+
+        planner.run_planning(sales, po_hist, open_so, open_po, two_location)
+
+        retained = captured["inventory"]
+        assert len(retained) == len(two_location)
+        assert set(retained["location_id"]) == {"01", "02"}
+        assert (retained[retained["location_id"] == "02"]["qty_on_hand"] == 7.0).all()

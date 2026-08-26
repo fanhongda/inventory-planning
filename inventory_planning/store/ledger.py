@@ -45,6 +45,12 @@ class BatchRecord:
     rows: int
     source_name: str = ""
     source_sha: Optional[str] = None
+    # What makes this batch *this* batch. Not the source bytes: the frame stored is the
+    # canonical one, so the same file read under a different FX table or a different
+    # incoterm rule is different content and has to be storable alongside. And the same
+    # bytes observed to still hold a week later is a new observation, not a duplicate.
+    # So: source bytes + the config that transformed them + the moment they describe.
+    content_key: Optional[str] = None
     run_id: Optional[str] = None
     # From the contract tests. A batch loaded on a partial key is kept and marked, not
     # refused: it is a perfectly good record of what the file said. What it cannot do is
@@ -128,16 +134,28 @@ class BatchLedger:
         return record
 
     def has_source(self, doc_type: str, source_sha: str) -> Optional[Dict[str, Any]]:
-        """
-        Whether these exact bytes were already loaded for this document type.
-
-        Loading the same file twice is the most ordinary mistake there is, and without
-        this it produces a duplicate batch that every later as-of read has to
-        disambiguate for no reason.
-        """
+        """Any batch of this document type that came from these bytes."""
         if not source_sha:
             return None
         for entry in self.batches(doc_type=doc_type):
             if entry.get("source_sha") == source_sha:
+                return entry
+        return None
+
+    def has_content(self, doc_type: str, content_key: str) -> Optional[Dict[str, Any]]:
+        """
+        Whether this exact batch is already stored.
+
+        Deduping on the source bytes alone was wrong in two directions. It dropped a
+        re-export of unchanged data at a later `valid_time`, which is a new observation
+        — evidence the position still held — and it dropped a re-run of the same file
+        after a config change, silently keeping the frame built under the old FX table
+        while the run itself used the new one. Both are the same mistake: the stored
+        frame is the canonical one, and the source bytes do not determine it.
+        """
+        if not content_key:
+            return None
+        for entry in self.batches(doc_type=doc_type):
+            if entry.get("content_key") == content_key:
                 return entry
         return None

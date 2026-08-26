@@ -448,6 +448,7 @@ class InventoryPlanner:
                     valid_time=valid_time,
                     source_name=record.name if record else "",
                     source_sha=record.sha256 if record else None,
+                    config_fingerprint=self.run.config_fingerprint,
                     run_id=self.run.run_id,
                     key_verdict=record.key_verdict if record else None,
                     storable=record.storable if record else None,
@@ -641,6 +642,16 @@ class InventoryPlanner:
         # single-node and every join downstream is on `sku` alone, so a SKU held in two
         # locations would fan out into two planning rows that each match the same open
         # PO and the same backlog — one saying pull in, the other saying push out.
+        # Kept before the collapse. `consolidate_to_planning_grain` sums storage
+        # locations into one row per SKU, which is right for planning and destroys the
+        # only record of where the stock actually was: the surviving `location_id` is
+        # the first code seen, so 100 sellable in `01` plus 40 quarantined in `02`
+        # becomes 140 in `01`. Retaining that would put a fabricated location on every
+        # stored row — against a contract whose natural key is `[sku, location_id]` —
+        # and would discard exactly the per-location detail the topology work in
+        # TODO.md is waiting on. History not collected cannot be recovered later, which
+        # is the whole argument for writing the store before anything reads it.
+        inventory_as_read = inventory_df
         inventory_df = consolidate_to_planning_grain(
             inventory_df, planning_location=self.inv_reader.location_id
         )
@@ -664,7 +675,8 @@ class InventoryPlanner:
 
         self._shadow_write({
             "sales_history": sales_df, "po_history": po_history_df,
-            "open_so": open_so_df, "open_po": open_po_df, "inventory": inventory_df,
+            "open_so": open_so_df, "open_po": open_po_df,
+            "inventory": inventory_as_read,
         }, valid_time=as_of)
 
         # Step 1: Demand time series + summary
@@ -997,10 +1009,10 @@ class InventoryPlanner:
         # Save planning snapshot for next-month feedback comparison
         try:
             policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text(encoding="utf-8"))
-            store = self.store
+            from .store.fact_store import history_root
             snapshot_path = SnapshotSaver().save(
                 results, policy_cfg, out,
-                history_root=store.history_dir if store is not None else None,
+                history_root=history_root(self.store_root),
             )
             print(f"  Snapshot saved:   {snapshot_path.name}")
         except Exception as e:

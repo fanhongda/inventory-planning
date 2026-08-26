@@ -114,15 +114,72 @@ review period. There is no transport-mode field in any extract, and incoterm is 
 proxy for one — EXW and FCA are mode-agnostic. Lengthening or shortening a review period
 for named materials is a rule the planner writes, which is what the rule engine is for.
 
-## Data layer (decided, not built)
+## Data layer (P1 — step 1 done)
 
-Where the inputs should live — an append-only typed store plus an editable overrides
-layer, rather than an editable SQL database of SAP reports. The decision, the Snowflake
-and SAP reasoning, and the coverage worksheet are in [DATA_LAYER.md](DATA_LAYER.md).
+Where the inputs live, and where each run's decisions go. The full reasoning is in
+[DATA_LAYER.md](DATA_LAYER.md); this is the work that follows from it, in order.
 
-Two items above depend on master data the worksheet locates: the P0 topology needs
-`MARD-INSME` / `SPEME` to tell quarantine from sellable, and the P1 phase-out cap needs
-`MARC-AUSDT` for the end date. Next action is filling in the worksheet, not writing code.
+The shape it settled on is **an append-only bitemporal fact store plus an editable
+overrides layer**, not an editable SQL database of ERP reports. Taking "create, update,
+delete on a fact" case by case, none of them needs a row updated in place: a bad import
+voids a batch, an amended document is a new batch, a delivery date confirmed by phone is
+*new evidence* belonging in overrides rather than a correction to a record that was
+never wrong, and a genuine erasure rewrites a batch under approval. Three kinds of table
+follow, with three key disciplines — facts keyed on `natural_key` + `valid_time` +
+`batch_id`, parameters on entity + `effective_from`, decisions on `run_id` + entity.
+
+**Step 1 — the natural key. Done.** As-of semantics rest entirely on being able to tell
+that two rows are the same row, and the key could not. Every part but `sku` was optional,
+every call site reduced the key to whatever had mapped, and an unverifiable grain was
+reported as a pass. Fixed: the document line is part of the key for the four line-grain
+contracts; `po_schedule_line` has a field of its own, so the key column stops moving
+between a sample and its parent export; and `KeyStatus` separates *plannable* — a
+degraded key still forecasts, and must keep doing so — from *storable*, which needs a
+complete one.
+
+**Step 2 — `run_id` and a run registry.** A run identity binding *(fact as-of, parameter
+version, config hash, code sha) → outputs*. This one binding is what four separate wants
+reduce to: drift is one entity across runs, scenario is one set of facts across parameter
+versions, feedback learning is a run's decisions against later facts, and a policy UI is
+a **diff of two runs** rather than a state view — `policy/parameters.py` already counts
+per-rule hits and skip reasons, then prints them and drops them. Verifiable in a single
+run, so it goes to `main` directly.
+
+**Step 3 — the store**, on a branch behind a PR:
+
+- Move it outside the repository. `INVENTORY_PLANNING_STORE`, defaulting under
+  `XDG_DATA_HOME`. Not a convenience — the store is the one thing here that is *not*
+  regenerable, and inside the repo it is one `git clean -fdx` from gone, while a fresh
+  clone or a cloud session starts empty and reports that as normal.
+- **Close the `history/` split.** `feedback/snapshot.py` computes
+  `output_dir.parent / "history"`, so `--output output` (the CLI default) writes to a
+  git-**tracked** `history/` while `--output output/real` writes to a gitignored
+  `output/history/`. There are 2 snapshots in the first and 223 in the second, and
+  `feedback/drift.py` reads the second. The default is the branch that commits data.
+  Nothing real has leaked — both tracked snapshots are `SKU-001`-style sample runs — but
+  a real extract run with default arguments would push per-SKU planning parameters to
+  GitHub.
+- `_schema_version` in the store, checked at startup, refusing rather than guessing. Git
+  cannot reach a store outside the repo, but a code upgrade can still change what the
+  bytes mean, and that failure is silent.
+- **Shadow write first**: the pipeline keeps reading files, the store is written and read
+  by nobody. History not collected cannot be recovered, so writing starts before reading
+  does; the merge to `main` lands while it still changes nothing.
+
+Then the Snowflake merge interface — `plan_merge` / `apply`, never a single `sync`, with
+the classification counts shown before anything is written. Those counts are the
+diagnostic: expecting a backfill and seeing 12,000 corrections means the wrong extract,
+and `unchanged` is a free integrity check on the key — 100% is the same file twice, 0% is
+the key failing to match across sources, which between Snowflake and Excel almost always
+means leading zeros.
+
+Two items above depend on master data the coverage worksheet locates: the P0 topology
+needs `MARD-INSME` / `SPEME` to tell quarantine from sellable, and the P1 phase-out cap
+needs `MARC-AUSDT` for the end date.
+
+Deliberately not here: a front end (the editable surface is ~46 planner-owned fields and
+adapter review, which YAML in git serves better), and moving the rule engine into the
+database.
 
 ## Smaller items
 

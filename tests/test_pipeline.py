@@ -216,3 +216,46 @@ class TestEndToEnd:
         assert all(b["config_fingerprint"] == manifest["config_fingerprint"]
                    for b in batches)
         assert list((planner.store.history_dir).glob("*/snapshot_*.json"))
+
+
+class TestScenarioComparison:
+    """
+    Two runs over one dataset under two rule sets. This is the comparison run identity
+    exists to make, and it is the one that was wrong: hashing only the config directory
+    made the pair `identical`, whose description tells the reader that a real policy
+    result is non-determinism.
+    """
+
+    def test_an_alternate_rule_set_compares_as_a_scenario(self, tmp_path):
+        from inventory_planning.provenance import RunRegistry
+
+        alt = tmp_path / "scenario_rules.md"
+        alt.write_text(
+            (CONFIG_DIR / "planning_parameters.md").read_text(encoding="utf-8")
+            .replace("service_level: 0.95", "service_level: 0.99"),
+            encoding="utf-8",
+        )
+        out = tmp_path / "out"
+
+        run_ids = []
+        for parameters_file in (None, alt):
+            planner = InventoryPlanner(config_dir=CONFIG_DIR, output_dir=out,
+                                       interactive=False, store_root=tmp_path / "store")
+            inputs = planner.load_all(sorted(SAMPLE_DIR.glob("*.csv")))
+            results = planner.run_planning(**inputs)
+            planner.run_policy_analysis(
+                results,
+                inventory_df=inputs["inventory_df"], open_po_df=inputs["open_po_df"],
+                parameters_file=parameters_file,
+            )
+            run_ids.append(planner.run.run_id)
+
+        registry = RunRegistry(out)
+        comparison = registry.compare(*run_ids)
+        assert comparison.basis == "scenario"
+        assert comparison.same_inputs
+        assert not comparison.same_config
+        # The facts are pinned, so the difference is attributable — and the batches are
+        # still keyed on the config identity their manifest records.
+        assert registry.get(run_ids[0])["config_fingerprint"] == \
+            registry.get(run_ids[1])["config_fingerprint"]

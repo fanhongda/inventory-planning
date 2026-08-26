@@ -242,6 +242,11 @@ class InventoryPlanner:
             "issues": [str(h) for h in resolved.conflicts],
             "status": "WARNINGS" if resolved.conflicts else "OK",
         })
+        # Re-record: the manifest was written at the end of `run_planning`, before this
+        # stage had resolved anything. A scenario run — one that passes an alternate
+        # `parameters_file` — differs from its baseline only in what happens here, so a
+        # manifest frozen before this point describes the wrong run.
+        self._record_run_state()
         return out
 
     # ------------------------------------------------------------------
@@ -873,6 +878,7 @@ class InventoryPlanner:
 
         params_file = parameters_file or (self.config_dir / "planning_parameters.md")
         planning_params = PlanningParameters(params_file)
+        self.run.record_policy_file(params_file)
         self.run.record_rules(r.rule_id for r in planning_params.rules)
 
         attributes, crosscheck = build_sku_attributes(
@@ -1021,6 +1027,13 @@ class InventoryPlanner:
         self._record_run(results, ts_str)
 
         print(f"\n  Outputs saved to: {out}")
+
+    def _record_run_state(self) -> None:
+        """Write the manifest as it now stands. Safe to call more than once per run."""
+        try:
+            RunRegistry(self.output_dir).save(self.run)
+        except Exception as e:
+            print(f"  Warning: run manifest not updated ({e})")
 
     def _record_run(self, results: dict, ts_str: str) -> None:
         """

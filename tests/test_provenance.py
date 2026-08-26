@@ -182,11 +182,57 @@ class TestConfigFingerprint:
         assert m.config_fingerprint
 
 
+class TestPolicyFingerprint:
+    """
+    `run_policy_analysis(parameters_file=...)` resolves the rule engine against a path
+    anywhere on disk. Hashing the config directory alone made a scenario run
+    indistinguishable from its baseline, and `compare` then called the pair `identical`
+    — telling the reader that a real policy result was non-determinism.
+    """
+
+    def test_a_different_rules_file_moves_it(self, tmp_path):
+        base = tmp_path / "planning_parameters.md"
+        base.write_text("service_level: 0.95\n", encoding="utf-8")
+        alt = tmp_path / "scenario_rules.md"
+        alt.write_text("service_level: 0.99\n", encoding="utf-8")
+
+        one, two = _manifest(), _manifest()
+        one.record_policy_file(base)
+        two.record_policy_file(alt)
+        assert one.policy_fingerprint != two.policy_fingerprint
+
+    def test_the_same_rules_file_does_not(self, tmp_path):
+        rules = tmp_path / "planning_parameters.md"
+        rules.write_text("service_level: 0.95\n", encoding="utf-8")
+        one, two = _manifest(), _manifest()
+        one.record_policy_file(rules)
+        two.record_policy_file(rules)
+        assert one.policy_fingerprint == two.policy_fingerprint
+
+    def test_it_does_not_disturb_the_config_fingerprint(self, tmp_path):
+        """Which is stamped on batches at intake and must not move afterwards."""
+        cfg = tmp_path / "config"; cfg.mkdir()
+        (cfg / "fx_rates.json").write_text('{"a": 1}', encoding="utf-8")
+        rules = tmp_path / "rules.md"; rules.write_text("x\n", encoding="utf-8")
+        m = _manifest(config_dir=cfg)
+        before = m.config_fingerprint
+        m.record_policy_file(rules)
+        m.record_rules(["R-001"])
+        assert m.config_fingerprint == before
+
+    def test_an_unreadable_rules_file_is_a_note_not_a_failure(self, tmp_path):
+        m = _manifest()
+        m.record_policy_file(tmp_path / "gone.md")
+        assert any("unfingerprinted" in n for n in m.notes)
+        assert m.policy_fingerprint
+
+
 class TestComparisonNamesWhatMoved:
     @staticmethod
-    def _entry(inputs="i1", config="c1", sha="s1"):
+    def _entry(inputs="i1", config="c1", sha="s1", policy="p1"):
         return {"run_id": "r", "input_fingerprint": inputs,
-                "config_fingerprint": config, "git_sha": sha}
+                "config_fingerprint": config, "policy_fingerprint": policy,
+                "git_sha": sha}
 
     def test_nothing_moved(self):
         c = RunComparison(a=self._entry(), b=self._entry())
@@ -212,6 +258,12 @@ class TestComparisonNamesWhatMoved:
         c = RunComparison(a=self._entry(), b=self._entry(sha="s2"))
         assert c.basis == "mixed"
 
+    def test_a_rule_set_change_alone_is_a_scenario(self):
+        """The case that read as `identical` while only the config dir was hashed."""
+        c = RunComparison(a=self._entry(), b=self._entry(policy="p2"))
+        assert c.basis == "scenario"
+        assert not c.same_config
+
 
 class TestRegistry:
     def test_a_saved_run_comes_back(self, tmp_path, files):
@@ -232,6 +284,24 @@ class TestRegistry:
             registry.save(m)
             ids.append(m.run_id)
         assert [e["run_id"] for e in registry.index()] == ids
+
+    def test_a_run_saved_twice_appears_once_in_its_original_position(self, tmp_path):
+        """
+        The planning stage records what a run read; the policy stage records what was
+        in force, afterwards, and may have resolved a different rule file. Both write.
+        The log keeps every line; a read of it keeps the newest per run.
+        """
+        registry = RunRegistry(tmp_path)
+        first, second = _manifest(output_dir=tmp_path), _manifest(output_dir=tmp_path)
+        registry.save(first)
+        registry.save(second)
+        first.record_rules(["R-001"])
+        registry.save(first)
+
+        index = registry.index()
+        assert [e["run_id"] for e in index] == [first.run_id, second.run_id]
+        assert index[0]["policy_fingerprint"] == first.policy_fingerprint
+        assert len(registry.index_path.read_text(encoding="utf-8").splitlines()) == 3
 
     def test_a_truncated_index_line_does_not_lose_the_rest(self, tmp_path):
         registry = RunRegistry(tmp_path)

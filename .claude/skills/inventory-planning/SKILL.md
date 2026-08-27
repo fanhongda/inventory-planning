@@ -41,7 +41,7 @@ path below is relative to the repository root — run from there.** All logic is
    as MTO but demand recurs, and held as MTS but demand is sporadic.
 2. **Safety stock** — combined demand × lead-time variability formula
 3. **Inventory projection** — should-be vs current position (on-hand + GIT + open PO)
-4. **6-month forecast** per SKU, plus `forecast_<ts>.csv` — one row per SKU with its
+4. **6-month forecast** per SKU, plus `forecast_<run_id>.csv` — one row per SKU with its
    history and the six months that follow, side by side, and the model that produced
    them. For make-to-stock items the model is chosen by backtest; make-to-order items
    use Croston. `vs_naive` on the row says whether the model beat repeating last
@@ -117,7 +117,7 @@ What this buys, in the order a planner cares about:
 2. **Sources get cross-checked.** Where two sources disagree by more than 25%, both
    values are reported with the gap. A master lead time that no longer resembles what
    suppliers deliver is a finding in its own right — every MRP run in the ERP is
-   planning on it. Written to `source_crosscheck_<ts>.csv`.
+   planning on it. Written to `source_crosscheck_<run_id>.csv`.
 3. **The planner's parameters get compared.** The safety stock, review period and
    service level in the worksheet are measured against what the data justifies, per
    SKU, with the capital or exposure attached. This is the main reason to load it.
@@ -175,7 +175,7 @@ What the run does with it, and what it will not do:
 - Declarations are **challenged, not trusted**: an old number still transacting after
   its own effective date is reported. Relay that one — it usually means the pair is
   really a phase pair and a live material has just been folded into another.
-- `output/<ts>/supersessions_<ts>.csv` records what each old number contributed to each
+- `output/<ts>/supersessions_<run_id>.csv` records what each old number contributed to each
   document. **Quote it when reporting on a merged SKU**: the stock is still on the shelf
   under the old label and the open POs are still raised against it, so a buyer told to
   order 400 needs to know how much of the cover is sitting under the number they will
@@ -591,20 +591,20 @@ All outputs carry `location_id`. When expanding to multi-echelon:
 
 ```
 output/<timestamp>/
-├── kpi_review_<ts>.html             ← self-contained review (open this)
-├── parameter_suggestions_<ts>.csv   ← suggested parameters vs those in force, per SKU
-├── suggested_rules_<ts>.md          ← the same as paste-able planning_parameters.md rules
-├── source_crosscheck_<ts>.csv       ← where two sources disagree, and by how much
-├── supersessions_<ts>.csv           ← old number -> new, and what each contributed to
+├── kpi_review_<run_id>.html             ← self-contained review (open this)
+├── parameter_suggestions_<run_id>.csv   ← suggested parameters vs those in force, per SKU
+├── suggested_rules_<run_id>.md          ← the same as paste-able planning_parameters.md rules
+├── source_crosscheck_<run_id>.csv       ← where two sources disagree, and by how much
+├── supersessions_<run_id>.csv           ← old number -> new, and what each contributed to
                                        each document. Written only where a renumbering
                                        was declared and matched something.
-├── purchase_recommendations_<ts>.csv
-├── inventory_projection_<ts>.csv
-├── backlog_realization_<ts>.csv     ← per-SKU realization rate and the evidence
-├── forecast_detail_<ts>.csv
+├── purchase_recommendations_<run_id>.csv
+├── inventory_projection_<run_id>.csv
+├── backlog_realization_<run_id>.csv     ← per-SKU realization rate and the evidence
+├── forecast_detail_<run_id>.csv
 ├── sku_planning_params.csv          stocking class, SS, ROP per SKU
 ├── supplier_params.csv              WMA LT per SKU×supplier
-└── history/YYYY-MM/snapshot_<ts>.json
+└── history/YYYY-MM/snapshot_<run_id>.json
                                      ← the durable record: plan + the lead time it
                                        planned on. Read back by the feedback loop and
                                        by feedback.drift for lead-time movement.

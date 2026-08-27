@@ -184,10 +184,11 @@ class TestConfigFingerprint:
 
 class TestPolicyFingerprint:
     """
-    `run_policy_analysis(parameters_file=...)` resolves the rule engine against a path
-    anywhere on disk. Hashing the config directory alone made a scenario run
-    indistinguishable from its baseline, and `compare` then called the pair `identical`
-    — telling the reader that a real policy result was non-determinism.
+    The rule set is an input to the run, not a by-product of it: the rules decide the
+    review period that sizes an order and the service level that sizes safety stock, so
+    a run under a different rule set is a different run. It is therefore fixed when the
+    run begins, exactly like the config directory, and for the same reason — the value
+    is stamped on batches at intake and cannot move afterwards.
     """
 
     def test_a_different_rules_file_moves_it(self, tmp_path):
@@ -196,35 +197,65 @@ class TestPolicyFingerprint:
         alt = tmp_path / "scenario_rules.md"
         alt.write_text("service_level: 0.99\n", encoding="utf-8")
 
-        one, two = _manifest(), _manifest()
-        one.record_policy_file(base)
-        two.record_policy_file(alt)
+        one = RunManifest.begin(policy_file=base)
+        two = RunManifest.begin(policy_file=alt)
         assert one.policy_fingerprint != two.policy_fingerprint
+
+    def test_editing_the_rules_in_place_moves_it_too(self, tmp_path):
+        """Over the file, so a rule's body counts — the ids alone would not catch it."""
+        rules = tmp_path / "planning_parameters.md"
+        rules.write_text("R-001:\n  service_level: 0.95\n", encoding="utf-8")
+        before = RunManifest.begin(policy_file=rules).policy_fingerprint
+        rules.write_text("R-001:\n  service_level: 0.99\n", encoding="utf-8")
+        assert RunManifest.begin(policy_file=rules).policy_fingerprint != before
 
     def test_the_same_rules_file_does_not(self, tmp_path):
         rules = tmp_path / "planning_parameters.md"
         rules.write_text("service_level: 0.95\n", encoding="utf-8")
-        one, two = _manifest(), _manifest()
-        one.record_policy_file(rules)
-        two.record_policy_file(rules)
-        assert one.policy_fingerprint == two.policy_fingerprint
+        assert (RunManifest.begin(policy_file=rules).policy_fingerprint
+                == RunManifest.begin(policy_file=rules).policy_fingerprint)
+
+    def test_reading_the_rules_does_not_move_it(self, tmp_path):
+        """`record_rules` runs mid-flight; batches are already stamped by then."""
+        rules = tmp_path / "rules.md"; rules.write_text("x\n", encoding="utf-8")
+        m = RunManifest.begin(policy_file=rules)
+        before = m.policy_fingerprint
+        m.record_rules(["R-001", "R-002"])
+        assert m.policy_fingerprint == before
 
     def test_it_does_not_disturb_the_config_fingerprint(self, tmp_path):
-        """Which is stamped on batches at intake and must not move afterwards."""
         cfg = tmp_path / "config"; cfg.mkdir()
         (cfg / "fx_rates.json").write_text('{"a": 1}', encoding="utf-8")
         rules = tmp_path / "rules.md"; rules.write_text("x\n", encoding="utf-8")
-        m = _manifest(config_dir=cfg)
-        before = m.config_fingerprint
-        m.record_policy_file(rules)
-        m.record_rules(["R-001"])
-        assert m.config_fingerprint == before
+        with_rules = RunManifest.begin(config_dir=cfg, policy_file=rules)
+        without = RunManifest.begin(config_dir=cfg)
+        assert with_rules.config_fingerprint == without.config_fingerprint
 
     def test_an_unreadable_rules_file_is_a_note_not_a_failure(self, tmp_path):
-        m = _manifest()
-        m.record_policy_file(tmp_path / "gone.md")
+        m = RunManifest.begin(policy_file=tmp_path / "gone.md")
         assert any("unfingerprinted" in n for n in m.notes)
         assert m.policy_fingerprint
+
+    def test_a_late_different_rules_file_is_a_note_not_a_new_fingerprint(self, tmp_path):
+        """
+        Folding it in would move a value already stamped on this run's batches, so
+        those batches would stop being joinable to their own manifest. It is still
+        worth saying: the plan and the report came from different rules.
+        """
+        base = tmp_path / "base.md"; base.write_text("a\n", encoding="utf-8")
+        alt = tmp_path / "alt.md"; alt.write_text("b\n", encoding="utf-8")
+        m = RunManifest.begin(policy_file=base)
+        before = m.policy_fingerprint
+        m.note_policy_override(alt)
+
+        assert m.policy_fingerprint == before
+        assert any("rules differ within the run" in n for n in m.notes)
+
+    def test_resolving_the_run_s_own_rules_file_says_nothing(self, tmp_path):
+        base = tmp_path / "base.md"; base.write_text("a\n", encoding="utf-8")
+        m = RunManifest.begin(policy_file=base)
+        m.note_policy_override(base)
+        assert not any("rules differ" in n for n in m.notes)
 
 
 class TestComparisonNamesWhatMoved:

@@ -37,7 +37,7 @@ import pandas as pd
 class SnapshotSaver:
 
     def save(self, results: dict, config: dict, output_dir: Path,
-             history_root: Path = None) -> Path:
+             history_root: Path = None, stamp: str = None) -> Path:
         """
         results:      output of InventoryPlanner.run_planning()
         config:       stocking_policy.json contents
@@ -56,7 +56,9 @@ class SnapshotSaver:
         """
         run_dt = datetime.now()
         month_label = run_dt.strftime("%Y-%m")
-        ts_str = run_dt.strftime("%Y%m%d_%H%M")
+        # The run's id when the caller has one, so a snapshot names the run that wrote
+        # it and two runs a few seconds apart do not land on the same filename.
+        ts_str = stamp or run_dt.strftime("%Y%m%d_%H%M")
 
         root = Path(history_root) if history_root else output_dir.parent / "history"
         history_dir = root / month_label

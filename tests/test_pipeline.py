@@ -221,41 +221,85 @@ class TestEndToEnd:
 class TestScenarioComparison:
     """
     Two runs over one dataset under two rule sets. This is the comparison run identity
-    exists to make, and it is the one that was wrong: hashing only the config directory
-    made the pair `identical`, whose description tells the reader that a real policy
-    result is non-determinism.
+    exists to make, and until the rule set reached `run_planning` it could not be made
+    at all: `parameters_file` only ever re-resolved the policy *report*, so a scenario
+    changed nothing a buyer would act on.
     """
+
+    @staticmethod
+    def _scenario_rules(path):
+        path.write_text(
+            (CONFIG_DIR / "planning_parameters.md").read_text(encoding="utf-8")
+            .replace("service_level: 0.95", "service_level: 0.99")
+            .replace("review_period_days: 30          #", "review_period_days: 90          #"),
+            encoding="utf-8",
+        )
+        return path
+
+    def _run(self, out, store, parameters_file=None):
+        planner = InventoryPlanner(config_dir=CONFIG_DIR, output_dir=out,
+                                   interactive=False, store_root=store,
+                                   parameters_file=parameters_file)
+        inputs = planner.load_all(sorted(SAMPLE_DIR.glob("*.csv")))
+        results = planner.run_planning(**inputs)
+        return planner, results
+
+    def test_the_rule_set_reaches_the_plan(self, tmp_path):
+        """The point of the whole thing: the recommendations themselves have to move."""
+        alt = self._scenario_rules(tmp_path / "scenario_rules.md")
+        _, base = self._run(tmp_path / "a", tmp_path / "store")
+        _, scen = self._run(tmp_path / "b", tmp_path / "store", parameters_file=alt)
+
+        def review_periods(results):
+            frame = results["parameters"].frame
+            return dict(zip(frame["sku"], frame["review_period_days"]))
+
+        assert review_periods(base) != review_periods(scen)
 
     def test_an_alternate_rule_set_compares_as_a_scenario(self, tmp_path):
         from inventory_planning.provenance import RunRegistry
 
-        alt = tmp_path / "scenario_rules.md"
-        alt.write_text(
-            (CONFIG_DIR / "planning_parameters.md").read_text(encoding="utf-8")
-            .replace("service_level: 0.95", "service_level: 0.99"),
-            encoding="utf-8",
-        )
+        alt = self._scenario_rules(tmp_path / "scenario_rules.md")
         out = tmp_path / "out"
-
-        run_ids = []
-        for parameters_file in (None, alt):
-            planner = InventoryPlanner(config_dir=CONFIG_DIR, output_dir=out,
-                                       interactive=False, store_root=tmp_path / "store")
-            inputs = planner.load_all(sorted(SAMPLE_DIR.glob("*.csv")))
-            results = planner.run_planning(**inputs)
-            planner.run_policy_analysis(
-                results,
-                inventory_df=inputs["inventory_df"], open_po_df=inputs["open_po_df"],
-                parameters_file=parameters_file,
-            )
-            run_ids.append(planner.run.run_id)
+        base_planner, _ = self._run(out, tmp_path / "store")
+        scen_planner, _ = self._run(out, tmp_path / "store", parameters_file=alt)
 
         registry = RunRegistry(out)
-        comparison = registry.compare(*run_ids)
+        comparison = registry.compare(base_planner.run.run_id, scen_planner.run.run_id)
         assert comparison.basis == "scenario"
         assert comparison.same_inputs
         assert not comparison.same_config
-        # The facts are pinned, so the difference is attributable — and the batches are
-        # still keyed on the config identity their manifest records.
-        assert registry.get(run_ids[0])["config_fingerprint"] == \
-            registry.get(run_ids[1])["config_fingerprint"]
+        # The facts are pinned and the two runs are separate identities, so the batches
+        # each wrote still carry the config identity their own manifest records.
+        assert registry.get(base_planner.run.run_id)["config_fingerprint"] == \
+            registry.get(scen_planner.run.run_id)["config_fingerprint"]
+        assert registry.get(base_planner.run.run_id)["policy_fingerprint"] != \
+            registry.get(scen_planner.run.run_id)["policy_fingerprint"]
+
+    def test_runs_seconds_apart_do_not_overwrite_each_other(self, tmp_path):
+        """
+        Output files were stamped to the minute, from four independent `datetime.now()`
+        calls, so a planner trying a rule change and re-running immediately lost the
+        first result — and one run's own files could straddle a minute boundary and
+        disagree. The stamp is the run id.
+        """
+        alt = self._scenario_rules(tmp_path / "scenario_rules.md")
+        out = tmp_path / "out"
+        self._run(out, tmp_path / "store")
+        self._run(out, tmp_path / "store", parameters_file=alt)
+
+        recommendations = sorted(out.glob("purchase_recommendations_*.csv"))
+        assert len(recommendations) == 2
+        # And one run's outputs all agree on which run they came from.
+        stamps = {f.stem.split("purchase_recommendations_")[1] for f in recommendations}
+        for stamp in stamps:
+            assert (out / f"inventory_projection_{stamp}.csv").exists()
+
+    def test_two_runs_of_the_same_rule_set_are_identical(self, tmp_path):
+        from inventory_planning.provenance import RunRegistry
+
+        out = tmp_path / "out"
+        first, _ = self._run(out, tmp_path / "store")
+        second, _ = self._run(out, tmp_path / "store")
+        comparison = RunRegistry(out).compare(first.run.run_id, second.run.run_id)
+        assert comparison.basis == "identical"

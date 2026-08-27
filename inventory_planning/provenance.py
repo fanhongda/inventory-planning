@@ -125,7 +125,8 @@ class RunManifest:
     # ── Start ────────────────────────────────────────────────────────────────
 
     @classmethod
-    def begin(cls, config_dir: Path = None, output_dir: Path = None) -> "RunManifest":
+    def begin(cls, config_dir: Path = None, output_dir: Path = None,
+              policy_file: Path = None) -> "RunManifest":
         now = datetime.now()
         run = cls(
             # Sortable, and unique even when two runs land in the same second — the
@@ -137,6 +138,8 @@ class RunManifest:
         )
         run._read_code()
         run._read_config(Path(config_dir) if config_dir else None)
+        if policy_file is not None:
+            run.set_policy_file(policy_file)
         return run
 
     def _read_code(self) -> None:
@@ -218,14 +221,40 @@ class RunManifest:
     def record_rules(self, rule_ids) -> None:
         self.rule_ids = [str(r) for r in rule_ids]
 
-    def record_policy_file(self, path) -> None:
-        """The rules file the run resolved against, wherever it lives."""
+    def set_policy_file(self, path) -> None:
+        """
+        The rule set this run plans under. Set once, when the run begins.
+
+        The rules are an input, not a by-product: they decide the review period that
+        sizes an order and the service level that sizes safety stock, so a run under a
+        different rule set is a different run with different recommendations — which is
+        what a scenario is. Recording them at the start is what lets `policy_fingerprint`
+        hold still for the whole run, the same reason `config_fingerprint` is read here.
+        """
         p = Path(path)
         digest = _sha256_file(p)
-        if digest:
-            self.policy_files[str(p)] = digest
-        else:
+        self.policy_files = {str(p): digest} if digest else {}
+        if not digest:
             self.notes.append(f"rules file {p} unreadable — policy unfingerprinted")
+
+    def note_policy_override(self, path) -> None:
+        """
+        A later stage resolved a *different* rules file than the run began with.
+
+        Recorded as a note and deliberately not folded into the fingerprint: a value
+        stamped on batches at intake cannot move afterwards without those batches
+        ceasing to be joinable to their manifest. It is worth saying out loud, though —
+        it means the plan and the report were produced under different rules.
+        """
+        p = str(Path(path))
+        if p in self.policy_files:
+            return
+        planned_under = ", ".join(self.policy_files) or "<none>"
+        self.notes.append(
+            f"rules differ within the run: planned under {planned_under}, "
+            f"policy report resolved {p}. The recommendations are the first file's. "
+            f"For a scenario, construct the planner with parameters_file instead."
+        )
 
     # ── Fingerprints ─────────────────────────────────────────────────────────
 
@@ -255,17 +284,20 @@ class RunManifest:
         """
         The rule set in force, which is what a scenario actually varies.
 
-        Over the digest of the rules file that was *resolved*, not the one that lives
-        in the config directory. `run_policy_analysis(parameters_file=...)` accepts a
-        path anywhere on disk, so hashing the config directory alone made two runs over
-        one dataset with two different rule sets indistinguishable — and `compare` then
-        called that pair `identical`, which tells the reader that a real policy result
-        is non-determinism. Precisely inverted, on precisely the comparison this
-        machinery exists to make.
+        Over the digest of the rules file the run plans under, which need not be the one
+        in the config directory — a scenario is exactly a run under a rule set from
+        somewhere else. Hashing the config directory alone made two such runs
+        indistinguishable, and `compare` then called the pair `identical`, whose
+        description tells the reader that a real policy result is non-determinism.
+
+        Over the *file*, not the rule ids parsed from it. The ids are read during the
+        run, and a fingerprint that moved partway through would leave every batch
+        already written stamped with a value the manifest no longer holds. The file
+        digest covers strictly more anyway: editing a rule's body changes it, where the
+        ids would not.
         """
         return _sha256_of(
-            [f"{name}:{digest}" for name, digest in sorted(self.policy_files.items())]
-            + ["rules:" + ",".join(sorted(self.rule_ids))]
+            f"{name}:{digest}" for name, digest in sorted(self.policy_files.items())
         )[:16]
 
     @property

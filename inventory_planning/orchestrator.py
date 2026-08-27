@@ -35,12 +35,20 @@ class InventoryPlanner:
     """
 
     def __init__(self, config_dir: Union[str, Path] = None, output_dir: Union[str, Path] = None,
-                 interactive: bool = True, store_root: Union[str, Path] = None):
+                 interactive: bool = True, store_root: Union[str, Path] = None,
+                 parameters_file: Union[str, Path] = None):
         base = Path(__file__).parents[1]
         self.config_dir = Path(config_dir) if config_dir else base / "config"
         self.output_dir = Path(output_dir) if output_dir else base / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.interactive = interactive
+        # The rule set this planner plans under. A scenario is a planner built with a
+        # different one: the rules decide the review period that sizes an order and the
+        # service level that sizes safety stock, so they have to reach `run_planning`
+        # rather than only the policy report, or a scenario changes nothing a buyer acts
+        # on. One planner, one rule set, one run identity.
+        self.parameters_file = (Path(parameters_file) if parameters_file
+                                else self.config_dir / "planning_parameters.md")
         self._quality_log: list = []   # accumulates quality reports across all loads
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
@@ -48,7 +56,8 @@ class InventoryPlanner:
         # Identity for this run: what it read, what it resolved, what code ran. Started
         # here rather than at save time so the config is fingerprinted before anything
         # has had a chance to be edited mid-run.
-        self.run = RunManifest.begin(config_dir=self.config_dir, output_dir=self.output_dir)
+        self.run = RunManifest.begin(config_dir=self.config_dir, output_dir=self.output_dir,
+                                     policy_file=self.parameters_file)
         self._store = None             # built on first use; see `store`
         self.store_root = store_root   # None -> $INVENTORY_PLANNING_STORE, then XDG
 
@@ -198,7 +207,7 @@ class InventoryPlanner:
             resolved, recommendations=results.get("recommendations"))
         print()
         print(suggestions.summary())
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        stamp = self.run.run_id
         csv_path = suggestions.to_csv(self.output_dir / f"parameter_suggestions_{stamp}.csv")
         md_path = self.output_dir / f"suggested_rules_{stamp}.md"
         suggestions.to_rules_markdown(md_path)
@@ -236,16 +245,15 @@ class InventoryPlanner:
 
         self._quality_log.append({
             "doc_type": "policy",
-            "file": str((parameters_file
-                         or (self.config_dir / "planning_parameters.md")).name),
+            "file": str(Path(parameters_file).name if parameters_file
+                        else self.parameters_file.name),
             "rows_loaded": len(attributes),
             "issues": [str(h) for h in resolved.conflicts],
             "status": "WARNINGS" if resolved.conflicts else "OK",
         })
-        # Re-record: the manifest was written at the end of `run_planning`, before this
-        # stage had resolved anything. A scenario run — one that passes an alternate
-        # `parameters_file` — differs from its baseline only in what happens here, so a
-        # manifest frozen before this point describes the wrong run.
+        # This stage produces outputs of its own after the manifest was written at the
+        # end of `run_planning`, so the manifest is written again with them in it. The
+        # fingerprints do not move — the rule set was fixed when the run began.
         self._record_run_state()
         return out
 
@@ -364,7 +372,7 @@ class InventoryPlanner:
             if len(levels):
                 service_target = float(levels.mode().iloc[0])
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        stamp = self.run.run_id
         path = self.output_dir / f"kpi_review_{stamp}.html"
         KPIReport(title).render(
             service=service, should_be=should_be, ordering=ordering,
@@ -569,7 +577,7 @@ class InventoryPlanner:
         if not report.records:
             return None
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        stamp = self.run.run_id
         path = self.output_dir / f"supersessions_{stamp}.csv"
         write_csv(report.to_frame(), path)
         print(f"    Merged item numbers : {path}")
@@ -876,9 +884,9 @@ class InventoryPlanner:
         from .policy.parameters import PlanningParameters
         from .policy.profile import build_policy_profile
 
-        params_file = parameters_file or (self.config_dir / "planning_parameters.md")
+        params_file = Path(parameters_file) if parameters_file else self.parameters_file
         planning_params = PlanningParameters(params_file)
-        self.run.record_policy_file(params_file)
+        self.run.note_policy_override(params_file)
         self.run.record_rules(r.rule_id for r in planning_params.rules)
 
         attributes, crosscheck = build_sku_attributes(
@@ -990,7 +998,7 @@ class InventoryPlanner:
         )
 
     def _save_outputs(self, results: dict) -> None:
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M")
+        ts_str = self.run.run_id
         out = self.output_dir
 
         # ── CSV outputs ───────────────────────────────────────────────────────
@@ -1019,6 +1027,7 @@ class InventoryPlanner:
             snapshot_path = SnapshotSaver().save(
                 results, policy_cfg, out,
                 history_root=history_root(self.store_root),
+                stamp=self.run.run_id,
             )
             print(f"  Snapshot saved:   {snapshot_path.name}")
         except Exception as e:

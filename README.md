@@ -701,25 +701,30 @@ zeroes and no error at all.
 
 ```
 output/
-├── kpi_review_<ts>.html                 ← open this
-├── parameter_suggestions_<ts>.csv       suggested parameters vs those in force, per SKU
-├── suggested_rules_<ts>.md              the same, as paste-able planning_parameters.md rules
-├── source_crosscheck_<ts>.csv           where two sources disagree, and by how much
-├── policy_profile_<ts>.csv              what each SKU *is* on eight axes — demand,
+├── kpi_review_<run_id>.html                 ← open this
+├── parameter_suggestions_<run_id>.csv       suggested parameters vs those in force, per SKU
+├── suggested_rules_<run_id>.md              the same, as paste-able planning_parameters.md rules
+├── source_crosscheck_<run_id>.csv           where two sources disagree, and by how much
+├── policy_profile_<run_id>.csv              what each SKU *is* on eight axes — demand,
 │                                        lead time, review, locations, capacity,
 │                                        excess demand — the evidence behind each
 │                                        reading, and the replenishment policy it
 │                                        implies next to the one in force
-├── supersessions_<ts>.csv               old item number -> new, and what each old
+├── supersessions_<run_id>.csv               old item number -> new, and what each old
 │                                        number contributed to each document
-├── purchase_recommendations_<ts>.csv
-├── inventory_projection_<ts>.csv
-├── backlog_realization_<ts>.csv         per-SKU realization rate and the evidence
-├── forecast_detail_<ts>.csv
+├── purchase_recommendations_<run_id>.csv
+├── inventory_projection_<run_id>.csv
+├── backlog_realization_<run_id>.csv         per-SKU realization rate and the evidence
+├── forecast_detail_<run_id>.csv
 ├── sku_planning_params.csv              persisted: stocking class, SS, ROP per SKU
 ├── supplier_params.csv                  persisted: WMA lead time per SKU × supplier
-└── history/YYYY-MM/snapshot_<ts>.json   feedback loop input
+└── history/YYYY-MM/snapshot_<run_id>.json   feedback loop input
 ```
+
+`<run_id>` is the run that wrote the file — `runs/<run_id>.json` holds what that run
+read, the parameters it resolved and the code that ran. It carries seconds and a random
+suffix rather than minutes, so two runs a few seconds apart (a planner trying a rule
+change) neither collide nor need to be told apart by hand.
 
 ---
 

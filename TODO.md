@@ -150,6 +150,24 @@ the store already has its gate recorded before it exists. Nothing here can fail 
 a missing git binary, an unreadable config, an input with no file behind it are each
 recorded as unknown.
 
+**Scenarios work, and the rule set is now a run input.** `parameters_file` used to
+reach only `run_policy_analysis`, so an alternate rule set changed the policy report and
+left the purchase recommendations exactly as they were — the one thing a planner would
+act on. It is a constructor argument now: `InventoryPlanner(parameters_file=...)`, or
+`--parameters` on the CLI. One planner, one rule set, one run identity, fixed before the
+first batch is written. Two runs over one dataset under two rule sets compare as
+`scenario` and their safety stock genuinely differs (9 of 10 SKUs on the sample data).
+
+Output files are stamped with the `run_id` rather than the minute. Four independent
+`datetime.now()` calls could disagree within one run, and two runs seconds apart — a
+planner trying a rule change, which is the whole point — overwrote each other's CSVs.
+
+What a planner-facing UI still needs on top of this: somewhere to edit a rule set
+without hand-writing markdown, and a diff view over two `run_id`s — which SKUs changed
+class, what the safety stock total moved by, which recommendations flipped. Neither
+needs new identity work; `policy/parameters.py` already counts per-rule hits and skip
+reasons, and throws them away at the end of the run.
+
 **Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the
 root (`--store` / `$INVENTORY_PLANNING_STORE` / `$XDG_DATA_HOME` / `~/.local/share`),
 `ledger.py` is the append-only batch record, `fact_store.py` writes parquet under

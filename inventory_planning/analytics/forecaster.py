@@ -63,14 +63,13 @@ _BACKTEST_FOLDS = 3
 _BACKTEST_STEPS = 3
 # Below this many observed periods there is nothing to hold out, and a competition
 # decided on two points is not a competition.
+_MIN_BACKTEST_POINTS = 12
 # Share of periods that must carry demand before ARIMA is worth offering. Below it the
 # model has zeros to explain rather than a series, and explains them by extrapolating.
 # Set at a half rather than at the Syntetos-Boylan intermittence boundary (~0.76) so a
 # genuine every-other-month item keeps it: on one of those ARIMA recovers the phase —
 # `[0, 150, 0, 150, ...]` — which is a better answer than Croston's flat average of it.
 _MIN_DENSITY_FOR_ARIMA = 0.5
-
-_MIN_BACKTEST_POINTS = 12
 # MAPE needs a non-zero actual to divide by. With fewer than this many across the whole
 # backtest the ranking would rest on one or two months, so RMSE decides instead — the
 # metric is reported either way rather than left to be assumed.
@@ -164,7 +163,13 @@ class Forecaster:
 
     # ── Choosing by competition ──────────────────────────────────────────────
 
-    def _candidates(self, series: pd.Series, horizon: int) -> dict:
+    @staticmethod
+    def _dense_enough_for_arima(series: pd.Series) -> bool:
+        """Whether a series has enough demand in it for ARIMA to be about anything."""
+        return bool(float((series > 0).mean()) >= _MIN_DENSITY_FOR_ARIMA)
+
+    def _candidates(self, series: pd.Series, horizon: int,
+                    allow_arima: bool = None) -> dict:
         """
         Every model's forecast for the next `horizon` periods, by name.
 
@@ -188,12 +193,20 @@ class Forecaster:
         # It is also 97% of the cost of a backtest: 5.15 ms a fit against 0.16 for ETS
         # and 0.01 for Croston. At 30,000 SKUs that is ten minutes against under one.
         # Correctness and cost point the same way here, which is rare enough to take.
-        dense_enough_for_arima = float((series > 0).mean()) >= _MIN_DENSITY_FOR_ARIMA
+        #
+        # `allow_arima` is decided by the caller so that every fold of one backtest
+        # decides it the same way. Judged per fold it moves: the training windows differ
+        # by a period each, and a series sitting on the boundary admits ARIMA to some
+        # folds and not others, leaving it ranked on six points against everyone else's
+        # nine. Pooling across folds exists precisely so that no model is scored on a
+        # different sample from its rivals.
+        if allow_arima is None:
+            allow_arima = self._dense_enough_for_arima(series)
 
         candidates = [
             ("ETS", lambda: self._fit_ets(series, trend, seasonal, horizon)),
         ]
-        if dense_enough_for_arima:
+        if allow_arima:
             candidates.append(("ARIMA", lambda: self._fit_arima(series, horizon)))
         for name, build in candidates + [
             ("SMA", lambda: self._fit_sma(series, horizon)),
@@ -224,12 +237,17 @@ class Forecaster:
         origins = [n - steps - _BACKTEST_FOLDS + 1 + i for i in range(_BACKTEST_FOLDS)]
         origins = [o for o in origins if o >= _MIN_BACKTEST_POINTS - steps and o >= 4]
 
+        # Settled once, on the whole series, and applied to every fold. Which model
+        # classes are meaningful for an item is a property of the item, not of how much
+        # of it a particular fold was shown.
+        allow_arima = self._dense_enough_for_arima(series)
+
         pooled = {}
         for origin in origins:
             train, actual = series.iloc[:origin], series.iloc[origin:origin + steps].values
             if len(actual) == 0:
                 continue
-            for name, values in self._candidates(train, len(actual)).items():
+            for name, values in self._candidates(train, len(actual), allow_arima).items():
                 pooled.setdefault(name, {"err": [], "act": []})
                 pooled[name]["err"].extend(values[:len(actual)] - actual)
                 pooled[name]["act"].extend(actual)
@@ -252,7 +270,9 @@ class Forecaster:
             }
 
         metric = ("mape" if all(s["mape"] is not None for s in scored.values()) else "rmse")
-        final = self._candidates(series, self.horizon)
+        # The same admission the folds were judged under, so the winner of the ranking
+        # is guaranteed to be among the models refitted to produce the forecast.
+        final = self._candidates(series, self.horizon, allow_arima)
         ranked = sorted(scored, key=lambda k: scored[k][metric])
         best = next((n for n in ranked if n in final), ranked[0])
         values = final.get(best, np.full(self.horizon, float(series.tail(3).mean())))

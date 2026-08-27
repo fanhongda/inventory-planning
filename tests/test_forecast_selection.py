@@ -181,6 +181,31 @@ class TestAWinnerStaysOnTheGround:
         series = pd.Series([0.0, 150.0] * 11, index=PERIODS)
         assert "ARIMA" in f._candidates(series, 6)
 
+    def test_every_fold_is_offered_the_same_models(self):
+        """
+        Admission is judged on density, and the folds differ by a period each, so a
+        series sitting on the boundary let ARIMA into some folds and not others — six
+        scored points against everyone else's nine. Pooling across folds exists so that
+        no model is ranked on a different sample from its rivals; deciding admission
+        inside the loop undid it.
+        """
+        # 15 non-zero in the first 31 periods, then demand at 32 and 33: fold densities
+        # run 0.4839, 0.5000, 0.5152 and cross the boundary mid-backtest.
+        values = [0.0] * 36
+        for i in range(15):
+            values[i * 2] = 100.0
+        values[31] = values[32] = 100.0
+        series = pd.Series(values, index=pd.period_range("2023-01", periods=36, freq="M"))
+
+        seen = []
+        f = Forecaster(horizon=6)
+        original = f._candidates
+        f._candidates = lambda s, h, allow=None: (seen.append(allow) or original(s, h, allow))
+        f._select_by_backtest(series)
+
+        assert len(seen) > 1, "expected more than one fold"
+        assert len(set(seen)) == 1, f"admission differed between folds: {seen}"
+
     def test_it_does_not_flatten_a_genuine_trend(self):
         """Rejecting runaway growth must not become a refusal to forecast growth."""
         detail, _ = _run(RAMP, "MTS")

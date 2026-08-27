@@ -8,11 +8,12 @@ not raise — and `forecast_rmse`, which sizes safety stock, was the in-sample r
 a measure of how closely a model traces the data it was fitted on, not of anything it
 predicts.
 
-Make-to-stock items now compete. Every candidate is refitted on a rolling origin, made
-to forecast periods it has not seen, and scored against what happened. Make-to-order
-items go straight to Croston and are not backtested: nothing is stocked against a
-forecast there, the demand is intermittent by construction, and the competition would
-spend the time to arrive where it started.
+Items now compete. Every candidate is refitted on a rolling origin, made to forecast
+periods it has not seen, and scored against what happened. Whether there is a
+competition is decided by how much history there is, not by the ERP's stocking policy:
+`MTO` means the item is not held in stock, which is a decision about money and says
+nothing about how often it sells. Croston stays in the pool and wins wherever it
+deserves to — it simply has to win.
 
 The naive forecast is an entrant, not a footnote. Without it, "best of five" can still
 be worse than repeating last month and nothing would say so — and on this extract 35
@@ -47,36 +48,48 @@ def _run(values, policy=None, sku="A", horizon=6, periods=PERIODS):
     return detail, detail[detail["is_next_period"]].iloc[0]
 
 
-class TestThePolicyDecidesWhetherThereIsACompetition:
+class TestTheHistoryDecidesWhetherThereIsACompetition:
 
     def test_make_to_stock_is_backtested(self):
         _, row = _run(RAMP, "MTS")
         assert row["selected_by"].startswith("backtest")
 
-    def test_make_to_order_goes_straight_to_croston(self):
-        """No competition, and the cost of one is the reason."""
+    def test_make_to_order_is_backtested_too(self):
+        """
+        It used to go straight to Croston because its demand was "intermittent by
+        construction". It is not: `stocking_policy` is a decision not to hold stock,
+        and a configured-to-order item can sell every month. The pipeline says as much
+        elsewhere, reporting *held as MTO, demand recurs* as a finding.
+        """
+        _, row = _run(LUMPY, "MTO")
+        assert row["selected_by"].startswith("backtest")
+
+    def test_croston_still_wins_on_a_series_it_suits(self):
+        """Which is the point: it wins on merit rather than by being routed to."""
         _, row = _run(LUMPY, "MTO")
         assert row["model_used"] == "Croston"
-        assert row["selected_by"] == "policy:MTO"
 
-    def test_the_policy_outranks_the_pattern(self):
+    def test_a_ramp_is_not_forced_onto_croston_by_its_policy(self):
         """
-        A clean ramp is exactly what Croston is wrong for, and MTO still takes it: the
-        ERP's policy is a statement about how the item is planned, not a guess to be
-        overridden by the shape of a series.
+        A clean ramp is exactly what Croston is wrong for, and the policy used to take
+        it anyway — answering with one number repeated across the horizon.
         """
         _, row = _run(RAMP, "MTO")
-        assert row["model_used"] == "Croston"
+        assert row["model_used"] != "Croston"
 
-    def test_no_policy_leaves_the_old_routing_alone(self):
-        """A missing policy is not evidence of one, so nothing about the SKU changes."""
+    def test_no_policy_is_backtested_on_the_same_terms(self):
         _, row = _run(RAMP, policy=None)
-        assert row["selected_by"] == "pattern"
+        assert row["selected_by"].startswith("backtest")
 
-    def test_a_series_too_short_to_hold_anything_out_is_not_backtested(self):
+    def test_a_series_too_short_to_hold_anything_out_falls_back_to_the_policy(self):
         short = pd.period_range("2025-01", periods=8, freq="M")
-        _, row = _run(RAMP[:8], "MTS", periods=short)
-        assert not row["selected_by"].startswith("backtest:")
+        _, row = _run(RAMP[:8], "MTO", periods=short)
+        assert row["selected_by"] == "policy:MTO"
+
+    def test_and_a_short_series_with_no_policy_falls_back_to_the_pattern(self):
+        short = pd.period_range("2025-01", periods=8, freq="M")
+        _, row = _run(RAMP[:8], policy=None, periods=short)
+        assert row["selected_by"] == "pattern"
 
 
 class TestTheCompetitionPicksOnEvidence:
@@ -143,12 +156,30 @@ class TestAWinnerStaysOnTheGround:
         assert detail["forecast_qty"].max() <= max(SPARSE_RAMP) * 3.0
         assert row["model_used"] != "ARIMA"
 
-    def test_and_the_model_that_would_have_run_away_is_a_real_candidate(self):
+    def test_the_model_that_would_run_away_still_would(self):
         """Not a hypothetical: ARIMA does fit this shape, and does run 25 out to 148."""
         f = Forecaster(horizon=6)
         series = pd.Series([float(v) for v in SPARSE_RAMP], index=PERIODS)
-        paths = f._candidates(series, 6)
-        assert np.max(paths["ARIMA"]) > max(SPARSE_RAMP) * 3.0
+        assert np.max(f._fit_arima(series, 6)) > max(SPARSE_RAMP) * 3.0
+
+    def test_it_is_no_longer_offered_on_a_series_this_empty(self):
+        """
+        It used to be offered and lose. It lost to Croston, and Croston only won
+        because its interval estimate started at 1.0 and never converged — so the
+        defence against a 63-million-a-month forecast was resting on a bias. Correcting
+        the bias handed the series to ARIMA. Not offering it is the defence that does
+        not depend on another model being wrong.
+        """
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in SPARSE_RAMP], index=PERIODS)
+        assert float((series > 0).mean()) < 0.5
+        assert "ARIMA" not in f._candidates(series, 6)
+
+    def test_it_is_still_offered_where_there_is_a_series_to_model(self):
+        """Every other month is intermittent, and ARIMA recovers the phase on it."""
+        f = Forecaster(horizon=6)
+        series = pd.Series([0.0, 150.0] * 11, index=PERIODS)
+        assert "ARIMA" in f._candidates(series, 6)
 
     def test_it_does_not_flatten_a_genuine_trend(self):
         """Rejecting runaway growth must not become a refusal to forecast growth."""

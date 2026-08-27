@@ -1033,7 +1033,7 @@ class InventoryPlanner:
         except Exception as e:
             print(f"  Warning: snapshot save failed ({e})")
 
-        self._record_run(results, ts_str)
+        self._record_run()
 
         print(f"\n  Outputs saved to: {out}")
 
@@ -1064,7 +1064,7 @@ class InventoryPlanner:
         except Exception as e:
             print(f"  Warning: run manifest not updated ({e})")
 
-    def _record_run(self, results: dict, ts_str: str) -> None:
+    def _record_run(self) -> None:
         """
         Bind this run's outputs to the facts, parameters and code behind them.
 

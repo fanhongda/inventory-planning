@@ -251,8 +251,8 @@ class InventoryPlanner:
             "issues": [str(h) for h in resolved.conflicts],
             "status": "WARNINGS" if resolved.conflicts else "OK",
         })
-        # This stage produces outputs of its own after the manifest was written at the
-        # end of `run_planning`, so the manifest is written again with them in it. The
+        # This stage writes outputs of its own after `run_planning` recorded the
+        # manifest, so the outputs are collected again and the manifest rewritten. The
         # fingerprints do not move — the rule set was fixed when the run began.
         self._record_run_state()
         return out
@@ -1037,9 +1037,29 @@ class InventoryPlanner:
 
         print(f"\n  Outputs saved to: {out}")
 
+    def _collect_outputs(self) -> None:
+        """
+        Record every file this run has written so far. Safe to run again.
+
+        Run again is the point: `_save_outputs` collects at the end of `run_planning`,
+        and the policy stage writes `parameter_suggestions`, `suggested_rules` and the
+        source cross-check afterwards. Collecting only once left those out of the
+        manifest — including the suggested rules, which is the output a planner acts on
+        when tuning a scenario and so the one that least deserves to be the one with no
+        provenance.
+        """
+        for path in sorted(self.output_dir.glob(f"*_{self.run.run_id}.*")):
+            if path.is_file():
+                self.run.record_output(path)
+        for name in ("supplier_params.csv", "sku_planning_params.csv"):
+            path = self.output_dir / name
+            if path.exists():
+                self.run.record_output(path)
+
     def _record_run_state(self) -> None:
         """Write the manifest as it now stands. Safe to call more than once per run."""
         try:
+            self._collect_outputs()
             RunRegistry(self.output_dir).save(self.run)
         except Exception as e:
             print(f"  Warning: run manifest not updated ({e})")
@@ -1052,12 +1072,7 @@ class InventoryPlanner:
         an unwritable registry is worth a warning, not a lost plan.
         """
         try:
-            for path in sorted(self.output_dir.glob(f"*_{ts_str}.*")):
-                self.run.record_output(path)
-            for name in ("supplier_params.csv", "sku_planning_params.csv"):
-                path = self.output_dir / name
-                if path.exists():
-                    self.run.record_output(path)
+            self._collect_outputs()
             manifest_path = RunRegistry(self.output_dir).save(self.run)
             print()
             print(self.run.summary())

@@ -303,3 +303,32 @@ class TestScenarioComparison:
         second, _ = self._run(out, tmp_path / "store")
         comparison = RunRegistry(out).compare(first.run.run_id, second.run.run_id)
         assert comparison.basis == "identical"
+
+
+class TestTheManifestNamesEverythingTheRunWrote:
+    """
+    Outputs were collected once, at the end of `run_planning`. The policy stage writes
+    `parameter_suggestions` and `suggested_rules` after that, so the manifest listed
+    neither — including the suggested rules, which is what a planner acts on when
+    tuning a scenario, and so the output that least deserves to be the one with no
+    provenance.
+    """
+
+    def test_the_policy_stage_outputs_are_recorded_too(self, tmp_path):
+        from inventory_planning.provenance import RunRegistry
+
+        out = tmp_path / "out"
+        planner = InventoryPlanner(config_dir=CONFIG_DIR, output_dir=out,
+                                   interactive=False, store_root=tmp_path / "store")
+        inputs = planner.load_all(sorted(SAMPLE_DIR.glob("*.csv")))
+        results = planner.run_planning(**inputs)
+        planner.run_policy_analysis(results, inventory_df=inputs["inventory_df"],
+                                    open_po_df=inputs["open_po_df"])
+
+        recorded = [o["name"] for o in RunRegistry(out).get(planner.run.run_id)["outputs"]]
+        on_disk = {f.name for f in out.iterdir()
+                   if f.is_file() and planner.run.run_id in f.name}
+
+        assert on_disk - set(recorded) == set()
+        assert any(n.startswith("suggested_rules_") for n in recorded)
+        assert len(recorded) == len(set(recorded)), "an output was recorded twice"

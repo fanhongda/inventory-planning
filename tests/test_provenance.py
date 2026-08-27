@@ -375,6 +375,15 @@ class TestItReportsWhatItDoesNotKnow:
         assert m.unstorable_inputs == []
         assert "not yet storable" not in m.summary()
 
+    def test_recording_an_output_twice_keeps_one_entry(self, tmp_path, files):
+        """The collection runs again after the policy stage writes its files."""
+        a, _ = files
+        m = _manifest()
+        m.record_output(a, rows=1)
+        m.record_output(a, rows=2)
+        assert [o.name for o in m.outputs] == [a.name]
+        assert m.outputs[0].rows == 2
+
     def test_the_manifest_serialises(self, tmp_path, files):
         a, _ = files
         m = _manifest(config_dir=tmp_path, output_dir=tmp_path)

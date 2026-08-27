@@ -211,12 +211,18 @@ class RunManifest:
             )
 
     def record_output(self, path, rows: int = None) -> None:
+        """Idempotent by name: the collection runs again after the policy stage."""
         p = Path(path)
-        self.outputs.append(OutputRecord(
+        record = OutputRecord(
             name=p.name,
             rows=rows,
             bytes=p.stat().st_size if p.exists() else None,
-        ))
+        )
+        for i, existing in enumerate(self.outputs):
+            if existing.name == record.name:
+                self.outputs[i] = record
+                return
+        self.outputs.append(record)
 
     def record_rules(self, rule_ids) -> None:
         self.rule_ids = [str(r) for r in rule_ids]

@@ -15,12 +15,20 @@ modelling at all. `forecast_rmse` was in-sample, the residuals of the fit agains
 data it was fitted on, which is a measure of how closely a model can trace history
 rather than of anything it can predict.
 
-**Make-to-order items go straight to Croston** and are not backtested. Nothing is
-stocked against a forecast there, the demand is by construction intermittent, and
-Croston is the method for it — a competition would spend the time to arrive where it
-started. The policy comes from the ERP (`stocking_policy`, MTS/MTO); where a SKU has
-none, the old pattern-based routing still applies, because a guess about the policy is
-not a reason to change how an item is planned.
+**Every item with enough history is backtested, whatever its policy.** Make-to-order
+items used to go straight to Croston on the grounds that their demand is "by
+construction intermittent". It is not: `stocking_policy` is an ERP decision not to hold
+stock — because the item is configured to order, or expensive, or shipped monthly
+against a contract — and says nothing about how often it sells. The pipeline knows
+this elsewhere and reports it, in `run_policy_analysis`, as *held as MTO, demand
+recurs*. An MTO item that in fact orders every month was being forced onto a method
+built for the opposite case, and Croston answers with one number repeated across the
+horizon.
+
+Croston remains in the candidate pool and wins wherever it deserves to, which on a
+genuinely sporadic item is most of the time. What changed is that it has to win.
+Below `_MIN_BACKTEST_POINTS` there is not enough history to rank anything, and the
+routing falls back to the policy and then to the demand pattern as before.
 
 A **naive forecast is always in the pool**. Without it, "the best of five models" can
 still be worse than repeating last month's number, and nothing in the output would say
@@ -56,6 +64,12 @@ _BACKTEST_STEPS = 3
 # Below this many observed periods there is nothing to hold out, and a competition
 # decided on two points is not a competition.
 _MIN_BACKTEST_POINTS = 12
+# Share of periods that must carry demand before ARIMA is worth offering. Below it the
+# model has zeros to explain rather than a series, and explains them by extrapolating.
+# Set at a half rather than at the Syntetos-Boylan intermittence boundary (~0.76) so a
+# genuine every-other-month item keeps it: on one of those ARIMA recovers the phase —
+# `[0, 150, 0, 150, ...]` — which is a better answer than Croston's flat average of it.
+_MIN_DENSITY_FOR_ARIMA = 0.5
 # MAPE needs a non-zero actual to divide by. With fewer than this many across the whole
 # backtest the ranking would rest on one or two months, so RMSE decides instead — the
 # metric is reported either way rather than left to be assumed.
@@ -109,7 +123,7 @@ class Forecaster:
         trend_detected = seasonal_detected = False
         scores = {}
 
-        if policy == MTS and series.notna().sum() >= _MIN_BACKTEST_POINTS:
+        if series.notna().sum() >= _MIN_BACKTEST_POINTS:
             model_used, forecast_values, rmse, scores = self._select_by_backtest(series)
             selected_by = scores.pop("_metric")
         elif policy == MTO:
@@ -149,7 +163,13 @@ class Forecaster:
 
     # ── Choosing by competition ──────────────────────────────────────────────
 
-    def _candidates(self, series: pd.Series, horizon: int) -> dict:
+    @staticmethod
+    def _dense_enough_for_arima(series: pd.Series) -> bool:
+        """Whether a series has enough demand in it for ARIMA to be about anything."""
+        return bool(float((series > 0).mean()) >= _MIN_DENSITY_FOR_ARIMA)
+
+    def _candidates(self, series: pd.Series, horizon: int,
+                    allow_arima: bool = None) -> dict:
         """
         Every model's forecast for the next `horizon` periods, by name.
 
@@ -159,14 +179,41 @@ class Forecaster:
         out = {}
         trend = self._detect_trend(series)
         seasonal = self._detect_seasonality(series)
-        for name, build in (
+
+        # ARIMA is offered only where there is a series for it to be about.
+        #
+        # On a mostly-zero history it has no autocorrelation to find and fits the
+        # arrangement of the zeros instead: `[0]*6, 4, [0]*12, 14, 2, 25` is read as a
+        # ramp and run out to 148, against a maximum ever observed of 25. That case is
+        # in the tests because it happened on a real SKU, where SARIMAX forecast 63
+        # million a month. What kept it from being chosen was Croston scoring better —
+        # and Croston only scored better because its interval estimate started at 1.0
+        # and never converged, so the defence was resting on the bias fixed above.
+        #
+        # It is also 97% of the cost of a backtest: 5.15 ms a fit against 0.16 for ETS
+        # and 0.01 for Croston. At 30,000 SKUs that is ten minutes against under one.
+        # Correctness and cost point the same way here, which is rare enough to take.
+        #
+        # `allow_arima` is decided by the caller so that every fold of one backtest
+        # decides it the same way. Judged per fold it moves: the training windows differ
+        # by a period each, and a series sitting on the boundary admits ARIMA to some
+        # folds and not others, leaving it ranked on six points against everyone else's
+        # nine. Pooling across folds exists precisely so that no model is scored on a
+        # different sample from its rivals.
+        if allow_arima is None:
+            allow_arima = self._dense_enough_for_arima(series)
+
+        candidates = [
             ("ETS", lambda: self._fit_ets(series, trend, seasonal, horizon)),
-            ("ARIMA", lambda: self._fit_arima(series, horizon)),
+        ]
+        if allow_arima:
+            candidates.append(("ARIMA", lambda: self._fit_arima(series, horizon)))
+        for name, build in candidates + [
             ("SMA", lambda: self._fit_sma(series, horizon)),
             ("Croston", lambda: self._croston(series, horizon)[1]),
             # The floor every other model has to clear: repeat the last observation.
             ("Naive", lambda: np.full(horizon, float(series.iloc[-1]))),
-        ):
+        ]:
             try:
                 values = build()
             except Exception:
@@ -190,12 +237,17 @@ class Forecaster:
         origins = [n - steps - _BACKTEST_FOLDS + 1 + i for i in range(_BACKTEST_FOLDS)]
         origins = [o for o in origins if o >= _MIN_BACKTEST_POINTS - steps and o >= 4]
 
+        # Settled once, on the whole series, and applied to every fold. Which model
+        # classes are meaningful for an item is a property of the item, not of how much
+        # of it a particular fold was shown.
+        allow_arima = self._dense_enough_for_arima(series)
+
         pooled = {}
         for origin in origins:
             train, actual = series.iloc[:origin], series.iloc[origin:origin + steps].values
             if len(actual) == 0:
                 continue
-            for name, values in self._candidates(train, len(actual)).items():
+            for name, values in self._candidates(train, len(actual), allow_arima).items():
                 pooled.setdefault(name, {"err": [], "act": []})
                 pooled[name]["err"].extend(values[:len(actual)] - actual)
                 pooled[name]["act"].extend(actual)
@@ -218,7 +270,9 @@ class Forecaster:
             }
 
         metric = ("mape" if all(s["mape"] is not None for s in scored.values()) else "rmse")
-        final = self._candidates(series, self.horizon)
+        # The same admission the folds were judged under, so the winner of the ranking
+        # is guaranteed to be among the models refitted to produce the forecast.
+        final = self._candidates(series, self.horizon, allow_arima)
         ranked = sorted(scored, key=lambda k: scored[k][metric])
         best = next((n for n in ranked if n in final), ranked[0])
         values = final.get(best, np.full(self.horizon, float(series.tail(3).mean())))
@@ -327,14 +381,35 @@ class Forecaster:
         values = series.values.astype(float)
         n = len(values)
 
-        # Initialise on first non-zero observation
-        first_nonzero = next((i for i, v in enumerate(values) if v > 0), None)
-        if first_nonzero is None:
+        # Initialise from what was actually observed, not from a guess of 1.0.
+        #
+        # `n_hat = 1.0` says "demand every period", which is the one thing an
+        # intermittent series is not. With beta = 0.2 the estimate crawls towards the
+        # truth — 0.2 of the gap per demand epoch — so the starting value survives for
+        # as long as there are few epochs, and few epochs is the definition of the
+        # items this method is chosen for. An item ordered every fourth month came out
+        # 92% too high after three orders, 44% after five, and needed about thirty
+        # before the error fell under a percent: ten years of history for a quarterly
+        # reorder. The forecast is a rate, so the error goes straight into safety stock
+        # and lands on exactly the sparse, make-to-order items that should be holding
+        # least.
+        #
+        # `z_hat` moves from one observation to the mean of them for the same reason —
+        # not to remove a bias, since a single draw is unbiased, but because one draw
+        # on a series with five of them is a needlessly noisy place to start.
+        nonzero = np.flatnonzero(values > 0)
+        if len(nonzero) == 0:
             avg = series.mean()
             return "Croston", np.full(horizon, avg), float(series.std())
 
-        z_hat = values[first_nonzero]     # magnitude estimate
-        n_hat = 1.0                        # interval estimate (periods between transactions)
+        first_nonzero = int(nonzero[0])
+        z_hat = float(values[nonzero].mean())     # magnitude estimate
+        n_hat = (float(np.diff(nonzero).mean()) if len(nonzero) > 1
+                 # A single epoch has no interval to observe. What is known is that one
+                 # order arrived across the whole span, and that is the estimate — the
+                 # alternative is to assert an interval of one period, which is the
+                 # error being fixed.
+                 else max(1.0, float(n)))
         last_nonzero = first_nonzero
 
         residuals = []

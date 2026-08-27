@@ -36,19 +36,32 @@ import pandas as pd
 
 class SnapshotSaver:
 
-    def save(self, results: dict, config: dict, output_dir: Path) -> Path:
+    def save(self, results: dict, config: dict, output_dir: Path,
+             history_root: Path = None, stamp: str = None) -> Path:
         """
-        results:    output of InventoryPlanner.run_planning()
-        config:     stocking_policy.json contents
-        output_dir: the run's output directory (where CSVs were saved)
+        results:      output of InventoryPlanner.run_planning()
+        config:       stocking_policy.json contents
+        output_dir:   the run's output directory (where CSVs were saved)
+        history_root: where snapshots accumulate. Defaults to the old location.
 
         Returns path to the saved snapshot JSON.
+
+        `history_root` exists because deriving it from `output_dir.parent` made the
+        location depend on the shape of an unrelated argument: `--output output` wrote
+        to a git-*tracked* `history/` at the repository root while `--output output/real`
+        wrote to the ignored `output/history/`. Two homes for one series, and the
+        default was the one that commits planning data. The caller now resolves it —
+        to the fact store, which is outside the working tree — and the fallback is kept
+        so a direct caller passing only three arguments still lands where it used to.
         """
         run_dt = datetime.now()
         month_label = run_dt.strftime("%Y-%m")
-        ts_str = run_dt.strftime("%Y%m%d_%H%M")
+        # The run's id when the caller has one, so a snapshot names the run that wrote
+        # it and two runs a few seconds apart do not land on the same filename.
+        ts_str = stamp or run_dt.strftime("%Y%m%d_%H%M")
 
-        history_dir = output_dir.parent / "history" / month_label
+        root = Path(history_root) if history_root else output_dir.parent / "history"
+        history_dir = root / month_label
         history_dir.mkdir(parents=True, exist_ok=True)
 
         rec = results.get("recommendations", pd.DataFrame())

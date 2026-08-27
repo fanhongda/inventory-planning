@@ -163,12 +163,13 @@ class TestForecaster:
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
 class TestEndToEnd:
-    def test_full_pipeline(self):
+    def test_full_pipeline(self, tmp_path):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         planner = InventoryPlanner(
             config_dir=CONFIG_DIR,
             output_dir=OUTPUT_DIR,
             interactive=False,
+            store_root=tmp_path / "store",
         )
         sales_df,   _ = planner.load_sales_history(SAMPLE_DIR / "sales_history.csv")
         po_hist_df, _ = planner.load_po_history(SAMPLE_DIR / "po_history.csv")
@@ -201,3 +202,133 @@ class TestEndToEnd:
         assert all(i["sha256"] for i in manifest["inputs"])
         assert manifest["outputs"]
         assert manifest["input_fingerprint"] and manifest["config_fingerprint"]
+
+        # The run retained its facts, and the snapshot went to the store rather than
+        # to a directory derived from --output.
+        batches = planner.store.batches()
+        assert {b["doc_type"] for b in batches} == {
+            "sales_history", "po_history", "open_so", "open_po", "inventory"
+        }
+        assert all(b["valid_time"] for b in batches)
+        assert all(b["run_id"] == planner.run.run_id for b in batches)
+        # The parameter identity on a batch has to be the one the manifest records, or
+        # the two cannot be joined — which is the only reason it is on the batch.
+        assert all(b["config_fingerprint"] == manifest["config_fingerprint"]
+                   for b in batches)
+        assert list((planner.store.history_dir).glob("*/snapshot_*.json"))
+
+
+class TestScenarioComparison:
+    """
+    Two runs over one dataset under two rule sets. This is the comparison run identity
+    exists to make, and until the rule set reached `run_planning` it could not be made
+    at all: `parameters_file` only ever re-resolved the policy *report*, so a scenario
+    changed nothing a buyer would act on.
+    """
+
+    @staticmethod
+    def _scenario_rules(path):
+        path.write_text(
+            (CONFIG_DIR / "planning_parameters.md").read_text(encoding="utf-8")
+            .replace("service_level: 0.95", "service_level: 0.99")
+            .replace("review_period_days: 30          #", "review_period_days: 90          #"),
+            encoding="utf-8",
+        )
+        return path
+
+    def _run(self, out, store, parameters_file=None):
+        planner = InventoryPlanner(config_dir=CONFIG_DIR, output_dir=out,
+                                   interactive=False, store_root=store,
+                                   parameters_file=parameters_file)
+        inputs = planner.load_all(sorted(SAMPLE_DIR.glob("*.csv")))
+        results = planner.run_planning(**inputs)
+        return planner, results
+
+    def test_the_rule_set_reaches_the_plan(self, tmp_path):
+        """The point of the whole thing: the recommendations themselves have to move."""
+        alt = self._scenario_rules(tmp_path / "scenario_rules.md")
+        _, base = self._run(tmp_path / "a", tmp_path / "store")
+        _, scen = self._run(tmp_path / "b", tmp_path / "store", parameters_file=alt)
+
+        def review_periods(results):
+            frame = results["parameters"].frame
+            return dict(zip(frame["sku"], frame["review_period_days"]))
+
+        assert review_periods(base) != review_periods(scen)
+
+    def test_an_alternate_rule_set_compares_as_a_scenario(self, tmp_path):
+        from inventory_planning.provenance import RunRegistry
+
+        alt = self._scenario_rules(tmp_path / "scenario_rules.md")
+        out = tmp_path / "out"
+        base_planner, _ = self._run(out, tmp_path / "store")
+        scen_planner, _ = self._run(out, tmp_path / "store", parameters_file=alt)
+
+        registry = RunRegistry(out)
+        comparison = registry.compare(base_planner.run.run_id, scen_planner.run.run_id)
+        assert comparison.basis == "scenario"
+        assert comparison.same_inputs
+        assert not comparison.same_config
+        # The facts are pinned and the two runs are separate identities, so the batches
+        # each wrote still carry the config identity their own manifest records.
+        assert registry.get(base_planner.run.run_id)["config_fingerprint"] == \
+            registry.get(scen_planner.run.run_id)["config_fingerprint"]
+        assert registry.get(base_planner.run.run_id)["policy_fingerprint"] != \
+            registry.get(scen_planner.run.run_id)["policy_fingerprint"]
+
+    def test_runs_seconds_apart_do_not_overwrite_each_other(self, tmp_path):
+        """
+        Output files were stamped to the minute, from four independent `datetime.now()`
+        calls, so a planner trying a rule change and re-running immediately lost the
+        first result — and one run's own files could straddle a minute boundary and
+        disagree. The stamp is the run id.
+        """
+        alt = self._scenario_rules(tmp_path / "scenario_rules.md")
+        out = tmp_path / "out"
+        self._run(out, tmp_path / "store")
+        self._run(out, tmp_path / "store", parameters_file=alt)
+
+        recommendations = sorted(out.glob("purchase_recommendations_*.csv"))
+        assert len(recommendations) == 2
+        # And one run's outputs all agree on which run they came from.
+        stamps = {f.stem.split("purchase_recommendations_")[1] for f in recommendations}
+        for stamp in stamps:
+            assert (out / f"inventory_projection_{stamp}.csv").exists()
+
+    def test_two_runs_of_the_same_rule_set_are_identical(self, tmp_path):
+        from inventory_planning.provenance import RunRegistry
+
+        out = tmp_path / "out"
+        first, _ = self._run(out, tmp_path / "store")
+        second, _ = self._run(out, tmp_path / "store")
+        comparison = RunRegistry(out).compare(first.run.run_id, second.run.run_id)
+        assert comparison.basis == "identical"
+
+
+class TestTheManifestNamesEverythingTheRunWrote:
+    """
+    Outputs were collected once, at the end of `run_planning`. The policy stage writes
+    `parameter_suggestions` and `suggested_rules` after that, so the manifest listed
+    neither — including the suggested rules, which is what a planner acts on when
+    tuning a scenario, and so the output that least deserves to be the one with no
+    provenance.
+    """
+
+    def test_the_policy_stage_outputs_are_recorded_too(self, tmp_path):
+        from inventory_planning.provenance import RunRegistry
+
+        out = tmp_path / "out"
+        planner = InventoryPlanner(config_dir=CONFIG_DIR, output_dir=out,
+                                   interactive=False, store_root=tmp_path / "store")
+        inputs = planner.load_all(sorted(SAMPLE_DIR.glob("*.csv")))
+        results = planner.run_planning(**inputs)
+        planner.run_policy_analysis(results, inventory_df=inputs["inventory_df"],
+                                    open_po_df=inputs["open_po_df"])
+
+        recorded = [o["name"] for o in RunRegistry(out).get(planner.run.run_id)["outputs"]]
+        on_disk = {f.name for f in out.iterdir()
+                   if f.is_file() and planner.run.run_id in f.name}
+
+        assert on_disk - set(recorded) == set()
+        assert any(n.startswith("suggested_rules_") for n in recorded)
+        assert len(recorded) == len(set(recorded)), "an output was recorded twice"

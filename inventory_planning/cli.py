@@ -4,7 +4,8 @@ Usage:
   inventory-plan --sales <path> --po-history <path> --open-so <path>
                  --open-po <path> --inventory <path>
                  [--timeseries <path>] [--item-master <path>]
-                 [--planning-master <path>] [--output <dir>] [--no-interactive]
+                 [--planning-master <path>] [--output <dir>] [--parameters <path>]
+                 [--no-interactive]
 """
 
 import argparse
@@ -30,6 +31,11 @@ def main():
     parser.add_argument("--ts-months",    type=int, default=36, help="Rolling months for time series (default 36)")
     parser.add_argument("--output",       default="output", help="Output directory (default: ./output)")
     parser.add_argument("--config",       default=None,   help="Config directory (default: ./config)")
+    parser.add_argument("--parameters",   default=None,
+                        help="Rule set to plan under (default: <config>/planning_parameters.md). "
+                             "A different one is a scenario: it changes the review period and "
+                             "service level the recommendations are built on, and the run records "
+                             "it so the two can be compared afterwards.")
     parser.add_argument("--no-interactive", action="store_true", help="Skip column-mapping confirmation prompts")
 
     args = parser.parse_args()
@@ -38,6 +44,7 @@ def main():
         config_dir=args.config,
         output_dir=args.output,
         interactive=not args.no_interactive,
+        parameters_file=args.parameters,
     )
 
     print("Loading input files...")

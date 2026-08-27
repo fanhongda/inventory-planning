@@ -17,7 +17,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-cov"]
+dev = ["pytest>=7", "pytest-cov", "pyarrow>=14"]
+# The fact store writes parquet rather than CSV because it sits exactly where the type
+# damage happens — a CSV round trip turns `000000000000123456` back into 123456. Kept
+# optional so a planning-only install stays small; without it the store declines to
+# write and says so, and the run still produces a plan.
+store = ["pyarrow>=14"]
 
 [project.scripts]
 inventory-plan = "inventory_planning.cli:main"

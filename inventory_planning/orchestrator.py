@@ -35,12 +35,20 @@ class InventoryPlanner:
     """
 
     def __init__(self, config_dir: Union[str, Path] = None, output_dir: Union[str, Path] = None,
-                 interactive: bool = True):
+                 interactive: bool = True, store_root: Union[str, Path] = None,
+                 parameters_file: Union[str, Path] = None):
         base = Path(__file__).parents[1]
         self.config_dir = Path(config_dir) if config_dir else base / "config"
         self.output_dir = Path(output_dir) if output_dir else base / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.interactive = interactive
+        # The rule set this planner plans under. A scenario is a planner built with a
+        # different one: the rules decide the review period that sizes an order and the
+        # service level that sizes safety stock, so they have to reach `run_planning`
+        # rather than only the policy report, or a scenario changes nothing a buyer acts
+        # on. One planner, one rule set, one run identity.
+        self.parameters_file = (Path(parameters_file) if parameters_file
+                                else self.config_dir / "planning_parameters.md")
         self._quality_log: list = []   # accumulates quality reports across all loads
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
@@ -48,7 +56,10 @@ class InventoryPlanner:
         # Identity for this run: what it read, what it resolved, what code ran. Started
         # here rather than at save time so the config is fingerprinted before anything
         # has had a chance to be edited mid-run.
-        self.run = RunManifest.begin(config_dir=self.config_dir, output_dir=self.output_dir)
+        self.run = RunManifest.begin(config_dir=self.config_dir, output_dir=self.output_dir,
+                                     policy_file=self.parameters_file)
+        self._store = None             # built on first use; see `store`
+        self.store_root = store_root   # None -> $INVENTORY_PLANNING_STORE, then XDG
 
         # Readers
         self.sales_reader   = SalesHistoryReader(self.config_dir)
@@ -196,7 +207,7 @@ class InventoryPlanner:
             resolved, recommendations=results.get("recommendations"))
         print()
         print(suggestions.summary())
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        stamp = self.run.run_id
         csv_path = suggestions.to_csv(self.output_dir / f"parameter_suggestions_{stamp}.csv")
         md_path = self.output_dir / f"suggested_rules_{stamp}.md"
         suggestions.to_rules_markdown(md_path)
@@ -234,12 +245,16 @@ class InventoryPlanner:
 
         self._quality_log.append({
             "doc_type": "policy",
-            "file": str((parameters_file
-                         or (self.config_dir / "planning_parameters.md")).name),
+            "file": str(Path(parameters_file).name if parameters_file
+                        else self.parameters_file.name),
             "rows_loaded": len(attributes),
             "issues": [str(h) for h in resolved.conflicts],
             "status": "WARNINGS" if resolved.conflicts else "OK",
         })
+        # This stage writes outputs of its own after `run_planning` recorded the
+        # manifest, so the outputs are collected again and the manifest rewritten. The
+        # fingerprints do not move — the rule set was fixed when the run began.
+        self._record_run_state()
         return out
 
     # ------------------------------------------------------------------
@@ -357,7 +372,7 @@ class InventoryPlanner:
             if len(levels):
                 service_target = float(levels.mode().iloc[0])
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        stamp = self.run.run_id
         path = self.output_dir / f"kpi_review_{stamp}.html"
         KPIReport(title).render(
             service=service, should_be=should_be, ordering=ordering,
@@ -382,6 +397,88 @@ class InventoryPlanner:
     # ------------------------------------------------------------------
     # Phase 1b: Contract-driven intake (preferred)
     # ------------------------------------------------------------------
+
+    @property
+    def store(self):
+        """
+        The fact store, or None when it cannot be opened.
+
+        Built lazily and never allowed to raise into the pipeline. A store on a schema
+        this code does not understand, an unwritable directory, a missing parquet
+        library: each is a warning and a run that still produces a plan. The store is
+        written by this phase and read by nothing, so its absence costs history and
+        costs no correctness.
+        """
+        if self._store is not None:
+            return self._store or None
+        try:
+            from .store import FactStore
+            self._store = FactStore(self.store_root)
+            for note in self._store.notes:
+                print(f"  Note: {note}")
+        except Exception as e:
+            print(f"  Warning: fact store unavailable ({e}) — planning continues, "
+                  f"nothing is being retained")
+            self._store = False
+        return self._store or None
+
+    def _shadow_write(self, frames: dict, valid_time) -> None:
+        """
+        Write this run's facts to the store, which nothing reads yet.
+
+        Phase one of three. The pipeline goes on reading its files; only when a run's
+        outputs can be shown identical from either source does anything start reading
+        the store. Writing starts first regardless, because history not collected
+        cannot be recovered later — every week spent waiting for the read path is a
+        week of positions that can never be reconstructed.
+
+        `valid_time` is the run's anchor: the newest date the data itself carries, from
+        `latest_observed_date`. That is a property of the content, unlike a file's
+        mtime, which a copy or a re-download rewrites while the data keeps describing
+        whatever it described. Per-document valid times — an inventory snapshot date
+        that differs from the sales anchor — belong with the merge interface, which
+        needs a reviewed plan in front of a human anyway.
+        """
+        store = self.store
+        if store is None:
+            return
+        if valid_time is None:
+            print("  Note: no date anchor in the data — nothing retained, because a "
+                  "batch with a guessed valid_time is worse than no batch")
+            return
+
+        by_source = {i.doc_type: i for i in self.run.inputs}
+        seen_notes = len(store.notes)
+        written = 0
+        for doc_type, frame in frames.items():
+            if frame is None or not len(frame):
+                continue
+            record = by_source.get(doc_type)
+            try:
+                batch = store.write_batch(
+                    doc_type=doc_type,
+                    frame=frame,
+                    valid_time=valid_time,
+                    source_name=record.name if record else "",
+                    source_sha=record.sha256 if record else None,
+                    config_fingerprint=self.run.config_fingerprint,
+                    run_id=self.run.run_id,
+                    key_verdict=record.key_verdict if record else None,
+                    storable=record.storable if record else None,
+                    written_by="pipeline",
+                )
+            except Exception as e:
+                print(f"  Warning: {doc_type} not retained ({e})")
+                continue
+            if batch is not None:
+                written += 1
+        if written:
+            print(f"  Retained: {written} batch(es) as of {valid_time} -> {store.root}")
+        # A run that retained nothing is the normal case for a re-run of the same
+        # extract, and saying so is the difference between "already have this" and a
+        # store that has quietly stopped working.
+        for note in store.notes[seen_notes:]:
+            print(f"  Note: {note}")
 
     def load_all(
         self,
@@ -480,7 +577,7 @@ class InventoryPlanner:
         if not report.records:
             return None
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        stamp = self.run.run_id
         path = self.output_dir / f"supersessions_{stamp}.csv"
         write_csv(report.to_frame(), path)
         print(f"    Merged item numbers : {path}")
@@ -558,6 +655,16 @@ class InventoryPlanner:
         # single-node and every join downstream is on `sku` alone, so a SKU held in two
         # locations would fan out into two planning rows that each match the same open
         # PO and the same backlog — one saying pull in, the other saying push out.
+        # Kept before the collapse. `consolidate_to_planning_grain` sums storage
+        # locations into one row per SKU, which is right for planning and destroys the
+        # only record of where the stock actually was: the surviving `location_id` is
+        # the first code seen, so 100 sellable in `01` plus 40 quarantined in `02`
+        # becomes 140 in `01`. Retaining that would put a fabricated location on every
+        # stored row — against a contract whose natural key is `[sku, location_id]` —
+        # and would discard exactly the per-location detail the topology work in
+        # TODO.md is waiting on. History not collected cannot be recovered later, which
+        # is the whole argument for writing the store before anything reads it.
+        inventory_as_read = inventory_df
         inventory_df = consolidate_to_planning_grain(
             inventory_df, planning_location=self.inv_reader.location_id
         )
@@ -578,6 +685,12 @@ class InventoryPlanner:
         }, anchor=as_of)
         print()
         print(intake.summary())
+
+        self._shadow_write({
+            "sales_history": sales_df, "po_history": po_history_df,
+            "open_so": open_so_df, "open_po": open_po_df,
+            "inventory": inventory_as_read,
+        }, valid_time=as_of)
 
         # Step 1: Demand time series + summary
         print("\n[1/7] Building demand time series...")
@@ -771,8 +884,9 @@ class InventoryPlanner:
         from .policy.parameters import PlanningParameters
         from .policy.profile import build_policy_profile
 
-        params_file = parameters_file or (self.config_dir / "planning_parameters.md")
+        params_file = Path(parameters_file) if parameters_file else self.parameters_file
         planning_params = PlanningParameters(params_file)
+        self.run.note_policy_override(params_file)
         self.run.record_rules(r.rule_id for r in planning_params.rules)
 
         attributes, crosscheck = build_sku_attributes(
@@ -884,7 +998,7 @@ class InventoryPlanner:
         )
 
     def _save_outputs(self, results: dict) -> None:
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M")
+        ts_str = self.run.run_id
         out = self.output_dir
 
         # ── CSV outputs ───────────────────────────────────────────────────────
@@ -909,16 +1023,48 @@ class InventoryPlanner:
         # Save planning snapshot for next-month feedback comparison
         try:
             policy_cfg = json.loads((self.config_dir / "stocking_policy.json").read_text(encoding="utf-8"))
-            snapshot_path = SnapshotSaver().save(results, policy_cfg, out)
+            from .store.fact_store import history_root
+            snapshot_path = SnapshotSaver().save(
+                results, policy_cfg, out,
+                history_root=history_root(self.store_root),
+                stamp=self.run.run_id,
+            )
             print(f"  Snapshot saved:   {snapshot_path.name}")
         except Exception as e:
             print(f"  Warning: snapshot save failed ({e})")
 
-        self._record_run(results, ts_str)
+        self._record_run()
 
         print(f"\n  Outputs saved to: {out}")
 
-    def _record_run(self, results: dict, ts_str: str) -> None:
+    def _collect_outputs(self) -> None:
+        """
+        Record every file this run has written so far. Safe to run again.
+
+        Run again is the point: `_save_outputs` collects at the end of `run_planning`,
+        and the policy stage writes `parameter_suggestions`, `suggested_rules` and the
+        source cross-check afterwards. Collecting only once left those out of the
+        manifest — including the suggested rules, which is the output a planner acts on
+        when tuning a scenario and so the one that least deserves to be the one with no
+        provenance.
+        """
+        for path in sorted(self.output_dir.glob(f"*_{self.run.run_id}.*")):
+            if path.is_file():
+                self.run.record_output(path)
+        for name in ("supplier_params.csv", "sku_planning_params.csv"):
+            path = self.output_dir / name
+            if path.exists():
+                self.run.record_output(path)
+
+    def _record_run_state(self) -> None:
+        """Write the manifest as it now stands. Safe to call more than once per run."""
+        try:
+            self._collect_outputs()
+            RunRegistry(self.output_dir).save(self.run)
+        except Exception as e:
+            print(f"  Warning: run manifest not updated ({e})")
+
+    def _record_run(self) -> None:
         """
         Bind this run's outputs to the facts, parameters and code behind them.
 
@@ -926,12 +1072,7 @@ class InventoryPlanner:
         an unwritable registry is worth a warning, not a lost plan.
         """
         try:
-            for path in sorted(self.output_dir.glob(f"*_{ts_str}.*")):
-                self.run.record_output(path)
-            for name in ("supplier_params.csv", "sku_planning_params.csv"):
-                path = self.output_dir / name
-                if path.exists():
-                    self.run.record_output(path)
+            self._collect_outputs()
             manifest_path = RunRegistry(self.output_dir).save(self.run)
             print()
             print(self.run.summary())

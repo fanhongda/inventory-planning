@@ -113,6 +113,10 @@ class RunManifest:
     config_dir: str = ""
     code: Dict[str, Any] = dc_field(default_factory=dict)
     config_files: Dict[str, str] = dc_field(default_factory=dict)
+    # The rules file the run actually resolved against, which is not necessarily one of
+    # the files above: `run_policy_analysis(parameters_file=...)` takes a path anywhere
+    # on disk, and running an alternate rule set is exactly what a scenario is.
+    policy_files: Dict[str, str] = dc_field(default_factory=dict)
     rule_ids: List[str] = dc_field(default_factory=list)
     inputs: List[InputRecord] = dc_field(default_factory=list)
     outputs: List[OutputRecord] = dc_field(default_factory=list)
@@ -121,7 +125,8 @@ class RunManifest:
     # ── Start ────────────────────────────────────────────────────────────────
 
     @classmethod
-    def begin(cls, config_dir: Path = None, output_dir: Path = None) -> "RunManifest":
+    def begin(cls, config_dir: Path = None, output_dir: Path = None,
+              policy_file: Path = None) -> "RunManifest":
         now = datetime.now()
         run = cls(
             # Sortable, and unique even when two runs land in the same second — the
@@ -133,6 +138,8 @@ class RunManifest:
         )
         run._read_code()
         run._read_config(Path(config_dir) if config_dir else None)
+        if policy_file is not None:
+            run.set_policy_file(policy_file)
         return run
 
     def _read_code(self) -> None:
@@ -204,15 +211,56 @@ class RunManifest:
             )
 
     def record_output(self, path, rows: int = None) -> None:
+        """Idempotent by name: the collection runs again after the policy stage."""
         p = Path(path)
-        self.outputs.append(OutputRecord(
+        record = OutputRecord(
             name=p.name,
             rows=rows,
             bytes=p.stat().st_size if p.exists() else None,
-        ))
+        )
+        for i, existing in enumerate(self.outputs):
+            if existing.name == record.name:
+                self.outputs[i] = record
+                return
+        self.outputs.append(record)
 
     def record_rules(self, rule_ids) -> None:
         self.rule_ids = [str(r) for r in rule_ids]
+
+    def set_policy_file(self, path) -> None:
+        """
+        The rule set this run plans under. Set once, when the run begins.
+
+        The rules are an input, not a by-product: they decide the review period that
+        sizes an order and the service level that sizes safety stock, so a run under a
+        different rule set is a different run with different recommendations — which is
+        what a scenario is. Recording them at the start is what lets `policy_fingerprint`
+        hold still for the whole run, the same reason `config_fingerprint` is read here.
+        """
+        p = Path(path)
+        digest = _sha256_file(p)
+        self.policy_files = {str(p): digest} if digest else {}
+        if not digest:
+            self.notes.append(f"rules file {p} unreadable — policy unfingerprinted")
+
+    def note_policy_override(self, path) -> None:
+        """
+        A later stage resolved a *different* rules file than the run began with.
+
+        Recorded as a note and deliberately not folded into the fingerprint: a value
+        stamped on batches at intake cannot move afterwards without those batches
+        ceasing to be joinable to their manifest. It is worth saying out loud, though —
+        it means the plan and the report were produced under different rules.
+        """
+        p = str(Path(path))
+        if p in self.policy_files:
+            return
+        planned_under = ", ".join(self.policy_files) or "<none>"
+        self.notes.append(
+            f"rules differ within the run: planned under {planned_under}, "
+            f"policy report resolved {p}. The recommendations are the first file's. "
+            f"For a scenario, construct the planner with parameters_file instead."
+        )
 
     # ── Fingerprints ─────────────────────────────────────────────────────────
 
@@ -223,10 +271,39 @@ class RunManifest:
 
     @property
     def config_fingerprint(self) -> str:
-        """The parameters and rules, which is what a scenario varies."""
+        """
+        The configuration that transformed the inputs — FX table, incoterm rules, node
+        map. Fixed at `begin()` and never moved afterwards, because this is the value
+        stamped on every batch at intake time and a batch has to be joinable back to
+        the manifest that describes the run that wrote it.
+
+        The rules do not belong here. They decide what the pipeline concludes, not what
+        the canonical frames contain, and they are resolved long after the batches are
+        written. `policy_fingerprint` carries them instead.
+        """
         return _sha256_of(
-            [f"{name}:{digest}" for name, digest in sorted(self.config_files.items())]
-            + ["rules:" + ",".join(sorted(self.rule_ids))]
+            f"{name}:{digest}" for name, digest in sorted(self.config_files.items())
+        )[:16]
+
+    @property
+    def policy_fingerprint(self) -> str:
+        """
+        The rule set in force, which is what a scenario actually varies.
+
+        Over the digest of the rules file the run plans under, which need not be the one
+        in the config directory — a scenario is exactly a run under a rule set from
+        somewhere else. Hashing the config directory alone made two such runs
+        indistinguishable, and `compare` then called the pair `identical`, whose
+        description tells the reader that a real policy result is non-determinism.
+
+        Over the *file*, not the rule ids parsed from it. The ids are read during the
+        run, and a fingerprint that moved partway through would leave every batch
+        already written stamped with a value the manifest no longer holds. The file
+        digest covers strictly more anyway: editing a rule's body changes it, where the
+        ids would not.
+        """
+        return _sha256_of(
+            f"{name}:{digest}" for name, digest in sorted(self.policy_files.items())
         )[:16]
 
     @property
@@ -241,10 +318,12 @@ class RunManifest:
             "run_at": self.run_at,
             "input_fingerprint": self.input_fingerprint,
             "config_fingerprint": self.config_fingerprint,
+            "policy_fingerprint": self.policy_fingerprint,
             "code": self.code,
             "output_dir": self.output_dir,
             "config_dir": self.config_dir,
             "config_files": self.config_files,
+            "policy_files": self.policy_files,
             "rule_ids": self.rule_ids,
             "inputs": [asdict(i) for i in self.inputs],
             "outputs": [asdict(o) for o in self.outputs],
@@ -258,6 +337,7 @@ class RunManifest:
             "run_at": self.run_at,
             "input_fingerprint": self.input_fingerprint,
             "config_fingerprint": self.config_fingerprint,
+            "policy_fingerprint": self.policy_fingerprint,
             "git_sha": (self.code or {}).get("git_sha"),
             "dirty": (self.code or {}).get("dirty"),
             "inputs": len(self.inputs),
@@ -272,7 +352,9 @@ class RunManifest:
             f"  Run {self.run_id}",
             f"    facts   {self.input_fingerprint}  ({len(self.inputs)} inputs)",
             f"    config  {self.config_fingerprint}  "
-            f"({len(self.config_files)} files, {len(self.rule_ids)} rules)",
+            f"({len(self.config_files)} files)",
+            f"    policy  {self.policy_fingerprint}  "
+            f"({len(self.rule_ids)} rules)",
             f"    code    {sha}{dirty}",
         ]
         unstorable = self.unstorable_inputs
@@ -304,7 +386,9 @@ class RunComparison:
 
     @property
     def same_config(self) -> bool:
-        return self.a.get("config_fingerprint") == self.b.get("config_fingerprint")
+        """Both halves: what transformed the inputs, and what rules were in force."""
+        return (self.a.get("config_fingerprint") == self.b.get("config_fingerprint")
+                and self.a.get("policy_fingerprint") == self.b.get("policy_fingerprint"))
 
     @property
     def same_code(self) -> bool:
@@ -353,18 +437,34 @@ class RunRegistry:
         return path
 
     def index(self) -> List[Dict[str, Any]]:
+        """
+        One entry per run, newest state last.
+
+        The file is an append-only log and a run is written to it more than once: the
+        planning stage records what it read, and the policy stage — which runs
+        afterwards and may resolve an entirely different rule file — records what was
+        in force. Later lines for a run supersede earlier ones, in the position the run
+        first appeared, so ordering still reflects when each run started.
+        """
         if not self.index_path.exists():
             return []
-        out = []
+        order: List[str] = []
+        latest: Dict[str, Dict[str, Any]] = {}
         for line in self.index_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-        return out
+            run_id = entry.get("run_id")
+            if run_id is None:
+                continue
+            if run_id not in latest:
+                order.append(run_id)
+            latest[run_id] = entry
+        return [latest[run_id] for run_id in order]
 
     def get(self, run_id: str) -> Optional[Dict[str, Any]]:
         path = self.dir / f"{run_id}.json"

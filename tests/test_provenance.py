@@ -151,13 +151,29 @@ class TestConfigFingerprint:
         after = _manifest(config_dir=cfg)
         assert before.config_fingerprint != after.config_fingerprint
 
-    def test_the_rules_in_force_are_part_of_it(self, tmp_path):
+    def test_recording_rules_does_not_move_it(self, tmp_path):
+        """
+        It used to. The rules are parsed well after the shadow write has stamped
+        batches with this value, so a fingerprint that included them was a different
+        number before and after — and every batch carried one that appeared nowhere in
+        the manifest.
+        """
         cfg = tmp_path / "config"; cfg.mkdir()
         (cfg / "stocking_policy.json").write_text('{"a": 1}', encoding="utf-8")
-        one, two = _manifest(config_dir=cfg), _manifest(config_dir=cfg)
-        one.record_rules(["R-001"])
-        two.record_rules(["R-001", "R-002"])
-        assert one.config_fingerprint != two.config_fingerprint
+        m = _manifest(config_dir=cfg)
+        before = m.config_fingerprint
+        m.record_rules(["R-001", "R-002"])
+        assert m.config_fingerprint == before
+        assert m.rule_ids == ["R-001", "R-002"]
+
+    def test_editing_the_rules_file_still_moves_it(self, tmp_path):
+        """Which is why dropping rule_ids from the hash covers nothing less."""
+        cfg = tmp_path / "config"; cfg.mkdir()
+        (cfg / "planning_parameters.md").write_text("rule_id: R-001\n", encoding="utf-8")
+        before = _manifest(config_dir=cfg).config_fingerprint
+        (cfg / "planning_parameters.md").write_text("rule_id: R-001\nrule_id: R-002\n",
+                                                    encoding="utf-8")
+        assert _manifest(config_dir=cfg).config_fingerprint != before
 
     def test_a_missing_config_directory_is_a_note_not_a_failure(self, tmp_path):
         m = _manifest(config_dir=tmp_path / "nope")
@@ -166,11 +182,88 @@ class TestConfigFingerprint:
         assert m.config_fingerprint
 
 
+class TestPolicyFingerprint:
+    """
+    The rule set is an input to the run, not a by-product of it: the rules decide the
+    review period that sizes an order and the service level that sizes safety stock, so
+    a run under a different rule set is a different run. It is therefore fixed when the
+    run begins, exactly like the config directory, and for the same reason — the value
+    is stamped on batches at intake and cannot move afterwards.
+    """
+
+    def test_a_different_rules_file_moves_it(self, tmp_path):
+        base = tmp_path / "planning_parameters.md"
+        base.write_text("service_level: 0.95\n", encoding="utf-8")
+        alt = tmp_path / "scenario_rules.md"
+        alt.write_text("service_level: 0.99\n", encoding="utf-8")
+
+        one = RunManifest.begin(policy_file=base)
+        two = RunManifest.begin(policy_file=alt)
+        assert one.policy_fingerprint != two.policy_fingerprint
+
+    def test_editing_the_rules_in_place_moves_it_too(self, tmp_path):
+        """Over the file, so a rule's body counts — the ids alone would not catch it."""
+        rules = tmp_path / "planning_parameters.md"
+        rules.write_text("R-001:\n  service_level: 0.95\n", encoding="utf-8")
+        before = RunManifest.begin(policy_file=rules).policy_fingerprint
+        rules.write_text("R-001:\n  service_level: 0.99\n", encoding="utf-8")
+        assert RunManifest.begin(policy_file=rules).policy_fingerprint != before
+
+    def test_the_same_rules_file_does_not(self, tmp_path):
+        rules = tmp_path / "planning_parameters.md"
+        rules.write_text("service_level: 0.95\n", encoding="utf-8")
+        assert (RunManifest.begin(policy_file=rules).policy_fingerprint
+                == RunManifest.begin(policy_file=rules).policy_fingerprint)
+
+    def test_reading_the_rules_does_not_move_it(self, tmp_path):
+        """`record_rules` runs mid-flight; batches are already stamped by then."""
+        rules = tmp_path / "rules.md"; rules.write_text("x\n", encoding="utf-8")
+        m = RunManifest.begin(policy_file=rules)
+        before = m.policy_fingerprint
+        m.record_rules(["R-001", "R-002"])
+        assert m.policy_fingerprint == before
+
+    def test_it_does_not_disturb_the_config_fingerprint(self, tmp_path):
+        cfg = tmp_path / "config"; cfg.mkdir()
+        (cfg / "fx_rates.json").write_text('{"a": 1}', encoding="utf-8")
+        rules = tmp_path / "rules.md"; rules.write_text("x\n", encoding="utf-8")
+        with_rules = RunManifest.begin(config_dir=cfg, policy_file=rules)
+        without = RunManifest.begin(config_dir=cfg)
+        assert with_rules.config_fingerprint == without.config_fingerprint
+
+    def test_an_unreadable_rules_file_is_a_note_not_a_failure(self, tmp_path):
+        m = RunManifest.begin(policy_file=tmp_path / "gone.md")
+        assert any("unfingerprinted" in n for n in m.notes)
+        assert m.policy_fingerprint
+
+    def test_a_late_different_rules_file_is_a_note_not_a_new_fingerprint(self, tmp_path):
+        """
+        Folding it in would move a value already stamped on this run's batches, so
+        those batches would stop being joinable to their own manifest. It is still
+        worth saying: the plan and the report came from different rules.
+        """
+        base = tmp_path / "base.md"; base.write_text("a\n", encoding="utf-8")
+        alt = tmp_path / "alt.md"; alt.write_text("b\n", encoding="utf-8")
+        m = RunManifest.begin(policy_file=base)
+        before = m.policy_fingerprint
+        m.note_policy_override(alt)
+
+        assert m.policy_fingerprint == before
+        assert any("rules differ within the run" in n for n in m.notes)
+
+    def test_resolving_the_run_s_own_rules_file_says_nothing(self, tmp_path):
+        base = tmp_path / "base.md"; base.write_text("a\n", encoding="utf-8")
+        m = RunManifest.begin(policy_file=base)
+        m.note_policy_override(base)
+        assert not any("rules differ" in n for n in m.notes)
+
+
 class TestComparisonNamesWhatMoved:
     @staticmethod
-    def _entry(inputs="i1", config="c1", sha="s1"):
+    def _entry(inputs="i1", config="c1", sha="s1", policy="p1"):
         return {"run_id": "r", "input_fingerprint": inputs,
-                "config_fingerprint": config, "git_sha": sha}
+                "config_fingerprint": config, "policy_fingerprint": policy,
+                "git_sha": sha}
 
     def test_nothing_moved(self):
         c = RunComparison(a=self._entry(), b=self._entry())
@@ -196,6 +289,12 @@ class TestComparisonNamesWhatMoved:
         c = RunComparison(a=self._entry(), b=self._entry(sha="s2"))
         assert c.basis == "mixed"
 
+    def test_a_rule_set_change_alone_is_a_scenario(self):
+        """The case that read as `identical` while only the config dir was hashed."""
+        c = RunComparison(a=self._entry(), b=self._entry(policy="p2"))
+        assert c.basis == "scenario"
+        assert not c.same_config
+
 
 class TestRegistry:
     def test_a_saved_run_comes_back(self, tmp_path, files):
@@ -216,6 +315,24 @@ class TestRegistry:
             registry.save(m)
             ids.append(m.run_id)
         assert [e["run_id"] for e in registry.index()] == ids
+
+    def test_a_run_saved_twice_appears_once_in_its_original_position(self, tmp_path):
+        """
+        The planning stage records what a run read; the policy stage records what was
+        in force, afterwards, and may have resolved a different rule file. Both write.
+        The log keeps every line; a read of it keeps the newest per run.
+        """
+        registry = RunRegistry(tmp_path)
+        first, second = _manifest(output_dir=tmp_path), _manifest(output_dir=tmp_path)
+        registry.save(first)
+        registry.save(second)
+        first.record_rules(["R-001"])
+        registry.save(first)
+
+        index = registry.index()
+        assert [e["run_id"] for e in index] == [first.run_id, second.run_id]
+        assert index[0]["policy_fingerprint"] == first.policy_fingerprint
+        assert len(registry.index_path.read_text(encoding="utf-8").splitlines()) == 3
 
     def test_a_truncated_index_line_does_not_lose_the_rest(self, tmp_path):
         registry = RunRegistry(tmp_path)
@@ -257,6 +374,15 @@ class TestItReportsWhatItDoesNotKnow:
         m.record_input(a, doc_type="open_po", key_verdict="complete", storable=True)
         assert m.unstorable_inputs == []
         assert "not yet storable" not in m.summary()
+
+    def test_recording_an_output_twice_keeps_one_entry(self, tmp_path, files):
+        """The collection runs again after the policy stage writes its files."""
+        a, _ = files
+        m = _manifest()
+        m.record_output(a, rows=1)
+        m.record_output(a, rows=2)
+        assert [o.name for o in m.outputs] == [a.name]
+        assert m.outputs[0].rows == 2
 
     def test_the_manifest_serialises(self, tmp_path, files):
         a, _ = files

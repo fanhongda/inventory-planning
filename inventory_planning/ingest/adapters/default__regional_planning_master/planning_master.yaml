@@ -60,9 +60,8 @@ column_map:
   supplier: vendor name
   description: Material description
   # The segmentation the forecast and the sales review are grouped by. This template
-  # carries the hierarchy in two columns: `NBU` is the business unit (Water, Inert Gas,
-  # Halocarbon, Mechanical) and `NBU 1` the product line under it (Fire Grooved,
-  # SAPPHIRE Hardware, Standard Commercial Sprinklers). The finer level is the family.
+  # carries the hierarchy in two columns: `NBU` is the business unit and `NBU 1` the
+  # product line under it. The finer level is the family.
   #
   # Mapped here rather than left to the contract aliases because a frozen adapter is
   # the whole column map, not a set of overrides: a field added to the contract later
@@ -96,7 +95,7 @@ notes:
     `material` and `alternate_material` are carried only as the coalesce inputs. Nothing
     downstream joins on them — the join key is the derived `sku`.
   - >
-    `NBU` is not clean: it holds both `Water` and `Water Segment`, and both `Mechanical`
-    and `Mechanical Segment`, for what are one business unit each. The values are
+    `NBU` is not clean: two of its business units appear twice each, once under the
+    bare name and once with a `Segment` suffix appended. The values are
     normalised downstream rather than here — an adapter's job is to say which column a
     field is in, not to decide that two of its values are the same thing.

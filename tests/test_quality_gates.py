@@ -40,9 +40,9 @@ class TestOneThingSpelledSeveralWays:
         assert canonical("INDIA") == canonical("India") == canonical("  india ")
 
     def test_a_trailing_noise_word_is_not_meaning(self):
-        """`Water` and `Water Segment` are one business unit in the source master."""
-        assert canonical("Water") == canonical("Water Segment")
-        assert canonical("Mechanical") == canonical("Mechanical Segment")
+        """One business unit, spelled with and without a `Segment` suffix."""
+        assert canonical("Hydraulics") == canonical("Hydraulics Segment")
+        assert canonical("Fittings") == canonical("Fittings Segment")
 
     def test_a_noise_word_alone_is_still_a_value(self):
         """Stripping the suffix off `Segment` would leave nothing to group by."""
@@ -57,20 +57,20 @@ class TestOneThingSpelledSeveralWays:
         assert set(normalise(s, "country").values) == {"India"}
 
     def test_a_tie_keeps_the_shorter_spelling(self):
-        s = pd.Series(["Water Segment", "Water"])
-        assert set(normalise(s, "bu").values) == {"Water"}
+        s = pd.Series(["Hydraulics Segment", "Hydraulics"])
+        assert set(normalise(s, "bu").values) == {"Hydraulics"}
 
     def test_every_merge_is_reported(self):
         """The fold is a judgement about the business — it may not happen silently."""
-        s = pd.Series(["Water"] * 5 + ["Water Segment"] * 2 + ["Inert Gas"])
+        s = pd.Series(["Hydraulics"] * 5 + ["Hydraulics Segment"] * 2 + ["Sensors"])
         result = normalise(s, "business_unit")
         assert len(result.collisions) == 1
         collision = result.collisions[0]
-        assert collision.kept == "Water"
-        assert collision.merged == ["Water Segment"]
+        assert collision.kept == "Hydraulics"
+        assert collision.merged == ["Hydraulics Segment"]
 
     def test_distinct_values_are_left_alone(self):
-        s = pd.Series(["Water", "Inert Gas", "Halocarbon"])
+        s = pd.Series(["Hydraulics", "Sensors", "Pumps"])
         assert normalise(s, "bu").collisions == []
 
 

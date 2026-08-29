@@ -2,10 +2,11 @@
 Normalising the values a dimension is grouped by.
 
 A dimension column arrives from an ERP as free text that several people have typed
-over several years, and the same business unit appears in it more than once. In one
-real master `NBU` holds both `Water` and `Water Segment`, and both `Mechanical` and
-`Mechanical Segment`; in the sales history beside it `Billto Country` holds `India`
-and `INDIA`. Nothing is missing and nothing is malformed — the file looks clean.
+over several years, and the same business unit appears in it more than once. One real
+master carries two business units each spelled twice — the name alone and the name
+with a `Segment` suffix — and the sales history beside it holds `India` and `INDIA`.
+Nothing is missing and nothing is malformed; the file looks clean. (The values used as
+examples throughout this module stand in for the real ones.)
 
 What it does to a report is not cosmetic. Every rollup splits: one business unit
 becomes two rows, each with part of the revenue, and the larger one looks like a
@@ -15,8 +16,8 @@ and the two forecasts do not add back to what one would have been.
 
 So values are canonicalised before anything groups by them, and every merge is
 reported rather than done quietly. The merge changes what the numbers mean, and the
-person reading them is the one who can say whether `Water` and `Water Segment` really
-are one thing. They almost always are. It is still their call.
+person reading them is the one who can say whether `Hydraulics` and `Hydraulics
+Segment` really are one thing. They almost always are. It is still their call.
 """
 
 from __future__ import annotations
@@ -28,8 +29,9 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 # Words an ERP appends to a dimension value without changing which thing it names.
-# `Water` and `Water Segment` are one business unit; `Valves` and `Valves Group` are
-# one product line. Stripped only from the *end*, and only when something is left:
+# `Hydraulics` and `Hydraulics Segment` are one business unit; `Valves` and `Valves
+# Group` are one product line. Stripped only from the *end*, and only when something
+# is left:
 # `Segment` on its own is a value, not a suffix.
 _NOISE_SUFFIXES = ("segment", "group", "division", "bu", "business unit", "category",
                    "line", "family")
@@ -107,8 +109,9 @@ def normalise(series: pd.Series, column: str) -> NormalisedDimension:
             subset=["key"]).groupby("key")["raw"]:
         spellings = group.astype(str).value_counts()
         # Frequency first, then the shorter spelling. The tie-break matters more than
-        # it looks: `Water` and `Water Segment` appearing equally often is common on a
-        # master someone half-finished renaming, and value_counts leaves that order to
+        # it looks: `Hydraulics` and `Hydraulics Segment` appearing equally often is
+        # common on a master someone half-finished renaming, and value_counts leaves
+        # that order to
         # the input. Preferring the shorter one keeps the name and drops the suffix,
         # which is the direction the fold is going anyway.
         spellings = spellings.sort_values(

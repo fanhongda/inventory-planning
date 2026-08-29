@@ -115,7 +115,7 @@ filename.
 
 When a master is present but the family did not map, the run stops and names the file:
 
-> `FSP IN30 master.xlsx` was read as a planning_master, and nothing in it mapped to
+> `regional master.xlsx` was read as a planning_master, and nothing in it mapped to
 > the field this needs. The column is probably there under a name no alias matched —
 > run `python -m inventory_planning.explain <file>` to see which headers went
 > unmatched, then add the right one as an alias or map it in an adapter.

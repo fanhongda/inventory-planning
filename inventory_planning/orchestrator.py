@@ -667,8 +667,8 @@ class InventoryPlanner:
         Fold each dimension column onto one spelling per thing, everywhere at once.
 
         "Everywhere at once" for the same reason the supersession rewrite is: the sales
-        history and the master both carry a business unit, and folding `Water Segment`
-        into `Water` in one of them and not the other produces a segment that has
+        history and the master both carry a business unit, and folding `Hydraulics Segment`
+        into `Hydraulics` in one of them and not the other produces a segment that has
         history and no items, beside one that has items and no history.
         """
         from .quality.dimensions import normalise_frame

@@ -6,7 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "inventory-planning"
 version = "0.3.0"
 description = "Distribution centre inventory planning — demand classification, safety stock, forecasting, purchase recommendations"
-requires-python = ">=3.9"
+# Matched to what CI actually runs. ">=3.9" was a claim nothing tested and that the
+# package did not meet: `feedback/loss.py` and `feedback/collector.py` annotate with
+# `str | Path`, which is a runtime TypeError before 3.10, and until this branch
+# `reporting/kpi_report.py` used a backslash inside an f-string expression — a syntax
+# error before 3.12. Both were invisible on a 3.12 developer machine. Widening this
+# again means adding the version to the CI matrix first.
+requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",

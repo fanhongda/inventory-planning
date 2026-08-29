@@ -1555,14 +1555,18 @@ class KPIReport:
             gap = float(row["gap_value"])
             demand_w = 100 * float(row["demand_cogs"]) / peak
             supply_w = 100 * float(row["supply_value"]) / peak
+            # Built before the f-string, not inside it. A backslash in an f-string
+            # expression is a syntax error before Python 3.12 (PEP 701 relaxed it), and
+            # the escaped quotes this needed made the whole module unimportable on 3.11
+            # — invisible on a 3.12 machine, and caught by CI on its first run.
+            gap_cell = (f"<span class='chip crit'>{_money(gap)}</span>" if gap > 0
+                        else "—")
             rows.append(
                 f"<tr><td class='sku'>{_esc(row['period'])}</td>"
                 f"<td class='n'>{_money(row['demand_cogs'])}</td>"
                 f"<td class='n'>{_money(row['supply_value'])}</td>"
                 f"<td class='n'>{_money(row['closing_value'])}</td>"
-                f"<td class='n'>"
-                f"{'<span class=\'chip crit\'>' + _money(gap) + '</span>' if gap > 0 else '—'}"
-                f"</td>"
+                f"<td class='n'>{gap_cell}</td>"
                 f"<td><div class='track' style='min-width:150px'>"
                 f"<div class='fill' style='width:{demand_w:.1f}%;"
                 f"background:var(--series-1)'></div>"
@@ -1702,15 +1706,16 @@ class KPIReport:
             name = " · ".join(str(row[k]) for k in ("business_unit", "product_family")
                               if k in row.index and pd.notna(row[k]))
             slow = row["slow_share"]
+            # Same reason as the gap cell above: no backslash inside the f-string.
+            slow_cell = (f"<span class='chip crit'>{_pct(slow, 0)}</span>"
+                         if slow > 0.25 else _pct(slow, 0))
             rows.append(
                 f"<tr><td class='sku'>{_esc(name)}</td>"
                 f"<td class='n'>{_num(row['skus'])}</td>"
                 f"<td class='n'>{_money(row['stock_value'])}</td>"
                 f"<td class='n'>{'∞' if not np.isfinite(dioh) else _num(dioh)}</td>"
                 f"<td class='n'>{_money(row['slow_value'])}</td>"
-                f"<td class='n'>"
-                f"{'<span class=\'chip crit\'>' + _pct(slow, 0) + '</span>' if slow > 0.25 else _pct(slow, 0)}"
-                f"</td></tr>"
+                f"<td class='n'>{slow_cell}</td></tr>"
             )
 
         tails = []

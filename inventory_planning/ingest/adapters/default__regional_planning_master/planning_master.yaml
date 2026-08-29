@@ -1,6 +1,6 @@
 name: default__regional_planning_master__planning_master
 doc_type: planning_master
-version: 1
+version: 2
 tenant: default
 system: regional_planning_master
 status: frozen
@@ -59,6 +59,21 @@ column_map:
   planner_safety_stock: SS
   supplier: vendor name
   description: Material description
+  # The segmentation the forecast and the sales review are grouped by. This template
+  # carries the hierarchy in two columns: `NBU` is the business unit (Water, Inert Gas,
+  # Halocarbon, Mechanical) and `NBU 1` the product line under it (Fire Grooved,
+  # SAPPHIRE Hardware, Standard Commercial Sprinklers). The finer level is the family.
+  #
+  # Mapped here rather than left to the contract aliases because a frozen adapter is
+  # the whole column map, not a set of overrides: a field added to the contract later
+  # is never picked up for a source this one matches. That is the cost of freezing, and
+  # it is paid every time the contract grows.
+  #
+  # Not taken from `Material Group 1` (SH/WM) or `Product Type` (Purchased/
+  # Manufactured): the first is a two-way plant split and the second is a make-or-buy
+  # flag. Neither is a product line, and both would have mapped on alias alone.
+  business_unit: NBU
+  product_family: NBU 1
 
 derivations:
   # The ERP number is in Alternate material for PL30 and in Material for other regions.
@@ -80,3 +95,8 @@ notes:
   - >
     `material` and `alternate_material` are carried only as the coalesce inputs. Nothing
     downstream joins on them — the join key is the derived `sku`.
+  - >
+    `NBU` is not clean: it holds both `Water` and `Water Segment`, and both `Mechanical`
+    and `Mechanical Segment`, for what are one business unit each. The values are
+    normalised downstream rather than here — an adapter's job is to say which column a
+    field is in, not to decide that two of its values are the same thing.

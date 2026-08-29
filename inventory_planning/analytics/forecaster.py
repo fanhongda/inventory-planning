@@ -467,10 +467,19 @@ class Forecaster:
         if forecast_df.empty:
             return pd.DataFrame()
 
+        # Both numbers where a sales review has been applied: `forecast_next_period` is
+        # what the plan runs on, `statistical_next_period` is what the model said before
+        # anyone argued with it. Carrying only the first would make the review
+        # permanently unscoreable — next period could measure the error but never say
+        # whether the adjustment caused it or prevented it.
+        carry = ["sku", "forecast_qty", "forecast_rmse"]
+        for column in ("statistical_qty", "forecast_source"):
+            if column in forecast_df.columns:
+                carry.append(column)
         next_period = (
-            forecast_df[forecast_df["is_next_period"]]
-            [["sku", "forecast_qty", "forecast_rmse"]]
-            .rename(columns={"forecast_qty": "forecast_next_period"})
+            forecast_df[forecast_df["is_next_period"]][carry]
+            .rename(columns={"forecast_qty": "forecast_next_period",
+                             "statistical_qty": "statistical_next_period"})
         )
 
         horizon_agg = (

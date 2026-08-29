@@ -164,6 +164,27 @@ td.wrap { white-space: normal; min-width: 190px; font-variant-numeric: normal; }
 .chip.warn { color: var(--text-primary); background: color-mix(in srgb, var(--status-warning) 26%, transparent); }
 .chip.crit { color: var(--status-critical); background: color-mix(in srgb, var(--status-critical) 14%, transparent); }
 
+.health { border: 1px solid var(--status-critical); border-radius: 8px;
+  padding: 14px 18px; margin: 0 0 26px; }
+.health.clean { border-color: color-mix(in srgb, var(--status-good) 45%, transparent); }
+.health.noted { border-color: color-mix(in srgb, var(--status-warning) 55%, transparent); }
+.health h3 { margin: 0 0 10px; font-size: 15px; letter-spacing: .01em; }
+.health .lede { color: var(--status-critical); }
+.health.clean .lede { color: var(--good-ink); }
+.health.noted .lede { color: var(--text-primary); }
+.health .finding { margin: 14px 0 0; padding-left: 14px;
+  border-left: 3px solid var(--status-critical); }
+.health .finding .what { font-weight: 600; color: var(--text-primary); }
+.health .finding .why { margin: 3px 0 6px; }
+.health .finding ul { margin: 4px 0 6px; padding-left: 18px; }
+.health .finding li { margin: 2px 0; }
+.health .finding li.safe { color: var(--good-ink); list-style: none; margin-left: -18px; }
+.health .fix { font-size: 12px; }
+.health .rest { margin-top: 12px; font-size: 12px; }
+/* Block, not inline. Two counts side by side wrap into each other on a narrow
+   viewport and read as one run-on sentence — which is the failure this banner
+   exists to avoid, reproduced in its own footer. */
+.health .rest span { display: block; margin: 0 0 3px; }
 .callout { border-left: 3px solid var(--accent-violet); padding: 2px 0 2px 14px;
            margin: 14px 0; color: var(--text-secondary); font-size: 14px; }
 .callout strong { color: var(--text-primary); }
@@ -249,18 +270,28 @@ class KPIReport:
         recommendations=None,
         open_po=None,
         suggestions=None,
+        health=None,
+        siop=None,
+        accuracy=None,
+        inventory_health=None,
         as_of: date = None,
         output_path: Path = None,
     ) -> str:
         as_of = as_of or date.today()
         body = [
             self._header(as_of, should_be, service),
+            # Above the KPI tiles, not below them and not in an appendix. Whether a
+            # number can be relied on is not a footnote to the number — it is the first
+            # thing that decides whether reading the rest is worth doing, and a reader
+            # who meets the tiles first has already formed a view by the time the
+            # caveat arrives.
+            self._health_banner(health),
             self._kpi_row(service, should_be, forward),
             self._currency_note(fx),
             self._chapter_past(service, should_be, ordering, cadence, service_target,
-                               attributes),
+                               attributes, inventory_health),
             self._chapter_future(forward, frontier, recommendations, open_po,
-                                 attributes, suggestions),
+                                 attributes, suggestions, siop, accuracy),
             self._footer(as_of),
         ]
         page = (
@@ -286,6 +317,81 @@ class KPIReport:
             bits.append(f"{lines:,} order lines")
         return (f"<h1>{_esc(self.title)}</h1>"
                 f"<p class='sub'>{' · '.join(bits)}</p>")
+
+    def _health_banner(self, health) -> str:
+        """
+        What in this report cannot be relied on, before anything that can.
+
+        Only the severe findings are opened out. The warnings and the missing inputs
+        are counted and named on one line — they belong in the report, and expanding
+        all of them here would bury the two that change what a reader should do under
+        the eleven that do not. That is the failure this banner exists to avoid, so it
+        must not reproduce it at the top of the page.
+        """
+        if health is None:
+            return ""
+        critical = list(health.critical)
+        noted, missing = list(health.noted), list(health.degradations)
+
+        if not critical and not noted and not missing:
+            return ("<div class='health clean'><h3 class='lede'>✓ Nothing in this "
+                    "report rests on a fallback</h3><p class='note'>Every quality gate "
+                    "passed and no input was missing.</p></div>")
+
+        if not critical:
+            bits = []
+            if noted:
+                bits.append(f"<span>⚠ {len(noted)} data-quality note"
+                            f"{'s' if len(noted) != 1 else ''} — applied or reported, "
+                            f"the numbers stand</span>")
+            if missing:
+                bits.append(f"<span>○ {len(missing)} thing"
+                            f"{'s' if len(missing) != 1 else ''} this run could not "
+                            f"measure</span>")
+            return (f"<div class='health noted'><h3 class='lede'>No figure in this "
+                    f"report is misleading</h3><p class='rest'>{''.join(bits)} — see "
+                    f"<code>run_health_{_esc(health.run_id)}.md</code>.</p></div>")
+
+        parts = [
+            "<div class='health'>",
+            f"<h3 class='lede'>Do not rely on {len(critical)} "
+            f"{'part' if len(critical) == 1 else 'parts'} of this report</h3>",
+            "<p class='note'>Specific figures below are not what they appear to be. "
+            "Everything not named here is unaffected.</p>",
+        ]
+        for finding in critical:
+            parts.append("<div class='finding'>")
+            parts.append(f"<div class='what'>{_esc(finding.what)}</div>")
+            parts.append(f"<p class='why note'>{_esc(finding.why)}</p>")
+            if finding.impacts:
+                parts.append("<ul>")
+                for impact in finding.impacts:
+                    # The "Not affected" line is the half a planner acts on, and it is
+                    # styled apart from the damage rather than listed among it. A
+                    # warning that does not bound itself gets read as "the whole report
+                    # is suspect", and the recommendations get discarded with the
+                    # rollup they had nothing to do with.
+                    safe = impact.lower().startswith("not affected")
+                    cls = " class='safe'" if safe else ""
+                    prefix = "✓ " if safe else ""
+                    parts.append(f"<li{cls}>{prefix}{_esc(impact)}</li>")
+                parts.append("</ul>")
+            parts.append(f"<p class='fix note'><strong>Fix:</strong> "
+                         f"{_esc(finding.fix)}</p>")
+            parts.append("</div>")
+
+        rest = []
+        if noted:
+            rest.append(f"<span>⚠ {len(noted)} further note"
+                        f"{'s' if len(noted) != 1 else ''}</span>")
+        if missing:
+            rest.append(f"<span>○ {len(missing)} thing"
+                        f"{'s' if len(missing) != 1 else ''} not measured</span>")
+        if rest:
+            parts.append(f"<p class='rest note'>{''.join(rest)} — see "
+                         f"<code>run_health_{_esc(health.run_id)}.md</code>.</p>")
+        parts.append("</div>")
+        return "".join(parts)
 
     def _kpi_row(self, service, should_be, forward) -> str:
         tiles = []
@@ -341,11 +447,16 @@ class KPIReport:
     # ── Chapter 1: what happened ─────────────────────────────────────────────
 
     def _chapter_past(self, service, should_be, ordering, cadence=None,
-                      service_target=None, attributes=None) -> str:
+                      service_target=None, attributes=None,
+                      inventory_health=None) -> str:
         parts = ["<h2>Chapter 1 · What happened</h2><hr class='chapter-rule'>"]
         parts.append(self._service_section(service, attributes))
         parts.append(self._otd_trend_section(service, service_target))
         parts.append(self._inventory_section(should_be))
+        # Directly after the position, because it is the same stock read a second way:
+        # the section above says how much there is against policy, this one says how
+        # long it lasts and which of it is not moving.
+        parts.append(self._dioh_section(inventory_health))
         parts.append(self._ordering_section(ordering))
         parts.append(self._cadence_section(cadence))
         return "".join(parts)
@@ -1054,8 +1165,14 @@ class KPIReport:
     # ── Chapter 2: what's coming ─────────────────────────────────────────────
 
     def _chapter_future(self, forward, frontier, recommendations=None,
-                        open_po=None, attributes=None, suggestions=None) -> str:
+                        open_po=None, attributes=None, suggestions=None,
+                        siop=None, accuracy=None) -> str:
         parts = ["<h2>Chapter 2 · What is coming</h2><hr class='chapter-rule'>"]
+        # First in the chapter: the period balance is the frame every per-SKU section
+        # below sits inside, and a reader who meets the exceptions before the plan has
+        # no scale to judge them against.
+        parts.append(self._siop_section(siop))
+        parts.append(self._accuracy_section(accuracy))
 
         # Ahead of the forward projection, and outside the branch that gives up
         # without one. Both come from what is on the shelf against what is on order,
@@ -1416,6 +1533,225 @@ class KPIReport:
                  "arrives. Read off the same forward projection as the two sections "
                  "above, so the three cannot disagree.",
             empty="No open PO needs its timing changed.",
+        )
+
+    def _siop_section(self, siop) -> str:
+        """
+        Demand, supply and the gap, a month at a time, in money.
+
+        The only section in the report that is not per SKU. That is its job: an S&IOP
+        meeting decides whether the business as a whole is covered, and no list of
+        individual shortages answers that — a hundred small ones and one enormous one
+        look identical until they are valued and phased.
+        """
+        if siop is None or not len(getattr(siop, "by_period", [])):
+            return ""
+        frame = siop.by_period
+        peak = max(float(frame["demand_cogs"].max()),
+                   float(frame["supply_value"].max()), 1.0)
+
+        rows = []
+        for _, row in frame.iterrows():
+            gap = float(row["gap_value"])
+            demand_w = 100 * float(row["demand_cogs"]) / peak
+            supply_w = 100 * float(row["supply_value"]) / peak
+            rows.append(
+                f"<tr><td class='sku'>{_esc(row['period'])}</td>"
+                f"<td class='n'>{_money(row['demand_cogs'])}</td>"
+                f"<td class='n'>{_money(row['supply_value'])}</td>"
+                f"<td class='n'>{_money(row['closing_value'])}</td>"
+                f"<td class='n'>"
+                f"{'<span class=\'chip crit\'>' + _money(gap) + '</span>' if gap > 0 else '—'}"
+                f"</td>"
+                f"<td><div class='track' style='min-width:150px'>"
+                f"<div class='fill' style='width:{demand_w:.1f}%;"
+                f"background:var(--series-1)'></div>"
+                f"<div class='fill' style='width:{supply_w:.1f}%;"
+                f"background:var(--series-2);opacity:.75'></div></div></td></tr>"
+            )
+
+        short = frame[frame["gap_value"] > 0]
+        if len(short):
+            first = short.iloc[0]
+            note = (f"First shortfall in <strong>{_esc(first['period'])}</strong>: "
+                    f"{_money(first['gap_value'])} across "
+                    f"{int(first['gap_skus']):,} SKUs. A period is short where the "
+                    f"projected close falls below the safety stock the policy calls "
+                    f"for — service is at risk there, not only where the shelf is "
+                    f"bare. The projection runs per SKU and is summed: one item's "
+                    f"surplus cannot cover another's short.")
+        else:
+            note = ("No period falls below its safety stock on committed supply. "
+                    "Measured per SKU and summed, never on the aggregate.")
+        if getattr(siop, "uncosted_skus", 0):
+            note += (f" {siop.uncosted_skus:,} SKUs have no unit cost and are excluded "
+                     f"from every amount here — their quantities are real and their "
+                     f"value is unknown, so counting them at zero would understate the "
+                     f"plan silently.")
+
+        return (
+            "<h3>Supply and demand by period</h3>"
+            "<p class='note'>Demand at <strong>cost</strong>, not at selling price — "
+            "the question here is what the business has to buy and hold. The S&amp;OP "
+            "worksheet values the same demand at revenue, because that is the language "
+            "sales own. Both are right; they are not comparable.</p>"
+            "<div class='scroll'><table>"
+            "<thead><tr><th>Period</th><th class='n'>Demand (COGS)</th>"
+            "<th class='n'>Supply</th><th class='n'>Closing</th>"
+            "<th class='n'>Gap</th><th>Demand vs supply</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+            f"<p class='note'>{note}</p>"
+        )
+
+    def _accuracy_section(self, accuracy) -> str:
+        """
+        Where the published plan missed by the most money, ranked, not averaged.
+
+        A single accuracy figure is a scoreboard, and a scoreboard closes a discussion:
+        "MAPE was 34%" tells nobody what to do differently. The same data ranked by the
+        size of the miss opens one — this line was forty per cent under all half-year,
+        whose assumption was that, and what changes.
+
+        Ranked by value rather than by percentage for the same reason the rest of this
+        report is: a 300% miss on an eight-hundred-dollar part is a rounding error, and
+        6% on the largest line in the business is the conversation worth having.
+        """
+        if accuracy is None:
+            return ""
+        if not getattr(accuracy, "measured", False):
+            # Said plainly rather than filled with the backtest, which would look like
+            # an answer to a question nobody asked.
+            return ("<h3>Forecast accuracy</h3>"
+                    f"<p class='callout'>Not measurable yet. "
+                    f"{_esc(getattr(accuracy, 'reason', ''))}</p>")
+
+        def rank_rows(frame, label_col, extra=None):
+            out = []
+            for _, row in frame.head(8).iterrows():
+                bias = float(row["bias_value"])
+                over = bias >= 0
+                pct = row.get("bias_pct")
+                chip = (f"<span class='chip {'warn' if over else 'crit'}'>"
+                        f"{'over' if over else 'under'} {_money(abs(bias))}</span>")
+                out.append(
+                    f"<tr><td class='sku'>{_esc(row[label_col])}</td>"
+                    f"<td class='n'>{_money(row['planned_value'])}</td>"
+                    f"<td class='n'>{_money(row['actual_value'])}</td>"
+                    f"<td class='n'>{chip}</td>"
+                    f"<td class='n'>"
+                    f"{'—' if pct is None or not np.isfinite(pct) else f'{pct:+.0%}'}"
+                    f"</td>"
+                    + (f"<td class='n'>{_esc(row.get(extra, ''))}</td>" if extra else "")
+                    + "</tr>")
+            return "".join(out)
+
+        head = ("<thead><tr><th>{}</th><th class='n'>Planned</th>"
+                "<th class='n'>Actual</th><th class='n'>Miss</th>"
+                "<th class='n'>vs actual</th>{}</tr></thead>")
+
+        blocks = []
+        if len(accuracy.by_family):
+            blocks.append(
+                "<h4>By product line</h4><div class='scroll'><table>"
+                + head.format("Product line", "")
+                + f"<tbody>{rank_rows(accuracy.by_family, 'label')}</tbody>"
+                "</table></div>")
+        if len(accuracy.by_sku):
+            blocks.append(
+                "<h4>By item</h4><div class='scroll'><table>"
+                + head.format("Item", "<th class='n'>Line</th>")
+                + f"<tbody>{rank_rows(accuracy.by_sku, 'sku', 'product_family')}</tbody>"
+                "</table></div>")
+
+        net = accuracy.bias_value
+        review = ""
+        if len(getattr(accuracy, "adjustments", [])):
+            skus = accuracy.adjustments["sku"].nunique()
+            review = (
+                f"<p class='callout'>The plan published by <strong>this</strong> run "
+                f"carries {skus:,} SKUs sales moved. It is not scored above — nothing "
+                f"has happened to it yet. Both numbers are kept, so next period can "
+                f"answer whether the adjustment helped rather than argue about it.</p>")
+
+        return (
+            "<h3>Forecast accuracy — the plan we published against what sold</h3>"
+            f"<p class='note'>{accuracy.scored_periods:,} SKU-periods from "
+            f"{accuracy.plans_read} earlier "
+            f"plan{'s' if accuracy.plans_read != 1 else ''} have closed. Net "
+            f"<strong>{_money(abs(net))} {'over' if net >= 0 else 'under'}-planned"
+            f"</strong> against {_money(accuracy.planned_value)} planned "
+            f"({_esc(accuracy.bias_direction)}); {_money(accuracy.abs_error_value)} was "
+            f"wrong in one direction or the other. This is the number the business "
+            f"committed to, after review — not the model's backtest, which answers a "
+            f"different question.</p>"
+            + "".join(blocks)
+            + "<p class='note'>Ranked by the <strong>value</strong> of the miss, not "
+            "the percentage, and deliberately not averaged. A mean closes a discussion; "
+            "a ranking opens one. Both sides are valued at the same price, so a "
+            "difference here is a forecasting miss and not a discount.</p>"
+            + review
+        )
+
+    def _dioh_section(self, health) -> str:
+        """Days on hand by product line, and the two tails worth acting on."""
+        if health is None or not len(getattr(health, "by_family", [])):
+            return ""
+        rows = []
+        for _, row in health.by_family.head(12).iterrows():
+            dioh = row["dioh"]
+            name = " · ".join(str(row[k]) for k in ("business_unit", "product_family")
+                              if k in row.index and pd.notna(row[k]))
+            slow = row["slow_share"]
+            rows.append(
+                f"<tr><td class='sku'>{_esc(name)}</td>"
+                f"<td class='n'>{_num(row['skus'])}</td>"
+                f"<td class='n'>{_money(row['stock_value'])}</td>"
+                f"<td class='n'>{'∞' if not np.isfinite(dioh) else _num(dioh)}</td>"
+                f"<td class='n'>{_money(row['slow_value'])}</td>"
+                f"<td class='n'>"
+                f"{'<span class=\'chip crit\'>' + _pct(slow, 0) + '</span>' if slow > 0.25 else _pct(slow, 0)}"
+                f"</td></tr>"
+            )
+
+        tails = []
+        if health.total_value:
+            tails.append(
+                f"<strong>Slow-moving</strong> {_money(health.slow_value)} "
+                f"({_pct(health.slow_value / health.total_value, 0)} of stock) "
+                f"across {len(health.slow_moving):,} SKUs with no demand in six months.")
+        if len(health.long_aging):
+            share = (health.aging_value / health.total_value
+                     if health.total_value else 0)
+            tails.append(
+                f"<strong>{_esc(health.aging_basis)}</strong> "
+                f"{_money(health.aging_value)} ({_pct(share, 0)}) across "
+                f"{len(health.long_aging):,} SKUs.")
+
+        caveat = ""
+        if len(health.long_aging) and not health.aging_measured:
+            caveat = ("<p class='callout warn'>The stock extract carries no ageing "
+                      "date, so the figure above is <strong>days of cover, not "
+                      "age</strong>. The two are wrong about each other in both "
+                      "directions — a fast item restocked yesterday can show a year of "
+                      "cover, and a five-year-old part with one recent order shows "
+                      "almost none. Supply a stock-ageing report or a last-movement "
+                      "date to measure it properly; until then this is a shortlist to "
+                      "check, not a write-off list.</p>")
+
+        return (
+            "<h3>Days on hand by product line</h3>"
+            "<div class='scroll'><table>"
+            "<thead><tr><th>Product line</th><th class='n'>SKUs</th>"
+            "<th class='n'>Stock value</th><th class='n'>DIOH</th>"
+            "<th class='n'>Slow-moving</th><th class='n'>Slow share</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+            "<p class='note'>DIOH is <strong>value-weighted</strong> — the line's stock "
+            "over the line's daily cost of sales. Averaging per-SKU DIOH would let one "
+            "dead part holding forty dollars speak as loudly as a live one holding "
+            "forty thousand, and on any real catalogue the dead ones are the "
+            "majority.</p>"
+            + (f"<p class='note'>{' '.join(tails)}</p>" if tails else "")
+            + caveat
         )
 
     def _stockout_section(self, forward) -> str:

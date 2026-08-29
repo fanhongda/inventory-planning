@@ -292,29 +292,74 @@ class TestContractTests:
 # ── Capabilities ─────────────────────────────────────────────────────────────
 
 class TestCapabilities:
+    # The minimum a run needs: demand, a stock position, and a master.
+    MINIMUM = {"demand_timeseries": "d.xlsx", "inventory": "i.csv",
+               "item_master": "m.xlsx"}
+
     def test_timeseries_alone_satisfies_demand(self):
         """The brief's case: a pre-bucketed series makes sales history unnecessary."""
-        plan = CapabilityResolver().resolve({"demand_timeseries": "d.xlsx",
-                                             "inventory": "i.csv"})
+        plan = CapabilityResolver().resolve(dict(self.MINIMUM))
         assert plan.has("demand_signal")
         assert plan.source_of("demand_signal") == "demand_timeseries"
         assert plan.can_run
 
     def test_sales_history_also_satisfies_demand(self):
-        plan = CapabilityResolver().resolve({"sales_history": "s.csv", "inventory": "i.csv"})
+        plan = CapabilityResolver().resolve({"sales_history": "s.csv", "inventory": "i.csv",
+                                             "item_master": "m.xlsx"})
         assert plan.source_of("demand_signal") == "sales_history"
 
     def test_missing_demand_blocks_the_run(self):
-        plan = CapabilityResolver().resolve({"inventory": "i.csv"})
+        plan = CapabilityResolver().resolve({"inventory": "i.csv", "item_master": "m.xlsx"})
         assert not plan.can_run
         assert "demand_signal" in [c.name for c in plan.missing_required]
 
-    def test_names_specific_consequences_of_gaps(self):
-        """Degradation must be stated, not silently absorbed into a thinner number."""
+    def test_a_run_without_master_data_is_blocked(self):
+        """
+        Demand and stock are no longer enough. Without a master the run still produces
+        every number it produced before — MOQ from a config default, the product family
+        guessed from the part number — and nothing in the output distinguishes those
+        from measured ones. A complete report that cannot be falsified is worse than no
+        report, so it is not produced.
+        """
         plan = CapabilityResolver().resolve({"demand_timeseries": "d.xlsx",
                                              "inventory": "i.csv"})
+        assert not plan.can_run
+        assert [c.name for c in plan.missing_required] == ["item_dimension"]
+
+    def test_a_planner_worksheet_can_supply_the_master_dimensions(self):
+        """
+        On many sites the family is maintained on the planner's sheet and nowhere else.
+        The requirement is the information, not the filename.
+        """
+        plan = CapabilityResolver().resolve({"demand_timeseries": "d.xlsx",
+                                             "inventory": "i.csv",
+                                             "planning_master": "w.xlsx"})
         assert plan.can_run
-        assert any("lead-time variability" in d for d in plan.degradations)
+        assert plan.source_of("product_dimension") == "planning_master"
+
+    def test_a_master_with_no_family_column_still_runs_but_says_what_it_costs(self):
+        """
+        Not blocking, deliberately. Replenishment does not use the family — safety
+        stock, reorder points and order quantities are identical with it and without —
+        so withholding a plan a buyer can act on because the rollup above it would be
+        unreliable helps nobody. What is owed is that the rollup is not read as if it
+        meant something, which is what the degradations are for.
+        """
+        plan = CapabilityResolver().resolve(
+            dict(self.MINIMUM),
+            withheld={"item_master": {"product_dimension"}},
+        )
+        assert plan.can_run
+        assert ("item_master", "product_dimension") in plan.withheld
+        assert not plan.has("product_dimension")
+        assert any("by product line" in d for d in plan.degradations), (
+            "the run has to name the tables that are now grouping on a guess")
+
+    def test_names_specific_consequences_of_gaps(self):
+        """Degradation must be stated, not silently absorbed into a thinner number."""
+        plan = CapabilityResolver().resolve(dict(self.MINIMUM))
+        assert plan.can_run
+        assert any("goods in transit" in d for d in plan.degradations)
         assert any("backlog" in d for d in plan.degradations)
 
 
@@ -333,7 +378,10 @@ class TestIntake:
         result = Intake(verbose=False).load_files(sorted(tmp_path.iterdir()))
 
         assert set(result.documents) == {"open_po", "demand_timeseries", "inventory"}
-        assert result.can_run
+        # Everything routed. The run is still blocked, and on exactly one thing: no
+        # master was supplied. Asserted rather than elided so that a future routing
+        # regression cannot hide behind the same red.
+        assert [c.name for c in result.plan.missing_required] == ["item_dimension"]
 
     def test_melts_wide_series_to_long_grain(self, tmp_path, planner_timeseries):
         planner_timeseries.to_excel(tmp_path / "demand.xlsx", index=False)

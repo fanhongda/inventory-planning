@@ -161,16 +161,33 @@ def build_sku_attributes(
     # ── Descriptive attributes for rule scopes ───────────────────────────────
     if timeseries_meta is not None and len(timeseries_meta):
         meta = timeseries_meta.reset_index() if timeseries_meta.index.name == "sku" else timeseries_meta
-        meta_cols = [c for c in ("sku", "description", "sopc_classification", "product_family")
+        meta_cols = [c for c in ("sku", "description", "sopc_classification",
+                                 "product_family", "business_unit")
                      if c in meta.columns]
         if "sku" in meta_cols and len(meta_cols) > 1:
             df = df.merge(meta[meta_cols].drop_duplicates("sku"), on="sku", how="left")
 
-    if "product_family" not in df.columns or df["product_family"].isna().all():
-        df["product_family"] = _infer_family(df)
-    else:
-        # Master data wins where it speaks; the prefix guess fills the rest.
-        df["product_family"] = df["product_family"].fillna(_infer_family(df))
+    # ── Product family: master where it speaks, the prefix guess for the rest ─
+    #
+    # Deliberately after `_merge_masters`, not before it. Guessing first and merging
+    # second cannot work: the guess leaves no nulls, and the descriptive merge is a
+    # `.where(notna)` that then never fires — so a master value that arrived late
+    # lost to a guess that arrived early. The failure is silent, and on a real
+    # extract it discarded a fully-populated family column for all 1,246 SKUs.
+    #
+    # `product_family_source` is what makes the fill survivable at all. A run is no
+    # longer stopped for a partly-classified catalogue — an item selling without a
+    # master row is the ordinary state of anything new or transferred in, and a planner
+    # who cannot get a report until master data is perfect gets no reports. What is
+    # owed instead is a count, and a count is only worth having if the reader can find
+    # the same rows in the output. Filter on `product_family_source == "master"` and
+    # the rollup contains nothing that was guessed.
+    from_master = (df["product_family"].notna() if "product_family" in df.columns
+                   else pd.Series(False, index=df.index))
+    guess = _infer_family(df)
+    df["product_family"] = (df["product_family"].where(from_master, guess)
+                            if "product_family" in df.columns else guess)
+    df["product_family_source"] = np.where(from_master, "master", "inferred")
 
     # ── Segmentation ─────────────────────────────────────────────────────────
     df["annual_value"] = (
@@ -304,7 +321,17 @@ def _merge_masters(
         ("description", ("description", "description")),
         ("supplier", ("supplier", "supplier")),
         ("incoterm", ("incoterm", None)),
-        ("product_family", ("product_family", None)),
+        # Readable from the planner worksheet as well as the item master. It was
+        # item-master-only, which on a site whose master routes to `planning_master` —
+        # the common case, because a hand-maintained safety stock column is what the
+        # discriminator keys on — meant the family was mapped, contract-tested, gated,
+        # and then never read. Every row came out with the part-number guess.
+        ("product_family", ("product_family", "product_family")),
+        # The level above the family. Carried for the same reason and by the same
+        # rule — filled from master data, never inferred. There is no prefix guess for
+        # a business unit and there should not be one: a rollup by BU that the pipeline
+        # invented would be read as the company's own segmentation.
+        ("business_unit", ("business_unit", "business_unit")),
         ("item_status", ("item_status", None)),
         ("planner_code", ("planner_code", None)),
         # The ERP's own make-to-stock / make-to-order flag. Filled, never arbitrated:

@@ -1,0 +1,11 @@
+Material,Product Group,Vendor,Planned Delivery Time,Min Order Qty,Rounding Value,Standard Price,Material Status
+SKU-001,valve,Sup-Alpha,75,50,1,254.3,active
+SKU-002,sprinkler,Sup-Beta,75,100,25,90.27,active
+SKU-003,valve,Sup-Alpha,75,0,50,79.81,active
+SKU-004,fitting,Sup-Gamma,90,200,1,30.25,active
+SKU-005,sprinkler,Sup-Beta,90,50,1,148.02,active
+SKU-006,actuator,Sup-Delta,45,50,1,365.21,active
+SKU-007,fitting,Sup-Alpha,30,100,25,21.54,active
+SKU-008,actuator,Sup-Gamma,45,100,25,250.73,active
+SKU-009,valve,Sup-Beta,75,100,25,318.87,obsolete
+SKU-010,sprinkler,Sup-Delta,60,200,25,187.45,active

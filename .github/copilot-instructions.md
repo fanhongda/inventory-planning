@@ -75,6 +75,58 @@ rule, it belongs in one of those files instead.
 These are not style preferences. Each one was a bug that produced confident wrong
 numbers, and each is covered by tests.
 
+**A run without master data does not happen.** `item_dimension` and
+`product_dimension` are required capabilities (`ingest/capabilities.py`), satisfied by
+an item master or a planner worksheet. Without one the fallbacks are not thinner
+numbers but different ones in the same typeface: MOQ from a config default, obsolete
+items replenished against their own history, and the product family guessed from the
+SKU prefix by `assemble._infer_family`. None of them are visible in the output.
+`product_dimension` is a *separate* capability because only it fails silently — a
+missing MOQ leaves a column empty where anyone can see it, a missing family leaves
+nothing empty at all. It is a capability rather than `required: true` on the field
+because required fields carry 75% of the routing score (`registry.py`), so demanding
+one would halve the score of a master that lacks it and route the file to a different
+contract — reporting the wrong problem.
+
+**`product_dimension` is not required, and neither gap in it blocks.** Replenishment
+never reads the family — safety stock, reorder points and order quantities are
+identical with it and without — so a plan a buyer can act on is not withheld because
+the rollup above it would be unreliable. Three severities, and the distinction is
+*what a reader must do*, not how bad the data is: BLOCK stops the run; SEVERE
+(`no_product_dimension`, when no master carries the column at all) leads every output
+and names the tables now grouping on a guess; WARN (`product_family_missing`,
+`sku_missing_from_master`) is a count. Every severe finding carries an `impacts` list
+that includes what is **not** affected — an unbounded warning gets read as "the whole
+report is suspect".
+
+**A quality gate blocks on the invisible, never on the untidy** (`quality/checks.py`).
+The distinction is not clean/dirty but whether a reader of the report could tell: 8% of
+lead times negative shows up as a finding and the run continues; 100% negative is the
+wrong column and it stops. `semantic_failure_ceiling` encodes exactly that line.
+Loosening it, or adding a gate that fires on ordinary export dirt, gets the whole
+mechanism deleted the first week it blocks a real run.
+
+**Dimension folding reports *and* applies** (`quality/dimensions.py`, wired in
+`orchestrator._normalise_dimensions`). Folding without reporting merges two of the
+customer's business units on the pipeline's own authority; reporting without folding
+leaves every rollup split while the console says it noticed. Never one without the other.
+
+**A sales override replaces the quantity and never the error**
+(`analytics/sales_plan.py`). `forecast_rmse` is σDL in the safety stock calculation. A
+number set by judgement is not evidence that demand became more predictable, so
+resetting σ on an override would cut safety stock at the moment the plan started
+resting on an opinion. `statistical_qty` is kept beside `forecast_qty` for the converse
+reason: a review nobody can score next quarter is a review that never improves.
+
+**The country split is top-down and must stay coherent** (`analytics/sop.py`). Parts sum
+to the SKU total by construction, so the sales review and the replenishment plan cannot
+disagree. Replacing it with per-cell models means reconciling back — an unreconciled
+hierarchy is how a business buys to one number and sells to another. Only quantities are
+apportioned; a price is a rate and multiplying it by a share is plausible and wrong.
+
+**A blank cell in a reviewed worksheet means no change, not zero.** A reviewer fills two
+months of six; reading blanks as zeroes plans four months of no demand for the sheet.
+
 **Pipeline stock counts only buyer-owned goods in transit**, decided per SKU by
 incoterm (`should_be.py`). Goods the supplier has not shipped are on nobody's books.
 Actual stock is measured on the *same* boundary — measuring the two sides differently

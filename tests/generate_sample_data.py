@@ -134,6 +134,41 @@ def gen_inventory(out_path: Path):
     print(f"  Generated: {out_path} ({len(rows)} rows)")
 
 
+# The family each SKU belongs to. Deliberately not derivable from the numbering
+# scheme: every sample SKU is `SKU-0xx`, so a prefix guess would put all ten in one
+# family and any family-scoped rule would silently apply to everything. That is the
+# failure the product_dimension capability exists to prevent, and the sample data has
+# to be able to demonstrate it.
+FAMILIES = {"SKU-001": "valve",     "SKU-002": "sprinkler", "SKU-003": "valve",
+            "SKU-004": "fitting",   "SKU-005": "sprinkler", "SKU-006": "actuator",
+            "SKU-007": "fitting",   "SKU-008": "actuator",  "SKU-009": "valve",
+            "SKU-010": "sprinkler"}
+
+
+def gen_item_master(out_path: Path):
+    """
+    The ERP master. Required since `item_dimension` and `product_dimension` became
+    required capabilities — without one the run stops, which is the point: MOQ from a
+    config default and a family guessed from the part number are wrong answers wearing
+    the same typeface as right ones.
+    """
+    rows = []
+    for sku in SKUS:
+        sup = SUPPLIERS[sku]
+        rows.append({
+            "Material": sku,
+            "Product Group": FAMILIES[sku],
+            "Vendor": sup,
+            "Planned Delivery Time": random.choice([30, 45, 60, 75, 90]),
+            "Min Order Qty": random.choice([0, 50, 100, 200]),
+            "Rounding Value": random.choice([1, 1, 25, 50]),
+            "Standard Price": round(random.uniform(20, 400), 2),
+            "Material Status": "obsolete" if sku == "SKU-009" else "active",
+        })
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"  Generated: {out_path} ({len(rows)} rows)")
+
+
 if __name__ == "__main__":
     out = Path(__file__).parents[1] / "sample_data"
     out.mkdir(exist_ok=True)
@@ -144,4 +179,5 @@ if __name__ == "__main__":
     gen_open_so(out / "open_so.csv")
     gen_open_po(out / "open_po.csv")
     gen_inventory(out / "inventory.csv")
+    gen_item_master(out / "item_master.csv")
     print("\nAll sample files generated.")

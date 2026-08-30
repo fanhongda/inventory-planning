@@ -154,6 +154,18 @@ class TestThePaddedAndUnpaddedJoin:
             "Closing Stock": rng.integers(20, 400, len(mats)),
             "Std cost": np.round(rng.random(len(mats)) * 100 + 5, 2),
         }).to_excel(tmp_path / "inventory.xlsx", index=False)
+
+        # Required since item_dimension and product_dimension became required
+        # capabilities. Deliberately thin: no lead time and no cost, so the two tests
+        # below still measure what they were written to measure — that the padded and
+        # unpadded material numbers meet — rather than being satisfied by a master
+        # value that never had to join with anything.
+        pd.DataFrame({
+            "Material": mats,
+            "Product Group": [("valve", "sprinkler", "fitting")[i % 3]
+                              for i in range(len(mats))],
+            "Min Order Qty": 50,
+        }).to_excel(tmp_path / "item master.xlsx", index=False)
         return mats
 
     def test_the_two_forms_land_on_one_sku(self, tmp_path):

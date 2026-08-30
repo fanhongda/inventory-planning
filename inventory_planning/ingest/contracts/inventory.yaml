@@ -167,6 +167,33 @@ fields:
     aliases: [snapshot date, report date, as of date, as-of date, date, run date,
               extract date, posting date, period end]
 
+  inventory_age_days:
+    type: number
+    role: measure
+    description: >
+      How long the stock has been held, from a stock-ageing report (SAP MC46/MB5B or
+      equivalent). Optional, and rarely present — most stock extracts carry a position
+      and no history of how it got there.
+
+      Where it arrives, ageing is measured. Where it does not, the ageing analysis
+      falls back to days of cover and reports it under that name. The two are wrong
+      about each other in both directions: a fast-moving item restocked yesterday can
+      carry a year of cover and no age at all, and a five-year-old part with one recent
+      order shows almost no cover while still being five years old. Presenting cover as
+      age would put the wrong items on a write-off list.
+    aliases: [inventory age, stock age, age days, ageing days, aging days,
+              days in stock, age in days, stock age days]
+
+  last_movement_date:
+    type: date
+    role: dimension
+    description: >
+      Last goods movement against this material — the other way an age can be worked
+      out, and the one an ERP gives up more readily than a full ageing report.
+    aliases: [last movement, last movement date, last goods movement, last issue date,
+              last consumption date, last transaction date, last activity date,
+              date of last movement]
+
 assertions:
   - expr: "not_null(sku)"
     severity: error

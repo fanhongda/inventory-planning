@@ -54,11 +54,25 @@ def _inventory(tmp_path, name: str = "inv.xlsx"):
     }).to_excel(tmp_path / name, index=False)
 
 
+def _master(tmp_path, name: str = "item master.xlsx", n: int = 50):
+    """
+    The item master every run now needs. `item_dimension` and `product_dimension` are
+    required capabilities, so without one `load_all` stops on the capability plan and
+    never reaches the structural guard these tests are about.
+    """
+    pd.DataFrame({
+        "Material": [f"P-{i:03d}" for i in range(n)],
+        "Product Group": [("valve", "sprinkler", "fitting")[i % 3] for i in range(n)],
+        "Min Order Qty": 25,
+    }).to_excel(tmp_path / name, index=False)
+
+
 class TestTheRunStopsWithAUsefulMessage:
 
     def test_a_missing_required_field_raises_before_planning(self, tmp_path):
         _sales(tmp_path, "Weird Timestamp Col")
         _inventory(tmp_path)
+        _master(tmp_path)
         planner = InventoryPlanner(output_dir=tmp_path / "out", interactive=False)
 
         with pytest.raises(ValueError) as exc:
@@ -72,6 +86,7 @@ class TestTheRunStopsWithAUsefulMessage:
         """The symptom being fixed: KeyError('demand_date') out of to_time_series."""
         _sales(tmp_path, "Weird Timestamp Col")
         _inventory(tmp_path)
+        _master(tmp_path)
         planner = InventoryPlanner(output_dir=tmp_path / "out", interactive=False)
 
         with pytest.raises(ValueError):
@@ -80,6 +95,7 @@ class TestTheRunStopsWithAUsefulMessage:
     def test_a_good_file_is_not_blocked(self, tmp_path):
         _sales(tmp_path, "Invdate Date")
         _inventory(tmp_path)
+        _master(tmp_path)
         planner = InventoryPlanner(output_dir=tmp_path / "out", interactive=False)
         inputs = planner.load_all(sorted(tmp_path.glob("*.xlsx")))
         assert inputs["sales_df"] is not None
@@ -100,6 +116,7 @@ class TestTheRunStopsWithAUsefulMessage:
             "Sales Revenue (USD)": rng.integers(10, 900, n),
         }).to_excel(tmp_path / "sales.xlsx", index=False)
         _inventory(tmp_path)
+        _master(tmp_path)
 
         planner = InventoryPlanner(output_dir=tmp_path / "out", interactive=False)
         inputs = planner.load_all(sorted(tmp_path.glob("*.xlsx")))

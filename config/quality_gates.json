@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Thresholds the quality gates judge against. Every one is a judgement about a",
+    "particular business rather than a fact about data, which is why they live here",
+    "and not in the code — a consolidated multi-plant extract and a single-warehouse",
+    "one do not deserve the same join floor.",
+    "",
+    "A gate BLOCKS when crossing the threshold would make the report wrong in a way",
+    "its reader could not see. Dirtiness that shows up as an obvious hole is a WARN",
+    "and does not stop anything. Raising a threshold to get past a failure is almost",
+    "always the wrong move: the run can be forced through once with allow_degraded,",
+    "which records the override, and that leaves the gate in place for next time."
+  ],
+
+  "_sku_agreement_floor": "Share of a document's item numbers that must appear in some other document. Below it, every join it feeds returns empty and empty reads as zero.",
+  "sku_agreement_floor": 0.20,
+
+  "_product_family_coverage_floor": "Share of demand SKUs carrying a product family, below which the coverage figure is put in the headline of the warning. This does NOT block: an item selling without a classified master row is the ordinary state of anything new or transferred in, and a planner who cannot get a report until master data is perfect gets no reports. The missing materials are counted instead, and `product_family_source` on every row marks which families were guessed from the part number.",
+  "product_family_coverage_floor": 0.90,
+
+  "_semantic_failure_ceiling": "Failure rate above which a semantic assertion is treated as the wrong column rather than dirty data. Keep it high: 8% negative lead times is a finding the report carries, 100% is a mapping error.",
+  "semantic_failure_ceiling": 0.50,
+
+  "_forecast_coverage_floor": "Share of SKUs with demand that must come out of the forecaster with a forecast. Without one a SKU is planned against zero demand and is never bought until it stocks out.",
+  "forecast_coverage_floor": 0.80,
+
+  "_position_coverage_floor": "Share of forecast SKUs that must have a row in the inventory snapshot. An absent position is planned as zero, so each one reads as a shortage and is bought again.",
+  "position_coverage_floor": 0.80,
+
+  "_median_history_months": "Periods of demand at the median SKU, below which the model competition cannot run and every SKU falls back to the pattern route. Warning only.",
+  "median_history_months": 6.0,
+
+  "_extract_staleness_days": "Age of the newest date in the data. The run anchors to it rather than to today, so past this the plan is made as of a date that has moved. Warning only.",
+  "extract_staleness_days": 120.0
+}

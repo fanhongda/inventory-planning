@@ -22,7 +22,20 @@ description: >
   should not make them split it.
 grain: sku
 natural_key: [sku]
-capabilities: [planner_baseline, lead_time_signal]
+capabilities: [planner_baseline, lead_time_signal, item_dimension, product_dimension]
+
+# A planner worksheet is a legitimate source of the item and product dimensions: in
+# practice it is often the only place the product family is maintained at all, because
+# it is the sheet a person curates rather than an extract a system emits. It supplies
+# them only where the columns are actually populated — declaring them unconditionally
+# would let a worksheet carrying safety stock and nothing else satisfy a requirement
+# it cannot meet, and suppress the item master that should have covered for it.
+capability_requires:
+  product_dimension: [product_family]
+  item_dimension: [product_family, business_unit, supplier, planner_min_order_qty,
+                   planner_order_multiple]
+  cost_signal: [unit_cost]
+  lead_time_signal: [planner_lead_time_days]
 
 # Distinguished from the item master by the presence of a parameter no ERP master
 # carries as such: a safety stock or a min/max the planner set themselves.
@@ -235,6 +248,39 @@ fields:
     aliases: [stock cat, stock category, stocking policy, stock policy, order policy,
               planning policy, procurement policy, mto/mts, mto mts, fulfilment policy,
               fulfillment policy, replenishment policy]
+
+  business_unit:
+    type: string
+    role: dimension
+    description: >
+      The business unit the SKU is sold under — the top level of the segmentation the
+      forecast and the sales review are grouped by (BU → product line → country).
+
+      Taken from the master rather than from sales history on purpose: the master is
+      curated by someone who knows the portfolio, while the transaction-side copy is
+      whatever was stamped on the line at the time and drifts as items are reclassified.
+      Where both exist and disagree, that is a finding about master data.
+
+      Optional where `product_family` is not: a site with one business unit still has a
+      product line to group by, and blocking a run for the absence of a rollup level
+      that does not apply would be a gate about paperwork rather than about numbers.
+    aliases: [business unit, bu, pbu, nbu, new business unit, bus unit,
+              business segment, business area, product bu, global bu]
+
+  product_family:
+    type: string
+    role: dimension
+    description: >
+      The product family, product line or business unit this SKU belongs to — the axis
+      revenue, days-on-hand and the S&OP review are grouped along.
+
+      Read from a planner worksheet on the same terms as from an item master. It is a
+      standing attribute of the material either way, and on many sites the worksheet is
+      where it is actually maintained. Where both documents carry it and disagree, that
+      disagreement is a finding about master data, not a tie to be broken quietly.
+    aliases: [product family, family, product group, material group, item group,
+              commodity, commodity code, category, product line, segment,
+              nbu 1, bu 1, pbu 1, sub bu, sub business unit, product sub line]
 
   planner_notes:
     type: string

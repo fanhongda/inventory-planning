@@ -15,7 +15,23 @@ description: >
   contract exists for.
 grain: sku
 natural_key: [sku]
-capabilities: [lead_time_signal, cost_signal, item_dimension]
+capabilities: [lead_time_signal, cost_signal, item_dimension, product_dimension]
+
+# A capability is only real if the field behind it arrived. `product_dimension` is
+# here rather than as `required: true` on the field because a required field carries
+# 75% of the routing score: demanding one would halve the score of a master that
+# lacks it and send the file to a different contract, reporting the wrong problem.
+#
+# Nothing downstream will complain about a missing family. `assemble._infer_family`
+# fills it from the SKU prefix, so a revenue-by-family table built on a numbering
+# scheme is indistinguishable from one built on master data. The gap has to be caught
+# here or not at all.
+capability_requires:
+  product_dimension: [product_family]
+  item_dimension: [product_family, business_unit, supplier, min_order_qty,
+                   order_multiple, item_status]
+  cost_signal: [unit_cost]
+  lead_time_signal: [lead_time_days]
 
 # `substitution_signal` is deliberately NOT declared here even though `successor_sku`
 # below is read. A follow-up material found on this document is *proposed*, never
@@ -187,14 +203,39 @@ fields:
               planning policy, procurement policy, mto/mts, mto mts, fulfilment policy,
               fulfillment policy, replenishment policy]
 
+  business_unit:
+    type: string
+    role: dimension
+    description: >
+      The business unit the SKU is sold under — the top level of the segmentation the
+      forecast and the sales review are grouped by (BU → product line → country).
+
+      Taken from the master rather than from sales history on purpose: the master is
+      curated by someone who knows the portfolio, while the transaction-side copy is
+      whatever was stamped on the line at the time and drifts as items are reclassified.
+      Where both exist and disagree, that is a finding about master data.
+
+      Optional where `product_family` is not: a site with one business unit still has a
+      product line to group by, and blocking a run for the absence of a rollup level
+      that does not apply would be a gate about paperwork rather than about numbers.
+    aliases: [business unit, bu, pbu, nbu, new business unit, bus unit,
+              business segment, business area, product bu, global bu]
+
   product_family:
     type: string
     role: dimension
     description: >
-      Explicit grouping from master data. Preferred over the family inferred from the
-      SKU prefix, which is only as good as the numbering scheme.
+      Explicit grouping from master data — the product line. The axis revenue,
+      days-on-hand and the S&OP review are grouped along, one level below
+      `business_unit`.
+
+      Preferred over the family inferred from the SKU prefix, which is only as good as
+      the numbering scheme. Where a master carries a two-level hierarchy — `NBU` and
+      `NBU 1`, `BU` and `BU 1` — the *finer* level is the family and the coarser one is
+      the business unit. Both are read; neither is derived from the other.
     aliases: [product family, family, product group, material group, item group,
-              commodity, commodity code, category, product line, segment]
+              commodity, commodity code, category, product line, segment,
+              nbu 1, bu 1, pbu 1, sub bu, sub business unit, product sub line]
 
   item_status:
     type: string

@@ -158,16 +158,60 @@ CAPABILITIES: Dict[str, Capability] = {
             "Master attributes per SKU — nominated supplier, MOQ, order multiple, "
             "product family, lifecycle status"
         ),
+        # Required, having been optional. What it used to fall back to was not a
+        # thinner number but a different one presented in the same font: MOQ and order
+        # multiple from a config-wide default, so a suggested quantity was rounded to
+        # a pack size the supplier does not sell; obsolete items replenished against
+        # their own history because nothing said they were dead; and the product
+        # family guessed from the SKU prefix. None of those announce themselves in the
+        # output. A run without master data produces a complete, plausible,
+        # unfalsifiable report, which is worse than no report — so it does not run.
+        required=True,
+        suppliers=["item_master", "planning_master"],
+        fallback=None,
+        degrades=[],
+    ),
+    "product_dimension": Capability(
+        name="product_dimension",
+        description=(
+            "The product family each SKU belongs to — the axis sales revenue, "
+            "days-on-hand and the S&OP review are grouped along"
+        ),
+        # Separate from item_dimension because the two fail differently and only one
+        # of them is silent. A master with no MOQ column leaves `min_order_qty` empty
+        # and every consumer of it can see that. A master with no family column leaves
+        # nothing empty: `_infer_family` fills the gap from the SKU prefix, and a
+        # revenue-by-family table built on a numbering scheme looks exactly like one
+        # built on master data.
+        #
+        # It is also why this is a capability and not a `required: true` on the field.
+        # Required fields carry 75% of the routing score, so demanding one here would
+        # halve the score of a master that lacks it and route the file to some other
+        # contract entirely — turning "your item master has no product family" into
+        # "your item master was read as a planner worksheet".
+        #
+        # Required, then not. Blocking on it stopped runs a planner legitimately needed:
+        # replenishment does not depend on the family at all — safety stock, reorder
+        # points and purchase quantities are identical with it and without it. What the
+        # family decides is how the results are *grouped*, and a plan a buyer can act on
+        # should not be withheld because the rollup above it would be unreliable.
+        #
+        # So the run proceeds and the gate raises a SEVERE finding instead: not one line
+        # among eleven, but the thing every output leads with, naming the tables that
+        # are grouping on a guess.
         required=False,
         suppliers=["item_master", "planning_master"],
-        fallback="MOQ and order multiple come from config defaults; family is inferred "
-                 "from the SKU prefix",
+        fallback="the family is guessed from the SKU prefix, and every row says so "
+                 "in `product_family_source`",
         degrades=[
-            "Suggested order quantities are not rounded to a real MOQ or pack size",
-            "Obsolete and phase-out items cannot be excluded, so dead stock is "
-            "replenished against its own history",
-            "Family-scoped parameter rules rest on the SKU numbering scheme rather than "
-            "on master data",
+            "Revenue and forecast value by product line group on the part-number "
+            "prefix, so the lines are the numbering scheme's and not the business's",
+            "Days-on-hand by product line is unusable for the same reason — the "
+            "denominator is a group nobody defined",
+            "The S&OP worksheet cannot be split for review by the team that owns each "
+            "line, because the lines do not correspond to teams",
+            "Family-scoped parameter rules in planning_parameters.md match on the "
+            "guess, so a rule written for one product line silently applies to another",
         ],
     ),
     "substitution_signal": Capability(
@@ -187,6 +231,25 @@ CAPABILITIES: Dict[str, Capability] = {
             "A part that changed number is planned as two items — the old number as "
             "dead stock against a history that stopped, the new one as a new item on "
             "too little history to forecast or to stock",
+        ],
+    ),
+    "geography_dimension": Capability(
+        name="geography_dimension",
+        description=(
+            "Where demand came from — the country or region a sale was billed to, the "
+            "bottom level of the forecast and sales-review segmentation"
+        ),
+        # Optional, and staying optional. A single-country extract has nothing to split
+        # by and is not a lesser run for it; the segmentation simply has one fewer
+        # level. What is not optional is saying so, which is what the degradation does.
+        required=False,
+        suppliers=["sales_history"],
+        fallback="the forecast and the sales review are not split by country",
+        degrades=[
+            "A distribution centre serving several countries forecasts them as one "
+            "series, so a country growing while another shrinks reads as flat demand",
+            "The sales review cannot be handed to the people who own each market — "
+            "there is one sheet for everyone rather than one per country",
         ],
     ),
     "customer_dimension": Capability(
@@ -304,7 +367,8 @@ class IntakePlan:
             lines.append("  Declared but not supplied by this extract:")
             for doc_type, cap_name in self.withheld:
                 lines.append(f"    {doc_type} carries no data for {cap_name} — "
-                             f"the field behind it is empty in this file")
+                             f"no column mapped to the field behind it, or the one "
+                             f"that did arrived empty")
 
         if self.degradations:
             lines.append("")
@@ -315,10 +379,29 @@ class IntakePlan:
         if self.missing_required:
             lines.append("")
             for cap in self.missing_required:
-                lines.append(
-                    f"  ✗ Missing {cap.name}: supply one of "
-                    f"{' or '.join(cap.suppliers)} ({cap.description})"
-                )
+                lines.append(f"  ✗ Missing {cap.name} — {cap.description}")
+                # Two different problems wear the same red, and telling a planner to
+                # "supply an item master" when they supplied one is how a real fix
+                # gets looked for in the wrong place. A capability is missing either
+                # because no document that could carry it arrived, or because one did
+                # and the field behind it did not.
+                held = [d for d in cap.suppliers if (d, cap.name) in self.withheld]
+                if held:
+                    for doc_type in held:
+                        lines.append(
+                            f"      {self.documents.get(doc_type, doc_type)} was read "
+                            f"as a {doc_type}, and nothing in it mapped to the field "
+                            f"this needs. The column is probably there under a name no "
+                            f"alias matched — run "
+                            f"`python -m inventory_planning.explain <file>` to see "
+                            f"which headers went unmatched, then add the right one as "
+                            f"an alias or map it in an adapter."
+                        )
+                else:
+                    lines.append(
+                        f"      No document supplied it. Provide one of: "
+                        f"{' or '.join(cap.suppliers)}."
+                    )
         return "\n".join(lines)
 
     def to_dict(self) -> Dict[str, Any]:

@@ -1,0 +1,74 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer irrelevant. Cancelling
+# it keeps the queue honest about what is actually being asked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      # Both versions run even when one has already failed. A pandas-3-only failure and
+      # a failure on both are different diagnoses, and stopping at the first one hides
+      # which of the two this is.
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+        # The split this matrix exists for. Production runs pandas 2 and development
+        # runs pandas 3, and the two disagree about enough — object-column downcasting
+        # in `fillna` and `replace` most recently — that a suite green on one says
+        # nothing about the other. Three such divergences were found by hand in a
+        # single session; this is that check, automated.
+        pandas: ["2", "3"]
+    name: py${{ matrix.python }} · pandas ${{ matrix.pandas }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          # Pinned after the project's own install, so the constraint wins over
+          # whatever the dependency resolver happened to pick.
+          python -m pip install "pandas==${{ matrix.pandas }}.*"
+          python -c "import pandas, numpy; print('pandas', pandas.__version__, 'numpy', numpy.__version__)"
+
+      - name: Test
+        run: pytest -q
+
+      # Reported, never failed. A deprecation raised inside this package is a change
+      # the library has already announced, and surfacing it early is the point — but a
+      # run that goes red on somebody else's timetable is a run people learn to ignore,
+      # and a check nobody reads is worse than no check.
+      #
+      # Written to a file rather than piped, because Actions runs `bash -eo pipefail`:
+      # in a pipeline the failing pytest decides the exit status, and the `|| echo`
+      # meant to handle "no matches" then fires after the matches have already printed.
+      - name: Deprecations raised inside this package
+        if: always()
+        run: |
+          # FutureWarning only. Promoting DeprecationWarning as well turns a
+          # dependency's import-time notice into a collection error — the suite never
+          # runs, and every "hit" is an import line rather than a finding.
+          pytest -q -W error::FutureWarning > warnings.txt 2>&1 || true
+          if grep -oE "inventory_planning/[a-z_/]+\.py:[0-9]+" warnings.txt | sort -u > hits.txt \
+             && [ -s hits.txt ]; then
+            echo "Deprecated calls in this package — not a failure, but they have a deadline:"
+            cat hits.txt
+          else
+            echo "None."
+          fi

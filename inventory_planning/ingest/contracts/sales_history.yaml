@@ -22,7 +22,12 @@ identifying_any:
 # roll up. `sku` stays after it so the key degrades to the old one — and no further —
 # on the many exports that carry no position column.
 natural_key: [so_number, so_line_number, sku, ship_date]
-capabilities: [demand_signal, customer_dimension, revenue_dimension]
+capabilities: [demand_signal, customer_dimension, revenue_dimension,
+               geography_dimension]
+
+capability_requires:
+  geography_dimension: [country]
+  revenue_dimension: [amount, unit_price]
 
 value_domains:
   uom:
@@ -167,9 +172,17 @@ fields:
     description: Line revenue — drives the revenue-at-risk ranking in the report
     # `amt` is a distinct token from `amount`, so the abbreviated spellings need
     # listing explicitly — token matching cannot bridge an abbreviation.
+    # The two-token spellings are load-bearing, not padding. A single-token alias is
+    # excluded from subset matching on purpose — `date` inside `delivery date` is not
+    # evidence — so `revenue` alone cannot reach a header like `Sales Revenue (USD)`,
+    # which is how a real extract arrived with its money column unmapped and every
+    # amount on the S&OP worksheet blank. `sales revenue` reaches it; the currency
+    # suffix is the unexplained token the penalty is for.
     aliases: [amount, amt, revenue, net amount, net amt, net value, sales amount,
               sales amt, order amount, order amt, line amount, line amt,
-              extended amount, invoice amount, sales value, turnover]
+              extended amount, invoice amount, sales value, turnover,
+              sales revenue, net revenue, total revenue, gross revenue,
+              revenue amount, invoice value, billed amount, billing amount]
 
   unit_price:
     type: decimal
@@ -202,6 +215,30 @@ fields:
       the transaction actually settled at rather than a planning average.
     aliases: [exchange rate, exch rate, fx rate, conversion rate, conv rate,
               currency rate, ukurs]
+
+  country:
+    type: string
+    role: dimension
+    description: >
+      Where the demand came from — the bill-to country, and the bottom level of the
+      segmentation the forecast and the sales review are grouped by
+      (business unit → product line → country).
+
+      This is the one dimension that has to come from the transaction rather than from
+      the master, because it is a property of the sale and not of the material: one
+      distribution centre serves several countries and the same SKU sells into all of
+      them. A Singapore extract carries demand for most of South-East Asia, and a
+      Chinese one is usually split by region instead — both arrive in this column.
+
+      Note what it cannot reach. Open sales orders carry a sold-to party and no
+      country, and a stock report carries neither, so the split runs as far as the
+      forecast and the sales review and stops there. Backlog netting and replenishment
+      stay at SKU level, which is correct anyway: the stock is one pool at one node and
+      cannot be held per country.
+    aliases: [country, billto country, bill-to country, bill to country,
+              ship to country, shipto country, destination country, country code,
+              country name, sales country, customer country, region, sales region,
+              area, territory, geo, market]
 
   customer:
     type: string

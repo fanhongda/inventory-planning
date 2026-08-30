@@ -80,21 +80,60 @@ every file automatically — do not ask the user to say which file is which.
 | `cost_signal` | no | inventory **or** PO history **or** item master | DIOH cannot be expressed in currency |
 | `order_pattern_signal` | no | PO history **or** open POs | EOQ conformance not assessed |
 | `service_signal` | no | open sales orders | on-time delivery modelled, not measured |
-| `item_dimension` | no | item master **or** planner worksheet | suggested quantities not rounded to a real MOQ; obsolete items still replenished |
+| `item_dimension` | **yes** | item master **or** planner worksheet | cannot run |
+| `product_dimension` | no | item master **or** planner worksheet carrying `product_family` | runs, raises SEVERE — every family is guessed from the part number, so rollups by product line are the numbering scheme's |
 | `planner_baseline` | no | planner worksheet | cannot say whether the safety stock in use is above or below what the data justifies |
+| `geography_dimension` | no | sales history carrying a country | the forecast and the sales review are not split by country |
 | `substitution_signal` | no | a substitution list — **only** this document merges anything | a part that changed number is planned as two items |
 
 **A pre-compiled SKU time series fully satisfies `demand_signal` on its own.** When a
 planner has already bucketed demand themselves, sales history is not needed — and the
 wide period layout is detected from the header, so nothing special has to be called.
 
+### A master is required, and it must name the product family
+
+`item_dimension` and `product_dimension` are **required capabilities**. A run with
+demand and stock but no master data does not proceed. This changed deliberately: what
+that run used to fall back to was not a thinner number but a different one set in the
+same typeface — MOQ and order multiple from a config-wide default, so a suggested
+quantity was rounded to a pack size the supplier does not sell; obsolete items
+replenished against their own history because nothing said they were dead; and the
+product family guessed from the SKU prefix by `_infer_family`. None of those announce
+themselves anywhere in the output. A complete, plausible report that cannot be
+falsified is worse than no report.
+
+`product_dimension` is separate from `item_dimension` because the two fail
+differently, and only one of them is silent. A master with no MOQ column leaves
+`min_order_qty` empty and every consumer can see that. A master with no family column
+leaves nothing empty — the prefix guess fills it — and a revenue-by-family or
+DIOH-by-family table built on a numbering scheme is indistinguishable from one built
+on master data.
+
+**Either master document can satisfy both.** On many sites the family is maintained on
+the planner's sheet and nowhere else; the requirement is the information, not the
+filename.
+
+When a master is present but the family did not map, the run stops and names the file:
+
+> `regional master.xlsx` was read as a planning_master, and nothing in it mapped to
+> the field this needs. The column is probably there under a name no alias matched —
+> run `python -m inventory_planning.explain <file>` to see which headers went
+> unmatched, then add the right one as an alias or map it in an adapter.
+
+That is the common case on a real extract, and it is a mapping decision the planner
+has to make rather than one to infer: an ERP master usually carries several candidate
+columns at different levels (a business unit, a product line, a material group), and
+which one is *the* family is a question about how the business reports, not about the
+data. Ask; do not pick.
+
 ### The two master documents, and why they are treated differently
 
 Planners routinely keep an **ERP item master** (supplier, planned lead time, MOQ,
 order multiple, standard cost, lifecycle status) and their **own planning worksheet**
 (the safety stock, min/max, review period and lead time actually in use, usually
-alongside a few columns of usage history). Both are optional; both change what the run
-can say. Hand them over with everything else — ingest identifies them.
+alongside a few columns of usage history). At least one is required — see above — and
+each changes what the run can say. Hand them over with everything else — ingest
+identifies them.
 
 They are not interchangeable, and the pipeline ranks them:
 
@@ -201,8 +240,9 @@ an open PO silently removes the measured lead time.
 ### Step 1 — Collect whatever the user has
 
 Ask for the files they have; do not enumerate five specific documents. If files are
-already attached, use them. Only the two required capabilities need chasing — and only
-name the *information*, not a filename:
+already attached, use them. Only the required capabilities need chasing — demand,
+stock position, and a master carrying the product family — and only name the
+*information*, not a filename:
 
 > "I have demand and stock. I don't have purchase history — without it I'll use an
 > assumed lead time and safety stock will be understated. Do you have a PO extract?"
@@ -313,6 +353,128 @@ results = planner.run_planning(
 ```
 </details>
 
+### Step 4a — The quality gates, and what to do when one stops the run
+
+Four checkpoints run automatically: **intake**, **demand**, **forecast**, **plan**. A
+BLOCK finding raises `DataQualityError` and the run stops. Every finding says three
+things — what is wrong, what it would have done to the report, and what to do — so
+**relay it verbatim**; do not paraphrase it into "there was a data issue".
+
+What blocks, and why each one is fatal rather than untidy:
+
+| Check | Blocks when | What it would otherwise produce |
+|---|---|---|
+| `sku_agreement` | a document's item numbers meet no other document's | a full report of confident zeroes |
+| `semantic_failure` | an assertion fails on most rows | the wrong column, uniformly wrong |
+| `forecast_coverage` | SKUs that sold got no forecast | those SKUs planned against zero demand, never bought |
+| `position_coverage` | forecast SKUs have no stock row | each reads as a shortage; the run re-buys stock on the shelf |
+
+`dimension_spelling`, `history_depth`, `extract_staleness`,
+`sku_missing_from_master` and `product_family_missing` are warnings. They are applied
+or noted and the run continues.
+
+**A SKU that sells but has no master row, or no product family, does not stop the
+run.** That is the ordinary state of anything new or transferred in, and a planner who
+cannot get a report until master data is perfect gets no reports. The two gaps are
+counted separately, because they have different owners — one needs the item *created*,
+the other needs it *classified* — and both counts belong in the final summary.
+
+The counts are reconcilable against the report rather than being assertions about it:
+every row carries `product_family_source`, reading `master` or `inferred`. Where a
+rollup by product line matters and the coverage is low, say so and offer the filtered
+view — `product_family_source == "master"` gives a rollup containing nothing guessed.
+
+A master with **no family column at all** does not stop the run either — it raises
+`no_product_dimension` at **SEVERE**, the middle of three severities. Replenishment
+never uses the family: safety stock, reorder points and purchase quantities come out
+identical with it and without, so a plan a buyer can act on is not withheld because the
+rollup above it would be unreliable. What the severity buys is that nobody reads the
+rollup as if it meant something.
+
+**Relay a SEVERE finding in full, including its "Not affected" line.** A warning that
+does not bound itself is read as "the whole report is suspect", and the purchase
+recommendations are exactly as good as they were.
+
+### Step 5a — Relay the run health block
+
+Every run ends with a `RUN HEALTH` block and writes `run_health_<run_id>.md` plus
+`quality_gates_<run_id>.json` beside the other outputs. It restates every finding where
+the outputs are, ranked, because the findings were printed as they occurred — by the
+time anyone reaches the recommendations, the sentence that would have changed how they
+read the revenue table has scrolled past.
+
+Three sections, and they are not interchangeable:
+
+- **Do not rely on these** — SEVERE findings, plus BLOCK findings if the run was forced
+  through with `allow_degraded`. Each names the outputs it reaches. **Put these in the
+  final summary, before the numbers, every time.**
+- **Noted** — warnings. Applied or reported; the numbers stand. Summarise, do not
+  enumerate.
+- **What this run could not measure** — the capability degradations. Inputs nobody
+  supplied and the specific consequence of each.
+
+`quality_gates_<run_id>.json` carries the same content structured, with `impacts` per
+finding and an `affected_outputs` roll-up — that is what a report builder should read
+rather than parsing the prose.
+
+The HTML report opens with the same content as a banner, above the KPI tiles. Severe
+findings are expanded with their impacts; warnings and missing inputs are counted on
+one line. A reader who meets the numbers first has formed a view by the time a caveat
+arrives, which is the whole reason it is at the top.
+
+**Do not reach for `allow_degraded=True` to get past a block.** It exists because a
+threshold is a judgement and judgements are occasionally wrong on data nobody
+anticipated. Almost always the finding is right and the fix is in the data or the
+mapping. If the user does decide to override, say plainly in the final summary that
+every figure rests on data that did not pass — the run records it in
+`quality_gates_<run_id>.json` either way.
+
+Thresholds live in `config/quality_gates.json`, documented in the file itself. Raising
+one to get past a failure is worse than a single override: the override is recorded and
+expires, the raised threshold is silent and permanent.
+
+### Step 4ab — The S&OP worksheet, and taking the review back
+
+Every run writes `sop_worksheet_<run_id>.xlsx` — the same forecast in the shape a sales
+organisation reads: history and forecast side by side, **in units and in money**,
+grouped by business unit → product line → country, with empty `REVIEWED qty <period>`
+columns to type into and a rollup tab for the conversation that actually happens.
+
+Money is the reason it exists. A planner argues about units and a sales manager argues
+about revenue; a forecast in units alone gets reviewed by nobody. The amount is
+`forecast_qty × ASP`, and `price_basis` on each row says where that price came from —
+`standard cost (not a price)` means there is no margin in that row.
+
+Where the extract carries a country the sheet is split by it, **top-down**: each SKU's
+forecast apportioned by that country's share of recent demand. The parts sum to the
+total by construction, so the sales review and the replenishment plan can never
+disagree. Say this if asked why a country is not modelled separately.
+
+When the reviewed file comes back:
+
+```python
+plan = planner.load_sales_plan('<the file sales sent back>')
+results = planner.run_planning(**inputs, sales_plan=plan)
+```
+
+Loaded **by name**, never through `load_all` — it is a decision, not an extract, and a
+spreadsheet sitting in an input folder must not be able to overwrite the demand plan by
+being profiled.
+
+Three things to relay about the result:
+
+1. **A blank cell means no change.** Untouched months keep the statistical forecast.
+2. **The statistical number survives** in `statistical_qty`, beside `forecast_qty`, with
+   `forecast_source` saying which is which. That is what makes the review scoreable next
+   quarter.
+3. **Safety stock still uses the statistical model's error.** A number set by judgement
+   is not evidence that demand became more predictable, so σDL does not move. Say this
+   if the user expects safety stock to fall after an upward revision — it will not, and
+   that is the design.
+
+Reviewed SKUs with no demand history are reported and ignored, never invented: a
+forecast conjured from a review alone has no error behind it to size stock on.
+
 ### Step 4b — Policy analysis (should-be, levers, targets)
 
 This is what makes the output an analysis rather than a report. Run it whenever the
@@ -367,6 +529,54 @@ reversible first, service-affecting last. Read out four things:
 
 If the target is unreachable, say so plainly with the shortfall. Do not pad the list
 with service cuts to make it close on paper.
+
+### Step 4bd — S&IOP, accuracy and DIOH
+
+Three analyses produced by the planning run and rendered in the report. They are
+aggregate views; everything else in the pipeline is per SKU.
+
+**`results["siop"]` — supply and demand by period, at cost.** Demand COGS, committed
+supply, projected close and the gap, a month at a time. Demand is valued at **cost**
+here and at **selling price** on the S&OP worksheet — the first asks what the business
+must buy and hold, the second is the number sales review. Both are right; never compare
+them. A period is short where the projected close falls below safety stock, not where
+it falls below zero: service is at risk before the shelf is bare. The projection runs
+per SKU and is summed — say so if anyone asks why a period shows a gap while total
+stock looks ample. `siop_by_period_<run>.csv`, `siop_by_family_<run>.csv`.
+
+**`results["forecast_accuracy"]` — the plan we published against what sold.** Not the
+model's backtest. The backtest asks whether the model was the best available for a
+series; this asks whether the number the business *committed to* — after sales reviewed
+and often changed it — turned out to be right. A model can win its backtest and still
+be wrong about next March, and a reviewed forecast that overrode the model is not in
+the backtest at all.
+
+It needs history. Each run stores its published plan in the snapshot, and a later run
+scores every period that has since closed. **On a first run it says so plainly** —
+relay that rather than quoting the backtest instead, which would look like an answer to
+a question nobody asked.
+
+Output is a **ranking, not an average**: the product lines and items whose plan missed
+by the most money, with the direction. Ranked by value rather than percentage — a 300%
+miss on an eight-hundred-dollar part is a rounding error, and 6% on the largest line is
+the conversation worth having. **Present the top lines and top items, not a summary
+statistic.** A mean closes a discussion; the ranking is there to open one — this line
+ran forty per cent under all half-year, whose assumption was that, what changes.
+
+Where two runs planned the same period, the **earliest** plan is scored: that is what
+the business acted on, and scoring a later revision would flatter every forecast.
+`forecast_bias_by_family_<run>.csv`, `forecast_bias_by_sku_<run>.csv`,
+`sales_review_adjustments_<run>.csv`.
+
+**`policy["inventory_health"]` — DIOH by product line, slow-moving and ageing.** DIOH
+is value-weighted: the line's stock over the line's daily COGS. Never average per-SKU
+DIOH — one dead part scoring 12,000 days drags a healthy line to a number nobody can
+act on. Slow-moving is no demand in six months. **Ageing is only ageing where the stock
+extract carries `inventory_age_days` or `last_movement_date`**; otherwise it is days of
+cover and the report says so. Relay that caveat — cover and age are wrong about each
+other in both directions, and presenting cover as age puts the wrong items on a
+write-off list. `dioh_by_family_<run>.csv`, `slow_moving_<run>.csv`,
+`long_aging_<run>.csv`.
 
 ### Step 4bb — KPI attribution and forward risk (the report)
 

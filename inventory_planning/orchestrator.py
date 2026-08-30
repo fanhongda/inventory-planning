@@ -25,7 +25,38 @@ from .analytics.safety_stock import SafetyStockCalculator
 from .analytics.inventory_projector import InventoryProjector
 from .analytics.forecaster import Forecaster
 from .analytics.purchase_recommender import PurchaseRecommender
+from .analytics.sop import SOPWorksheet
+from .analytics.siop import build_siop_plan
+from .analytics.inventory_health import build_inventory_health
+from .analytics.forecast_accuracy import build_forecast_accuracy
+from .analytics.sales_plan import apply_sales_plan, read_sales_plan
 from .ingest.encoding import write_csv
+from .quality import DataQualityError, GateReport, GateThresholds
+from .quality import assess as assess_run_health
+from .quality import checks as quality_checks
+
+
+def _price_lookup(sop):
+    """
+    Selling price per SKU from the S&OP worksheet's price basis, or nothing.
+
+    Accuracy is weighted by what a SKU is worth, and worth here means revenue: the
+    forecast is the demand plan, and demand is the thing sales committed to. The basis
+    already carries its own provenance label, so a SKU priced from a fallback is
+    weighted the same as one priced from realised revenue — which is right, because the
+    alternative is dropping it from the measurement altogether.
+    """
+    price = getattr(sop, "price", None)
+    frame = getattr(price, "frame", None)
+    if frame is None or not len(frame) or "asp" not in frame.columns:
+        return None
+    priced = frame.dropna(subset=["asp"]).drop_duplicates("sku")
+    if not len(priced):
+        return None
+    return pd.Series(
+        pd.to_numeric(priced["asp"], errors="coerce").values,
+        index=priced["sku"].astype(str).tolist(),
+    )
 
 
 class InventoryPlanner:
@@ -36,7 +67,8 @@ class InventoryPlanner:
 
     def __init__(self, config_dir: Union[str, Path] = None, output_dir: Union[str, Path] = None,
                  interactive: bool = True, store_root: Union[str, Path] = None,
-                 parameters_file: Union[str, Path] = None):
+                 parameters_file: Union[str, Path] = None,
+                 allow_degraded: bool = False):
         base = Path(__file__).parents[1]
         self.config_dir = Path(config_dir) if config_dir else base / "config"
         self.output_dir = Path(output_dir) if output_dir else base / "output"
@@ -50,6 +82,13 @@ class InventoryPlanner:
         self.parameters_file = (Path(parameters_file) if parameters_file
                                 else self.config_dir / "planning_parameters.md")
         self._quality_log: list = []   # accumulates quality reports across all loads
+        # Quality gates. `allow_degraded` proceeds past a BLOCK finding, and is not a
+        # convenience: a threshold is a judgement and judgements are occasionally wrong
+        # on data nobody anticipated. Every override is recorded on the gate report and
+        # travels into the manifest, so an output produced under one says so.
+        self.allow_degraded = bool(allow_degraded)
+        self.gate_thresholds = GateThresholds.load(self.config_dir)
+        self._gate_reports: list = []
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
         self._fx = None                # set by load_all(); which money was restated, and what could not be
@@ -78,6 +117,7 @@ class InventoryPlanner:
         self.projector     = InventoryProjector(self.config_dir,
                                                 horizon_days=self.backlog_horizon_days)
         self.forecaster    = Forecaster(horizon=policy_cfg["forecast_horizon_months"])
+        self.sop           = SOPWorksheet(horizon=policy_cfg["forecast_horizon_months"])
         self.recommender   = PurchaseRecommender(
             demand_basis=policy_cfg.get("demand_basis", "forecast_consumption"),
             horizon_days=self.backlog_horizon_days,
@@ -119,6 +159,21 @@ class InventoryPlanner:
         df, report = self.inv_reader.read(path, interactive=self.interactive)
         self._check_quality(report)
         return df, report
+
+    def load_sales_plan(self, path: Union[str, Path]):
+        """
+        Read a reviewed S&OP worksheet — the forecast after sales have adjusted it.
+
+        Loaded by name and not through `load_all`, because this is the one input that
+        is a decision rather than an extract. Overwriting the demand plan is an act
+        that should be named: a spreadsheet that happened to be sitting in an input
+        folder must not be able to do it by being profiled.
+        """
+        plan = read_sales_plan(path)
+        self.run.record_input(path, doc_type="sales_plan", rows=len(plan.adjustments))
+        print()
+        print(plan.summary())
+        return plan
 
     def load_timeseries(self, path: Union[str, Path], rolling_months: int = 36):
         self.run.record_input(path, doc_type="demand_timeseries")
@@ -195,6 +250,19 @@ class InventoryPlanner:
         print()
         print(should_be.summary())
 
+        # Days on hand rolled up to the product line, with the two tails pulled out.
+        # Built off `should_be` because that is where the position is already valued;
+        # the demand series supplies when each item last sold.
+        health = build_inventory_health(
+            should_be=should_be,
+            time_series=results.get("time_series"),
+            attributes=attributes,
+            inventory=inventory_df,
+            currency=str(getattr(self._fx, "reporting_currency", "USD") or "USD"),
+        )
+        print()
+        print(health.summary())
+
         levers = LeverAnalyzer(calculator).analyze(resolved, actual=inventory_df,
                                                    baseline=should_be)
         print()
@@ -214,6 +282,13 @@ class InventoryPlanner:
         print(f"\n    Per-SKU suggestions : {csv_path}")
         print(f"    Paste-able rules    : {md_path}")
 
+        if len(health.by_family):
+            write_csv(health.by_family, self.output_dir / f"dioh_by_family_{stamp}.csv")
+        if len(health.slow_moving):
+            write_csv(health.slow_moving, self.output_dir / f"slow_moving_{stamp}.csv")
+        if len(health.long_aging):
+            write_csv(health.long_aging, self.output_dir / f"long_aging_{stamp}.csv")
+
         if len(crosscheck.all_disagreements):
             xc_path = self.output_dir / f"source_crosscheck_{stamp}.csv"
             write_csv(crosscheck.frame(), xc_path)
@@ -223,6 +298,12 @@ class InventoryPlanner:
             "sku_attributes": attributes,
             "parameters": resolved,
             "should_be": should_be,
+            "inventory_health": health,
+            # Forwarded from the planning stage so the KPI review, which is handed the
+            # policy dict and not the planning one, can render them without a second
+            # argument nobody would remember to pass.
+            "siop": results.get("siop"),
+            "forecast_accuracy": results.get("forecast_accuracy"),
             "levers": levers,
             "suggestions": suggestions,
             # Carried forward so the KPI review's work list uses the same
@@ -380,6 +461,10 @@ class InventoryPlanner:
             frontier=frontier, fx=self._fx, service_target=service_target,
             attributes=attributes, recommendations=policy.get("recommendations"),
             open_po=open_po_df, suggestions=policy.get("suggestions"),
+            health=self.run_health(),
+            siop=policy.get("siop"),
+            accuracy=policy.get("forecast_accuracy"),
+            inventory_health=policy.get("inventory_health"),
             as_of=as_of, output_path=path,
         )
         print(f"\n  KPI review saved: {path}")
@@ -548,6 +633,19 @@ class InventoryPlanner:
                 "source columns went unmatched, then add the right one as an alias to "
                 "the contract."
             )
+        # Everything above is about a document being absent or unreadable. This is
+        # about the documents being present, readable, and not describing the same
+        # business — the failure that produces a full report of zeroes.
+        self._run_gate(quality_checks.gate_intake(
+            self._intake, plan, self.gate_thresholds))
+
+        # The gate reports the spelling collisions; this applies the fold. Both halves
+        # are needed and neither substitutes for the other — folding without reporting
+        # merges two of somebody's business units on the pipeline's own authority, and
+        # reporting without folding leaves every rollup split while the console says it
+        # noticed. Done after the gate so what is reported is what arrived.
+        self._normalise_dimensions(inputs)
+
         # Degradations are recorded rather than raised: the run is still meaningful,
         # but the report must be able to say which numbers rest on a fallback.
         self._quality_log.append({
@@ -558,6 +656,29 @@ class InventoryPlanner:
             "status": "OK" if not plan.degradations else "WARNINGS",
         })
         return inputs
+
+    # Columns a rollup, a forecast segment or a review sheet groups by. Only these:
+    # folding a free-text column nobody groups by is churn, and folding an identifier
+    # would merge two real things.
+    _DIMENSION_COLUMNS = ("business_unit", "product_family", "country", "region")
+
+    def _normalise_dimensions(self, inputs: dict) -> None:
+        """
+        Fold each dimension column onto one spelling per thing, everywhere at once.
+
+        "Everywhere at once" for the same reason the supersession rewrite is: the sales
+        history and the master both carry a business unit, and folding `Hydraulics Segment`
+        into `Hydraulics` in one of them and not the other produces a segment that has
+        history and no items, beside one that has items and no history.
+        """
+        from .quality.dimensions import normalise_frame
+
+        for key, frame in list(inputs.items()):
+            if not isinstance(frame, pd.DataFrame) or not len(frame):
+                continue
+            folded, collisions = normalise_frame(frame, self._DIMENSION_COLUMNS)
+            if collisions:
+                inputs[key] = folded
 
     def _write_supersession_record(self) -> Optional[Path]:
         """
@@ -644,6 +765,7 @@ class InventoryPlanner:
         timeseries_meta: pd.DataFrame = None,
         item_master_df: pd.DataFrame = None,     # ERP master: supplier, LT, MOQ, cost
         planning_master_df: pd.DataFrame = None, # planner's worksheet: SS, min/max, LT
+        sales_plan=None,                         # reviewed forecast from load_sales_plan
     ) -> dict:
         print("\n" + "="*60)
         print("  INVENTORY PLANNING PIPELINE")
@@ -703,6 +825,8 @@ class InventoryPlanner:
             ts = self.sales_reader.to_time_series(sales_df)
             demand_summary = self.sales_reader.summarize(sales_df)
         print(f"      {len(ts.columns)} SKUs × {len(ts)} periods ({ts.index[0]} → {ts.index[-1]})")
+        self._run_gate(quality_checks.gate_demand(
+            ts, as_of, stale if as_of else None, self.gate_thresholds))
 
         # Step 2: Supplier lead times
         print("\n[2/7] Computing supplier lead times...")
@@ -736,6 +860,16 @@ class InventoryPlanner:
                   and "stocking_policy" in planning_master_df.columns else None)
         forecast_detail = self.forecaster.forecast_all(ts, classified=classified,
                                                        policy=policy)
+        # Sales have the last word on the quantity, and no word at all on the error.
+        # Applied here, before `summary()` builds the frame that safety stock and the
+        # recommender read, so there is exactly one forecast downstream rather than a
+        # statistical one and a reviewed one that some steps use and others do not.
+        override = apply_sales_plan(forecast_detail, sales_plan)
+        forecast_detail = override.forecast_detail
+        if override.applied or sales_plan is not None:
+            print()
+            print(override.summary())
+
         forecast_summary_df = self.forecaster.summary(forecast_detail)
         if not forecast_detail.empty:
             model_counts = forecast_detail.drop_duplicates("sku")["model_used"].value_counts().to_dict()
@@ -743,6 +877,8 @@ class InventoryPlanner:
             # own history and keeps its own winner; `model_used` on every row of
             # forecast_detail and forecast_<ts>.csv says which.
             print(f"      Model chosen per SKU — {model_counts}")
+        self._run_gate(quality_checks.gate_forecast(
+            forecast_detail, ts, self.gate_thresholds))
 
         # Step 5: Planning parameters and the policy each SKU is on.
         #
@@ -771,6 +907,22 @@ class InventoryPlanner:
         print()
         print(profile.summary())
 
+        # The same forecast, written for the other audience. Built here rather than
+        # beside the forecast itself because the segmentation it is grouped by comes
+        # from `attributes`, which the policy step above is what resolves.
+        sop = self.sop.build(
+            time_series=ts,
+            forecast_detail=forecast_detail,
+            sales_df=sales_df,
+            attributes=attributes,
+            unit_cost=attributes if "unit_cost" in getattr(attributes, "columns", [])
+            else None,
+        )
+        print()
+        print(sop.price.summary())
+        print()
+        print(sop.summary())
+
         # Step 6: Safety stock — uses forecast RMSE from step 4 as σDL, over the
         # exposure window the resolved review period implies.
         print("\n[6/7] Calculating safety stock...")
@@ -794,6 +946,9 @@ class InventoryPlanner:
                 open_po_df, as_of=as_of, horizon_days=self.recommender.horizon_days)
             if open_po_df is not None else None
         )
+        self._run_gate(quality_checks.gate_plan(
+            forecast_summary_df if not forecast_detail.empty else None,
+            inventory_df, self.gate_thresholds))
         eff_inv = self.inv_reader.effective_inventory(inventory_df, open_po_summary, supplier_lt)
         projection = self.projector.project(ss_df, eff_inv, open_po_summary)
 
@@ -824,6 +979,42 @@ class InventoryPlanner:
                 print(f"      {late} SKUs have order lines whose order-by date has "
                       f"already passed — lead time no longer recoverable")
 
+        # The period balance, in money. Built here because it is the first point at
+        # which all four of its inputs exist: the bucketed forecast, the open order
+        # book with delivery dates filled in, the opening position, and the safety
+        # stock the gap is measured against.
+        siop = build_siop_plan(
+            forecast_detail=forecast_detail,
+            inventory=inventory_df,
+            open_po=open_po_df,
+            attributes=attributes,
+            safety_stock=ss_df,
+            currency=str(getattr(self._fx, "reporting_currency", "USD") or "USD"),
+        )
+        print()
+        print(siop.summary())
+
+        # Whether the plan this business published last time turned out to be right —
+        # the published number against what then sold, not the model's own backtest.
+        # Needs history, so it says nothing on a first run rather than substituting a
+        # statistic that would look like an answer. Built after the override has been
+        # applied so `statistical_qty` and `forecast_qty` are both on the frame.
+        from .store.fact_store import history_root
+        accuracy = build_forecast_accuracy(
+            time_series=ts,
+            history_root=history_root(self.store_root),
+            forecast_detail=forecast_detail,
+            attributes=attributes,
+            price=_price_lookup(sop),
+            currency=str(getattr(self._fx, "reporting_currency", "USD") or "USD"),
+            # This run's own snapshot is written after the analytics, but a re-run into
+            # the same store would otherwise score a plan against the actuals it was
+            # built from and report a perfect forecast.
+            exclude_run=self.run.run_id,
+        )
+        print()
+        print(accuracy.summary())
+
         realization = self._estimate_realization(open_so_df, inventory_df, as_of)
         print()
         print(realization.summary())
@@ -852,6 +1043,10 @@ class InventoryPlanner:
             "crosscheck": crosscheck,
             "policy_profile": profile,
             "backlog_realization": realization,
+            "sop": sop,
+            "siop": siop,
+            "forecast_accuracy": accuracy,
+            "sales_plan_override": override,
             "intake_summary": intake,
             "inventory_consolidated": inventory_df,
             "item_master": item_master_df,
@@ -861,10 +1056,16 @@ class InventoryPlanner:
             "po_history": po_history_df,
             "as_of": as_of,
             "_quality_reports": self._quality_log,
+            "gate_reports": self._gate_reports,
+            "run_health": self.run_health(),
         }
 
         self._save_outputs(results)
         self._print_summary(recommendations)
+        # Last, deliberately. A caveat printed before the numbers it qualifies is read
+        # as preamble; printed after them it is read as it is meant to be — the answer
+        # to "how much of that do I believe".
+        print(results["run_health"].console())
         return results
 
     def _resolve_policy(self, classified_demand, supplier_lt, inventory,
@@ -1010,6 +1211,36 @@ class InventoryPlanner:
             results["time_series"], results["forecast_detail"])
         if len(sheet):
             write_csv(sheet, out / f"forecast_{ts_str}.csv")
+
+        # The review sheet, in the format the reviewer opens it in. CSV as well as
+        # xlsx: the xlsx is what goes to sales, and the CSV is what survives being
+        # read back by anything else.
+        accuracy = results.get("forecast_accuracy")
+        if accuracy is not None:
+            if len(accuracy.by_sku):
+                write_csv(accuracy.by_sku, out / f"forecast_bias_by_sku_{ts_str}.csv")
+            if len(accuracy.by_family):
+                write_csv(accuracy.by_family,
+                          out / f"forecast_bias_by_family_{ts_str}.csv")
+            if len(accuracy.adjustments):
+                write_csv(accuracy.adjustments,
+                          out / f"sales_review_adjustments_{ts_str}.csv")
+
+        siop = results.get("siop")
+        if siop is not None and len(siop.by_period):
+            write_csv(siop.by_period, out / f"siop_by_period_{ts_str}.csv")
+            if len(siop.by_family):
+                write_csv(siop.by_family, out / f"siop_by_family_{ts_str}.csv")
+
+        sop = results.get("sop")
+        if sop is not None and len(sop.sheet):
+            write_csv(sop.sheet, out / f"sop_worksheet_{ts_str}.csv")
+            try:
+                xlsx = out / f"sop_worksheet_{ts_str}.xlsx"
+                self._write_sop_workbook(xlsx, sop)
+                self.run.record_output(xlsx, rows=len(sop.sheet))
+            except Exception as e:
+                print(f"  Warning: S&OP workbook not written ({e})")
         write_csv(results["recommendations"], out / f"purchase_recommendations_{ts_str}.csv")
 
         profile = results.get("policy_profile")
@@ -1019,6 +1250,24 @@ class InventoryPlanner:
         realization = results.get("backlog_realization")
         if realization is not None and len(realization.per_sku):
             write_csv(realization.per_sku, out / f"backlog_realization_{ts_str}.csv")
+
+        # What each checkpoint found, including the ones that passed. Written every run
+        # rather than only on failure: "the gates found nothing" is a statement about
+        # this extract, and a file that appears only when something is wrong cannot
+        # make it. It is also the record of an override — an output produced under
+        # allow_degraded has to be able to say so after the console has scrolled away.
+        health = results.get("run_health")
+        if health is not None:
+            gate_path = out / f"quality_gates_{ts_str}.json"
+            gate_path.write_text(json.dumps(health.to_dict(), indent=2,
+                                            ensure_ascii=False), encoding="utf-8")
+            self.run.record_output(gate_path)
+            # Also as prose. The JSON is for the report builder; this is for the person
+            # who opens the output folder a week later and has to decide whether the
+            # numbers in it were ever safe to use.
+            health_path = out / f"run_health_{ts_str}.md"
+            health_path.write_text(health.markdown(), encoding="utf-8")
+            self.run.record_output(health_path)
 
         # Save planning snapshot for next-month feedback comparison
         try:
@@ -1055,6 +1304,70 @@ class InventoryPlanner:
             path = self.output_dir / name
             if path.exists():
                 self.run.record_output(path)
+
+    def _write_sop_workbook(self, path: Path, sop) -> None:
+        """
+        The review sheet as a workbook, with somewhere to write the answer.
+
+        Three things make this different from dumping the frame to xlsx. The
+        **adjustment columns are empty and adjacent** — a reviewer types beside the
+        month they are arguing with, not on a second tab. The **statistical columns are
+        left alone**, so what the model said survives next to what sales decided and
+        the two can be compared afterwards; overwriting the forecast in place would
+        destroy the only evidence of whether the review helped. And the **rollup goes
+        on its own sheet**, because the argument happens at product-line level and the
+        SKU detail is what gets consulted when somebody disputes the rollup.
+
+        Written with pandas rather than by hand: cell formatting is not worth a
+        dependency on openpyxl's styling API, and a reviewer will reformat it anyway.
+        """
+        sheet = sop.sheet.copy()
+
+        # One editable column per forecast month, plus a place to say why. Empty on
+        # purpose — pre-filling them with the statistical number means a reviewer who
+        # changes nothing has silently endorsed everything, and one who changes one
+        # month leaves no signal that the others were considered.
+        for period in sop.horizon_periods:
+            sheet[f"REVIEWED qty {period}"] = np.nan
+        sheet["REVIEWED by"] = ""
+        sheet["REVIEWED reason"] = ""
+
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            sheet.to_excel(writer, sheet_name="Review by SKU", index=False)
+
+            group_cols = [c for c in ("business_unit", "product_family", "country")
+                          if c in sheet.columns and sheet[c].notna().any()]
+            if group_cols:
+                measures = [c for c in sheet.columns
+                            if c.startswith(("hist amt ", "fcst amt "))
+                            or c in ("history_amount_total", "forecast_amount_total",
+                                     "history_qty_total", "forecast_qty_total")]
+                rollup = (sheet.groupby(group_cols, dropna=False)[measures]
+                          .sum().reset_index())
+                rollup.to_excel(writer, sheet_name="Rollup", index=False)
+
+            # What the numbers rest on, in the file rather than in a chat message. A
+            # worksheet that circulates for three weeks outlives every explanation
+            # given when it was sent.
+            notes = pd.DataFrame({"note": [
+                "History is what was invoiced. Amounts are as booked at the time, not "
+                "restated at today's price.",
+                "Forecast amount = forecast quantity x average selling price. "
+                "`price_basis` on each row says where that price came from; "
+                "`standard cost (not a price)` means there is no margin in that row.",
+                "`vs_naive` is the model's error over the error of simply repeating "
+                "last month. 1.00 means the model added nothing.",
+                "Blank amount means no price could be established. It is blank rather "
+                "than zero so it cannot sum into a total unnoticed.",
+                "Type into the REVIEWED qty columns. Leave the others alone — keeping "
+                "the statistical forecast beside your number is how we find out, next "
+                "quarter, which of the two was closer.",
+                "A blank REVIEWED cell means 'no change', and the statistical forecast "
+                "stands for that month.",
+            ]})
+            notes.to_excel(writer, sheet_name="How to read this", index=False)
+
+        print(f"  S&OP worksheet:   {path.name}")
 
     def _record_run_state(self) -> None:
         """Write the manifest as it now stands. Safe to call more than once per run."""
@@ -1156,6 +1469,50 @@ class InventoryPlanner:
                 "sopc_class":  meta.loc[sku, "sopc_classification"] if (meta is not None and sku in meta.index and "sopc_classification" in meta.columns) else "",
             })
         return pd.DataFrame(rows)
+
+    def _run_gate(self, report: GateReport) -> GateReport:
+        """
+        Print a checkpoint's findings and stop the run if any of them block.
+
+        Every gate goes through here so that the override, the recording and the
+        message are the same wherever the check lives. A gate that raised on its own
+        would be a gate that could be added without an override path or without leaving
+        a trace, and the first time a threshold turned out to be wrong on somebody's
+        data the answer would be to delete the check.
+        """
+        self._gate_reports.append(report)
+        if report.findings:
+            print()
+            print(report.summary())
+        if report.passed:
+            return report
+        if not self.allow_degraded:
+            raise DataQualityError(report)
+        report.overridden = True
+        print(f"\n  ⚠ Continuing past {len(report.blocking)} blocking "
+              f"{'finding' if len(report.blocking) == 1 else 'findings'} at the "
+              f"'{report.stage}' gate — allow_degraded is set. Every figure that "
+              f"follows rests on data that did not pass.")
+        return report
+
+    @property
+    def gate_reports(self) -> list:
+        """Every checkpoint this run passed through, in order, with what it found."""
+        return list(self._gate_reports)
+
+    def run_health(self):
+        """
+        Every reservation attached to this run, collected and ranked.
+
+        The findings were all printed as they occurred, which is the wrong moment for
+        all but the first: by the time a planner reaches the recommendations, the one
+        sentence that would have changed how they read the revenue table has scrolled
+        past. This restates them where the outputs are.
+        """
+        return assess_run_health(
+            run_id=self.run.run_id, gates=self._gate_reports,
+            plan=self._intake_plan, allow_degraded=self.allow_degraded,
+        )
 
     def _check_quality(self, report: dict) -> None:
         self._quality_log.append(report)

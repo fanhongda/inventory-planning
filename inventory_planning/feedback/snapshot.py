@@ -36,6 +36,37 @@ import pandas as pd
 
 class SnapshotSaver:
 
+    @staticmethod
+    def _published_plan(results: dict) -> list:
+        """
+        Every period of the horizon as it was planned, with both numbers where a sales
+        review moved one.
+
+        Kept flat and small — sku, period, two quantities and a source — because it is
+        written every run and read by every later one. The rest of the forecast detail
+        (model, backtest scores) is already in `forecast_detail_<run>.csv`; what is
+        needed here is only what a future actual can be compared against.
+        """
+        detail = results.get("forecast_detail")
+        if detail is None or not len(detail):
+            return []
+        columns = {"sku", "period", "forecast_qty"} & set(detail.columns)
+        if len(columns) < 3:
+            return []
+        rows = []
+        for _, row in detail.iterrows():
+            entry = {
+                "sku": str(row["sku"]),
+                "period": str(row["period"]),
+                "forecast_qty": float(row["forecast_qty"]),
+            }
+            if "statistical_qty" in detail.columns and pd.notna(row.get("statistical_qty")):
+                entry["statistical_qty"] = float(row["statistical_qty"])
+            if "forecast_source" in detail.columns:
+                entry["forecast_source"] = str(row.get("forecast_source") or "statistical")
+            rows.append(entry)
+        return rows
+
     def save(self, results: dict, config: dict, output_dir: Path,
              history_root: Path = None, stamp: str = None) -> Path:
         """
@@ -76,6 +107,16 @@ class SnapshotSaver:
                 "suggested_po_qty": float(row.get("suggested_po_qty", 0)),
                 "forecast_next_period": float(row.get("forecast_next_period", 0)),
                 "forecast_avg_monthly": float(row.get("forecast_avg_monthly", 0)),
+                # Both numbers, so next period can score the review rather than argue
+                # about it. `forecast_next_period` is what was planned on — the
+                # reviewed figure where sales changed it — and this is what the model
+                # said before they did. Storing only the first makes the question
+                # "did the adjustment help?" permanently unanswerable, and a review
+                # process that cannot be scored is one that never improves.
+                "statistical_next_period": float(
+                    row.get("statistical_next_period",
+                            row.get("forecast_next_period", 0)) or 0),
+                "forecast_source": row.get("forecast_source", "statistical"),
                 "net_requirement": float(row.get("net_requirement", 0)),
                 "available_supply": float(row.get("available_supply", 0)),
                 "safety_stock": float(row.get("safety_stock", 0)),
@@ -108,6 +149,15 @@ class SnapshotSaver:
         snapshot = {
             "run_at": run_dt.isoformat(),
             "planning_month": month_label,
+            # The plan as published, across the whole horizon rather than only t+1.
+            #
+            # Forecast accuracy that matters to an S&IOP meeting is not how a model
+            # scored on held-out history — it is whether the number the business
+            # committed to turned out to be right. Answering that needs the plan for
+            # every period, kept, so a later run can put the actual beside it. t+1
+            # alone can only ever score the month that was already nearly certain.
+            "as_of": str(results.get("as_of") or ""),
+            "plan": self._published_plan(results),
             "config_snapshot": {
                 "cv_intermittent_threshold": config.get("cv_intermittent_threshold"),
                 "cv_erratic_threshold": config.get("cv_erratic_threshold"),

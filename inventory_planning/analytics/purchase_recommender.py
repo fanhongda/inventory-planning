@@ -155,8 +155,12 @@ class PurchaseRecommender:
         # ── Next-period demand: use t+1 point forecast, not 6-month average ──
         if forecast_summary is not None and len(forecast_summary):
             if "forecast_next_period" in forecast_summary.columns:
-                next_cycle = forecast_summary[["sku", "forecast_next_period",
-                                               "forecast_avg_monthly"]].copy()
+                wanted = ["sku", "forecast_next_period", "forecast_avg_monthly"]
+                # Carried through untouched so the snapshot can keep both, and next
+                # period can score the sales review instead of relitigating it.
+                wanted += [c for c in ("statistical_next_period", "forecast_source")
+                           if c in forecast_summary.columns]
+                next_cycle = forecast_summary[wanted].copy()
                 df = df.merge(next_cycle, on="sku", how="left")
                 # forecast_next_period is the authoritative demand estimate for net req
                 df["next_period_demand"] = df["forecast_next_period"].fillna(
@@ -284,7 +288,8 @@ class PurchaseRecommender:
 
         cols = [
             "sku", "location_id", "stocking_class", "recommended_action",
-            "forecast_next_period", "forecast_avg_monthly", "forecast_horizon_qty",
+            "forecast_next_period", "statistical_next_period", "forecast_source",
+            "forecast_avg_monthly", "forecast_horizon_qty",
             "backlog_qty", "backlog_due_qty", "backlog_past_due_qty",
             "backlog_realization_rate", "firm_demand_qty",
             "mto_order_by", "mto_order_status", "mto_actionable_qty",

@@ -26,7 +26,9 @@ def main():
     parser.add_argument("--open-po",      required=True,  help="Open purchase orders file (CSV/xlsx)")
     parser.add_argument("--inventory",    required=True,  help="Inventory snapshot file (CSV/xlsx)")
     parser.add_argument("--timeseries",   default=None,   help="Pre-compiled time series file (wide format, optional)")
-    parser.add_argument("--item-master",  default=None,   help="ERP item master (optional): supplier, lead time, MOQ, cost")
+    parser.add_argument("--item-master",  required=True,
+                        help="ERP item master: supplier, lead time, MOQ, cost and — "
+                             "required — the product family each SKU belongs to")
     parser.add_argument("--planning-master", default=None, help="Planner worksheet (optional): safety stock, min/max, LT — compared, not consumed")
     parser.add_argument("--ts-months",    type=int, default=36, help="Rolling months for time series (default 36)")
     parser.add_argument("--output",       default="output", help="Output directory (default: ./output)")
@@ -36,6 +38,15 @@ def main():
                              "A different one is a scenario: it changes the review period and "
                              "service level the recommendations are built on, and the run records "
                              "it so the two can be compared afterwards.")
+    parser.add_argument("--sales-plan",   default=None,
+                        help="A reviewed S&OP worksheet. Its REVIEWED qty columns "
+                             "replace the statistical forecast for those SKU-months; "
+                             "blank cells leave the forecast alone. Safety stock still "
+                             "uses the statistical model's error.")
+    parser.add_argument("--allow-degraded", action="store_true",
+                        help="Continue past a failed quality gate. The findings and the "
+                             "override are recorded in quality_gates_<run>.json — every "
+                             "figure then rests on data that did not pass.")
     parser.add_argument("--no-interactive", action="store_true", help="Skip column-mapping confirmation prompts")
 
     args = parser.parse_args()
@@ -45,6 +56,7 @@ def main():
         output_dir=args.output,
         interactive=not args.no_interactive,
         parameters_file=args.parameters,
+        allow_degraded=args.allow_degraded,
     )
 
     print("Loading input files...")
@@ -69,12 +81,31 @@ def main():
         item_master_df = loaded.get("item_master_df")
         planning_master_df = loaded.get("planning_master_df")
 
+    # This path loads one named file per flag and never builds a capability plan, so
+    # the `product_dimension` gate in `load_all` cannot fire here. The gate is about
+    # the data, not about which entry point read it: without a family the product
+    # rollups are built on `_infer_family`'s reading of the part number, and nothing
+    # in the output says so.
+    masters = [df for df in (item_master_df, planning_master_df) if df is not None]
+    if not any("product_family" in df.columns and df["product_family"].notna().any()
+               for df in masters):
+        parser.error(
+            f"{args.item_master} carries no product family. Nothing mapped to "
+            f"`product_family` — the column is probably there under a name no alias "
+            f"matched. Run `python -m inventory_planning.explain {args.item_master}` "
+            f"to see which headers went unmatched, then add the right one as an alias "
+            f"or map it in an adapter."
+        )
+
+    sales_plan = planner.load_sales_plan(args.sales_plan) if args.sales_plan else None
+
     results = planner.run_planning(
         sales_df, po_hist_df, open_so_df, open_po_df, inv_df,
         timeseries_pivot=ts_pivot,
         timeseries_meta=ts_meta,
         item_master_df=item_master_df,
         planning_master_df=planning_master_df,
+        sales_plan=sales_plan,
     )
     planner.run_policy_analysis(
         results, inventory_df=inv_df, open_po_df=open_po_df,

@@ -948,7 +948,11 @@ class InventoryPlanner:
         )
         self._run_gate(quality_checks.gate_plan(
             forecast_summary_df if not forecast_detail.empty else None,
-            inventory_df, self.gate_thresholds))
+            inventory_df, self.gate_thresholds,
+            # So the check can tell an item that should be on the shelf from one the
+            # policy never intended to hold. Without them every make-to-order item
+            # counts as a missing position, which is the ordinary state of the data.
+            attributes=attributes, classified=classified))
         eff_inv = self.inv_reader.effective_inventory(inventory_df, open_po_summary, supplier_lt)
         projection = self.projector.project(ss_df, eff_inv, open_po_summary)
 

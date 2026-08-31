@@ -248,15 +248,85 @@ class TestForecastAndPositionCoverage:
         detail = pd.DataFrame({"sku": ["Q-0", "Q-1"], "forecast_qty": [1.0, 1.0]})
         assert quality_checks.gate_forecast(detail, ts, GateThresholds.load(None)).passed
 
-    def test_forecast_skus_absent_from_the_stock_report_block(self):
+    def _summary(self, n=10):
+        return pd.DataFrame({"sku": [f"P-{i}" for i in range(n)]})
+
+    def test_stocked_items_absent_from_the_stock_report_are_severe(self):
         """
-        The expensive direction: an absent position is planned as zero, reads as a
-        shortage, and the run buys stock the warehouse already holds.
+        An item the policy says to hold, with no row, is read as a position of zero —
+        right when the shelf is empty, wrong when the extract did not cover it, and the
+        output does not separate the two.
         """
-        summary = pd.DataFrame({"sku": [f"P-{i}" for i in range(10)]})
-        inventory = pd.DataFrame({"sku": ["P-0", "P-1"]})
-        report = quality_checks.gate_plan(summary, inventory, GateThresholds.load(None))
-        assert [f for f in report.blocking if f.check == "position_coverage"]
+        classified = pd.DataFrame({"sku": [f"P-{i}" for i in range(10)],
+                                   "stocking_class": ["stocking-high"] * 10})
+        report = quality_checks.gate_plan(
+            self._summary(), pd.DataFrame({"sku": ["P-0", "P-1"]}),
+            GateThresholds.load(None), classified=classified)
+        finding = next(f for f in report.severe if f.check == "position_coverage")
+        assert "20%" in finding.what
+
+    def test_it_does_not_block(self):
+        """
+        It did, and it was the wrong call. A missing position is visible in the output —
+        the SKU comes out at zero and lands in SHORTAGE-RISK — and blocking is for
+        damage a reader cannot see. Blocking here also got the whole mechanism switched
+        off with `allow_degraded`, which disables every gate at every stage.
+        """
+        classified = pd.DataFrame({"sku": [f"P-{i}" for i in range(10)],
+                                   "stocking_class": ["stocking-high"] * 10})
+        report = quality_checks.gate_plan(
+            self._summary(), pd.DataFrame({"sku": ["P-0"]}),
+            GateThresholds.load(None), classified=classified)
+        assert report.passed, "a visible gap must not stop the run"
+
+    def test_non_stocking_items_are_not_expected_to_have_a_position(self):
+        """
+        The case that made this fire on healthy data. A non-stocking item sells and is
+        never held; an extract that omits it is correct, not incomplete.
+        """
+        classified = pd.DataFrame({
+            "sku": [f"P-{i}" for i in range(10)],
+            "stocking_class": ["stocking-high"] * 2 + ["non-stocking"] * 8,
+        })
+        report = quality_checks.gate_plan(
+            self._summary(), pd.DataFrame({"sku": ["P-0", "P-1"]}),
+            GateThresholds.load(None), classified=classified)
+        assert report.findings == [], "only the two stocked SKUs count, and both joined"
+
+    def test_the_erp_policy_outranks_the_inferred_class(self):
+        """
+        `stocking_policy` is a decision someone made; `stocking_class` is the pipeline's
+        reading of the demand. Where both speak, the decision wins.
+        """
+        attributes = pd.DataFrame({
+            "sku": [f"P-{i}" for i in range(10)],
+            "stocking_policy": ["MTO"] * 8 + ["MTS"] * 2,
+            # The pipeline disagrees and would call all ten stocked.
+            "stocking_class": ["stocking-high"] * 10,
+        })
+        report = quality_checks.gate_plan(
+            self._summary(), pd.DataFrame({"sku": ["P-8", "P-9"]}),
+            GateThresholds.load(None), attributes=attributes)
+        assert report.findings == []
+
+    def test_the_excluded_items_are_still_counted_in_the_finding(self):
+        """Excluded from the ratio, not from the reader's view."""
+        classified = pd.DataFrame({
+            "sku": [f"P-{i}" for i in range(10)],
+            "stocking_class": ["stocking-high"] * 5 + ["non-stocking"] * 5,
+        })
+        report = quality_checks.gate_plan(
+            self._summary(), pd.DataFrame({"sku": ["P-0"]}),
+            GateThresholds.load(None), classified=classified)
+        finding = next(f for f in report.severe if f.check == "position_coverage")
+        assert finding.evidence["missing_by_design"] == 5
+        assert "not expected to" in finding.what
+
+    def test_with_no_policy_at_all_every_sku_counts_and_it_says_so(self):
+        report = quality_checks.gate_plan(
+            self._summary(), pd.DataFrame({"sku": ["P-0"]}), GateThresholds.load(None))
+        finding = next(f for f in report.severe if f.check == "position_coverage")
+        assert "no stocking policy or class was available" in finding.why
 
 
 # ── End to end ───────────────────────────────────────────────────────────────

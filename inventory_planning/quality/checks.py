@@ -415,13 +415,34 @@ def gate_forecast(forecast_detail: pd.DataFrame, time_series: pd.DataFrame,
 
 
 def gate_plan(forecast_summary: pd.DataFrame, inventory: pd.DataFrame,
-              thresholds: GateThresholds) -> GateReport:
+              thresholds: GateThresholds, attributes: pd.DataFrame = None,
+              classified: pd.DataFrame = None) -> GateReport:
     """
-    Whether the stock position joined to the demand it is meant to cover.
+    Whether the items the business *intends to stock* joined to a stock position.
 
-    The join that fails here fails in the most expensive direction. A forecast SKU with
-    no inventory row is not dropped — it is planned against a position of zero, which
-    reads as a shortage, and the run recommends buying stock the warehouse already has.
+    The first version of this check counted every forecast SKU and blocked below 80%,
+    and it was wrong about the business rather than about the arithmetic. **An
+    inventory extract is not expected to contain every item that sold.** A
+    make-to-order item is bought against a customer order and never held; a
+    non-stocking item is one the policy has decided not to carry. Both sell, neither
+    has a position, and an extract that omits them is correct. On a real run 45% of
+    forecast SKUs had no inventory row and the gate stopped a report that was fine.
+
+    Worse than being wrong, it was wrong in the way that gets a gate removed: the fix
+    reached for was `allow_degraded`, which switches off *every* gate at every stage.
+    A check that fires on the ordinary state of the data costs more than it protects.
+
+    So the denominator is now the items that should have a position — the ERP's `MTS`
+    where it says, the pipeline's stocking class otherwise — and the make-to-order and
+    non-stocking items are counted separately and reported as context rather than as a
+    fault.
+
+    It no longer blocks either. A missing position is visible in the output: the SKU
+    comes out at zero on hand and lands in SHORTAGE-RISK. Blocking is reserved for
+    damage a reader cannot see, and this is not that. The genuine catastrophe — an item
+    key that agrees with nothing — is caught at intake by `sku_agreement`, which
+    compares the keys directly instead of inferring a join failure from a coverage
+    number that has an innocent explanation.
     """
     report = GateReport(stage="plan")
     if (forecast_summary is None or not len(forecast_summary)
@@ -430,22 +451,91 @@ def gate_plan(forecast_summary: pd.DataFrame, inventory: pd.DataFrame,
 
     forecast_skus = set(forecast_summary["sku"].astype(str))
     stocked = set(inventory["sku"].dropna().astype(str))
-    share = len(forecast_skus & stocked) / len(forecast_skus)
+    expected, held_by_design, basis = _expected_to_hold(
+        forecast_skus, attributes, classified)
+
+    missing_by_design = sorted((forecast_skus - stocked) & held_by_design)
+    if not expected:
+        return report
+
+    covered = expected & stocked
+    share = len(covered) / len(expected)
     if share >= thresholds["position_coverage_floor"]:
         return report
 
-    missing = sorted(forecast_skus - stocked)
+    missing = sorted(expected - stocked)
+    context = ""
+    if missing_by_design:
+        context = (f" A further {len(missing_by_design):,} SKUs have no position and "
+                   f"are not expected to — they are make-to-order or non-stocking, and "
+                   f"are excluded from the figure above.")
+
     report.findings.append(Finding(
-        stage="plan", check="position_coverage", severity=BLOCK,
-        what=(f"{share:.0%} of the {len(forecast_skus):,} forecast SKUs have a row in "
-              f"the inventory snapshot — {len(missing):,} do not."),
-        why=("An absent position is planned as zero, not as unknown. Each of those "
-             "SKUs reads as a shortage and generates a purchase recommendation for "
-             "stock that may already be on the shelf."),
+        stage="plan", check="position_coverage", severity=SEVERE,
+        what=(f"{share:.0%} of the {len(expected):,} SKUs that should be stocked have "
+              f"a row in the inventory snapshot — {len(missing):,} do not.{context}"),
+        why=("For an item the policy says to hold, an absent row is read as a position "
+             "of zero rather than as unknown. That is right when the shelf really is "
+             "empty and wrong when the extract simply did not cover the item, and "
+             f"nothing in the output separates the two. Stocking intent read from "
+             f"{basis}."),
+        impacts=[
+            "Purchase recommendations for the affected SKUs: each reads as a shortage "
+            "and may ask you to buy stock the warehouse already holds",
+            "Inventory projection and days of cover: computed from zero on hand",
+            "Excess and value-at-risk totals: understated, since these SKUs carry no "
+            "value into them",
+            "Not affected: every SKU that did join, and the demand forecast for all of "
+            "them — the forecast never reads the stock position.",
+        ],
         fix=("Check the inventory extract covers the same plants and item range as the "
-             "sales history, and that both key on the same item number. "
+             "sales history. Where it is a genuine zero-stock position that the export "
+             "omits, the report is right and this is noise — say so and move on. "
              f"First few: {', '.join(missing[:5])}"),
-        evidence={"coverage": round(share, 4), "forecast_skus": len(forecast_skus),
-                  "unpositioned": len(missing), "examples": missing[:20]},
+        evidence={"coverage": round(share, 4), "expected_to_hold": len(expected),
+                  "unpositioned": len(missing), "basis": basis,
+                  "missing_by_design": len(missing_by_design),
+                  "examples": missing[:20]},
     ))
     return report
+
+
+def _expected_to_hold(forecast_skus: set, attributes, classified) -> tuple:
+    """
+    Split the forecast SKUs into those that should carry stock and those that should not.
+
+    Authority order matters. `stocking_policy` is the ERP's — a decision a person made
+    about whether to hold the item — and outranks `stocking_class`, which is the
+    pipeline's own reading of the demand. Where neither is available every SKU is
+    treated as expected to hold, and the finding says so: an unqualified count is worth
+    less, but silently narrowing the check to nothing would be worse.
+    """
+    frames = [f for f in (attributes, classified)
+              if f is not None and len(f) and "sku" in f.columns]
+
+    policy = {}
+    for frame in frames:
+        if "stocking_policy" in frame.columns:
+            part = frame[["sku", "stocking_policy"]].dropna()
+            policy.update({str(k): str(v).strip().upper()
+                           for k, v in zip(part["sku"], part["stocking_policy"])})
+    if policy:
+        held = {s for s in forecast_skus if policy.get(s) == "MTO"}
+        # Returned even when nothing is left. A business whose every item is bought to
+        # order is a real one, and there the right answer is that no SKU was expected
+        # to carry stock — falling through to the inferred class would put them all
+        # back and report a missing position for each.
+        return forecast_skus - held, held, "the ERP's stocking policy (MTS/MTO)"
+
+    klass = {}
+    for frame in frames:
+        if "stocking_class" in frame.columns:
+            part = frame[["sku", "stocking_class"]].dropna()
+            klass.update({str(k): str(v).strip().lower()
+                          for k, v in zip(part["sku"], part["stocking_class"])})
+    if klass:
+        held = {s for s in forecast_skus
+                if klass.get(s, "").startswith("non-stocking")}
+        return forecast_skus - held, held, "the pipeline's stocking class"
+
+    return set(forecast_skus), set(), "nothing — no stocking policy or class was available"

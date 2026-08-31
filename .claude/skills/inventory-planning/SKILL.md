@@ -367,11 +367,24 @@ What blocks, and why each one is fatal rather than untidy:
 | `sku_agreement` | a document's item numbers meet no other document's | a full report of confident zeroes |
 | `semantic_failure` | an assertion fails on most rows | the wrong column, uniformly wrong |
 | `forecast_coverage` | SKUs that sold got no forecast | those SKUs planned against zero demand, never bought |
-| `position_coverage` | forecast SKUs have no stock row | each reads as a shortage; the run re-buys stock on the shelf |
 
-`dimension_spelling`, `history_depth`, `extract_staleness`,
-`sku_missing_from_master` and `product_family_missing` are warnings. They are applied
-or noted and the run continues.
+`dimension_spelling`, `history_depth`, `extract_staleness`, `sku_missing_from_master`,
+`product_family_missing` and `position_coverage` are warnings. They are applied or
+noted and the run continues.
+
+**`position_coverage` does not block, and it does not count every SKU.** An inventory
+extract is not expected to contain every item that sold: a make-to-order item is bought
+against a customer order and never held, and a non-stocking item is one the policy has
+decided not to carry. Both sell, neither has a position, and an extract that omits them
+is *correct*. The check counts only the SKUs that should be stocked — the ERP's `MTS`
+where the master says, the pipeline's stocking class otherwise — and reports the rest
+as context.
+
+If it fires, say what it is before treating it as a fault: for an item the policy says
+to hold, an absent row is read as zero, which is right when the shelf really is empty
+and wrong when the extract did not cover the item. **Often it is the former and the
+report is fine.** Never reach for `allow_degraded` to get past it — that switches off
+every gate at every stage, including the ones that catch a report of confident zeroes.
 
 **A SKU that sells but has no master row, or no product family, does not stop the
 run.** That is the ordinary state of anything new or transferred in, and a planner who

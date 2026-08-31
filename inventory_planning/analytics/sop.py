@@ -191,11 +191,24 @@ def country_shares(sales_df: pd.DataFrame, months: int = _PRICE_MONTHS) -> pd.Da
     shares are what the top-down split apportions by, so a share that is stale is a
     forecast pointed at the wrong country.
     """
-    if (sales_df is None or not len(sales_df) or "country" not in sales_df.columns
+    # Country where the extract names one, the sales region where it only names that.
+    # A Singapore order book reports `APAC - SEA` and never says Korea or Vietnam, and
+    # a coarser split honestly labelled is worth more than no split at all — the whole
+    # point of the segmentation is that a market growing while another shrinks should
+    # not read as flat demand, and that signal survives at region level.
+    #
+    # The column keeps its own name on the sheet, so nobody reads `APAC - SEA` under a
+    # heading that says country.
+    level = next((c for c in ("country", "region")
+                  if sales_df is not None and c in getattr(sales_df, "columns", [])
+                  and sales_df[c].notna().any()), None)
+    if (sales_df is None or not len(sales_df) or level is None
             or "demand_date" not in sales_df.columns):
         return pd.DataFrame(columns=["sku", "country", "share"])
 
-    df = sales_df.dropna(subset=["sku", "country", "demand_date"]).copy()
+    df = sales_df.dropna(subset=["sku", level, "demand_date"]).copy()
+    if level != "country":
+        df = df.rename(columns={level: "country"})
     df["qty"] = pd.to_numeric(df.get("qty"), errors="coerce")
     df = df[df["qty"] > 0]
     if not len(df):

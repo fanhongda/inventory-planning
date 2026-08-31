@@ -216,6 +216,26 @@ fields:
     aliases: [exchange rate, exch rate, fx rate, conversion rate, conv rate,
               currency rate, ukurs]
 
+  region:
+    type: string
+    role: dimension
+    description: >
+      The geography *above* country — a sales region or area, in whatever levels the
+      business reports on: `APAC`, `APAC - SEA`, `EMEA North`.
+
+      Separate from `country` because they are different levels and a single field
+      cannot hold both. `country` used to list `region`, `area` and `territory` among
+      its aliases, so whichever of the two columns matched first took the field and
+      the other was dropped — an extract carrying `Country` *and* `Sold-to Region`
+      kept one at random and lost the level nobody noticed was missing.
+
+      Where an extract carries only a region, `country` stays empty and the segmented
+      forecast falls back to this. That is a coarser split, honestly labelled, rather
+      than a region wearing the word "country".
+    aliases: [region, sales region, sold-to region, sold to region, sold-to global region,
+              sold to global region, global region, area, sales area, territory,
+              sales territory, geo, geography, market, sub region, sub-region, zone]
+
   country:
     type: string
     role: dimension
@@ -237,8 +257,8 @@ fields:
       cannot be held per country.
     aliases: [country, billto country, bill-to country, bill to country,
               ship to country, shipto country, destination country, country code,
-              country name, sales country, customer country, region, sales region,
-              area, territory, geo, market]
+              country name, sales country, customer country, ship-to country,
+              deliver to country, land]
 
   customer:
     type: string

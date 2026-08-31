@@ -362,3 +362,72 @@ class TestTheWholeLoop:
         assert results["sales_plan_override"].applied == 1
         summary = results["forecast_summary"].set_index("sku")
         assert summary.loc[target, "forecast_next_period"] == pytest.approx(original * 2)
+
+
+# ── Geography: two levels, kept apart ────────────────────────────────────────
+
+
+class TestCountryAndRegionAreDifferentLevels:
+    """
+    `country` used to list `region`, `area` and `territory` among its aliases, so an
+    extract carrying both a country and a sales region kept whichever matched first and
+    silently dropped the other level.
+    """
+
+    def _load(self, tmp_path, columns):
+        import pandas as pd
+        from inventory_planning.ingest.intake import Intake
+        rows = 40
+        frame = {"Part Number": [f"P-{i:03d}" for i in range(rows)],
+                 "Order Number": [1000 + i for i in range(rows)],
+                 "Backlog QTY": 100,
+                 "Customer Request Date": pd.Timestamp("2026-08-30"),
+                 "Promise Date": pd.Timestamp("2026-08-30")}
+        frame.update({k: v for k, v in columns.items()})
+        pd.DataFrame(frame).to_excel(tmp_path / "backlog.xlsx", index=False)
+        result = Intake(verbose=False).load_files([tmp_path / "backlog.xlsx"])
+        return result.get("open_so").adapter.column_map
+
+    def test_both_levels_survive_when_both_are_present(self, tmp_path):
+        mapped = self._load(tmp_path, {"Billto Country": "Singapore",
+                                       "Sold-to Region": "APAC - SEA"})
+        assert mapped.get("country") == "Billto Country"
+        assert mapped.get("region") == "Sold-to Region"
+
+    def test_a_region_only_export_leaves_country_empty(self, tmp_path):
+        """Reported at the level the data has, never relabelled as a country."""
+        mapped = self._load(tmp_path, {"Sold-to Region": "APAC - SEA"})
+        assert mapped.get("region") == "Sold-to Region"
+        assert "country" not in mapped
+
+    def test_a_region_is_not_a_customer(self, tmp_path):
+        """
+        `sold to` matched `Sold-to Region` as a qualified variant, and on a backlog with
+        no customer column at all the geography took the field uncontested — the run
+        then claimed a customer dimension and ranked shortage risk by continent.
+        """
+        mapped = self._load(tmp_path, {"Sold-to Region": "APAC - SEA"})
+        assert mapped.get("customer") != "Sold-to Region"
+
+    def test_a_planned_ship_date_is_not_a_shipment(self, tmp_path):
+        """
+        The one that moved the whole run's clock. `latest_observed_date` treats
+        `ship_date` as backward-looking and anchors "now" to the newest one, so a
+        planned date mapped there sets `as_of` to a day that has not arrived.
+        """
+        mapped = self._load(tmp_path, {"Planned Ship Date": "2026-08-30"})
+        assert mapped.get("ship_date") != "Planned Ship Date"
+
+    def test_the_split_falls_back_to_region(self):
+        """A coarser split, honestly labelled, beats no split at all."""
+        import pandas as pd
+        from inventory_planning.analytics.sop import country_shares
+        df = pd.DataFrame({
+            "sku": ["A"] * 4, "qty": [10, 30, 20, 40],
+            "region": ["APAC - SEA", "APAC - SEA", "APAC - NE", "APAC - NE"],
+            "demand_date": pd.to_datetime(["2026-05-01", "2026-06-01",
+                                           "2026-05-01", "2026-06-01"]),
+        })
+        shares = country_shares(df)
+        assert set(shares["country"]) == {"APAC - SEA", "APAC - NE"}
+        assert shares["share"].sum() == pytest.approx(1.0)

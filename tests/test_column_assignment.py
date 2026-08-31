@@ -142,3 +142,78 @@ class TestRankTablesAgree:
             f"Old {header}": list(range(101, 131)),
         }).astype(str)
         assert _assign(registry, frame, doc_type).get(field) == header
+
+
+class TestRunTogetherWordsAreStillWords:
+    """
+    `OrderDate` matched none of an alias's three rules — not exact, not the same token
+    set, not a superset of one — because the boundary between its two words is carried
+    in the capitalisation and normalisation threw that away before anything looked. It
+    went unmapped, and so did every `ShipDate`, `MaterialNo` and `PONumber` in every
+    export that writes headers that way.
+
+    The alternative was to list the run-together spelling of each alias by hand, which
+    is the enumeration treadmill the contracts exist to avoid.
+    """
+
+    def test_a_camel_case_header_maps(self, registry):
+        frame = pd.DataFrame({
+            "Material": ["100000797", "100000798"],
+            "Still to be delivered (qty)": [10, 20],
+            "OrderDate": ["2026-06-16", "2026-06-17"],
+        })
+        assert _assign(registry, frame, "open_po").get("order_date") == "OrderDate"
+
+    @pytest.mark.parametrize("header,expected", [
+        ("OrderDate", "order date"),
+        ("ShipDate", "ship date"),
+        ("MaterialNo", "material no"),
+        ("PONumber", "po number"),
+        ("GRDate", "gr date"),
+    ])
+    def test_the_boundary_is_found(self, header, expected):
+        assert normalize_header(header) == expected
+
+    @pytest.mark.parametrize("header", ["MATNR", "ETA", "SKU", "EBELN", "WERKS"])
+    def test_an_acronym_is_left_whole(self, header):
+        """
+        The rule that protects them is the second one: a split happens between an
+        acronym and a following word, never inside the acronym. `MATNR` has no
+        lower-to-upper transition and comes through untouched.
+        """
+        assert normalize_header(header) == header.lower()
+
+    def test_separators_still_work_as_before(self):
+        for header, expected in (("qty_on_hand", "qty on hand"),
+                                 ("QUANTITY_ORDERED", "quantity ordered"),
+                                 ("Sold-to Region", "sold to region"),
+                                 ("Vendor/supplying plant", "vendor supplying plant")):
+            assert normalize_header(header) == expected
+
+
+class TestSiblingContractsAgreeOnTheSameParty:
+    """
+    `vendor supplying plant` was declared on `po_history` and not on `open_po`. Somebody
+    met the header on a purchase history, added the alias to the contract in front of
+    them, and the sibling describing the same real-world party was never touched — so
+    one export's supplier mapped and the next one's did not.
+    """
+
+    def test_the_supplier_maps_on_an_open_po(self, registry):
+        frame = pd.DataFrame({
+            "Material": ["100000797", "100000798"],
+            "Still to be delivered (qty)": [10, 20],
+            "Vendor/supplying plant": ["8012822 ACME", "8012822 ACME"],
+        })
+        assert _assign(registry, frame, "open_po").get("supplier") == "Vendor/supplying plant"
+
+    def test_a_single_word_alias_is_not_what_rescues_it(self, registry):
+        """
+        `vendor` alone cannot claim `Vendor/supplying plant`: subset matching ignores
+        one-token aliases on purpose, because `date` inside `delivery date` is not
+        evidence. The multi-word alias is doing the work, which is why it has to be
+        declared on both contracts.
+        """
+        contract = registry.contracts.get("open_po")
+        aliases = contract.fields["supplier"].aliases
+        assert "vendor supplying plant" in aliases

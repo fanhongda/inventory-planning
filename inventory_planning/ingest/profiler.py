@@ -38,9 +38,26 @@ _PUNCT_RE = re.compile(r"[#./()\\\[\]{}:;,'\"*&%$@!?<>|+=~`^]")
 _SPACE_RE = re.compile(r"[\s_\-]+")
 
 
+# Word boundaries a header carries in its capitalisation instead of in a separator.
+# `OrderDate` is two words and matched none of `order date`'s three matching rules —
+# not exact, not the same token set, not a superset — so it went unmapped, and so did
+# every `ShipDate`, `MaterialNo` and `PONumber` in every export. The alternative was to
+# list the run-together spelling of each alias by hand, which is the enumeration
+# treadmill the contracts exist to avoid.
+#
+# Two rules, and the second is what protects acronyms. `MATNR` and `ETA` have no
+# lower-to-upper transition and are left whole; `PONumber` splits between the acronym
+# and the word that follows it, not inside the acronym.
+_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_ACRONYM_RE = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+
+
 def normalize_header(s: Any) -> str:
-    """Lowercase, strip punctuation, collapse separators. Shared by profiler and contract."""
-    text = str(s).lower().strip()
+    """Lowercase, split run-together words, strip punctuation, collapse separators."""
+    text = str(s).strip()
+    # Before lowercasing — the capitalisation is the only evidence of the boundary.
+    text = _ACRONYM_RE.sub(" ", _CAMEL_RE.sub(" ", text))
+    text = text.lower()
     text = _PUNCT_RE.sub(" ", text)
     text = _SPACE_RE.sub(" ", text)
     return text.strip()

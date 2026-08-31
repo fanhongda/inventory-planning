@@ -134,8 +134,17 @@ fields:
     type: string
     role: dimension
     description: Vendor supplying this line
-    aliases: [supplier, supplier name, supplier id, vendor, vendor name, vendor no,
-              vendor code, creditor, seller, source]
+    # `vendor supplying plant` and its siblings were on `po_history` and not here.
+    # Somebody met the header on a purchase history, added the alias to the contract in
+    # front of them, and the sibling contract describing the same real-world party was
+    # never touched — so one export's `Vendor/supplying plant` mapped and the next
+    # one's did not. A single-token alias like `vendor` cannot rescue it: subset
+    # matching deliberately ignores one-word aliases, because `date` inside `delivery
+    # date` is not evidence.
+    aliases: [supplier, supplier name, supplier id, supplier code, supplier no,
+              vendor, vendor name, vendor no, vendor code, vendor id, creditor,
+              seller, source, manufacturer, vendor supplying plant, supplying plant,
+              vendor plant]
 
   po_number:
     type: string

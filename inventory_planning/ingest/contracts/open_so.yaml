@@ -51,12 +51,54 @@ fields:
               branch, facility, stock location, werks, receiving plant,
               supplying plant]
 
+  country:
+    type: string
+    role: dimension
+    description: >
+      Where the order is destined. The bottom level of the segmentation the forecast
+      and the sales review are grouped by, and a property of the sale rather than of
+      the material — one distribution centre serves several countries and the same SKU
+      sells into all of them.
+
+      Read here as well as on the sales history because the backlog is the demand that
+      has not shipped yet: a country growing in the order book before it grows in the
+      history is exactly the signal a quarterly review exists to catch.
+    aliases: [country, billto country, bill-to country, bill to country,
+              ship to country, shipto country, destination country, country code,
+              country name, sold to country, sold-to country, customer country]
+
+  region:
+    type: string
+    role: dimension
+    description: >
+      The geography above country — a sales region or area. Kept apart from `country`
+      because they are different levels; an extract carrying both would otherwise lose
+      whichever matched second.
+
+      Many backlog exports carry only this. A Singapore order book reports `APAC - SEA`
+      and never names Korea or Vietnam, so the split it supports is coarser than the
+      one the sales history supports. Reported at the level the data actually has
+      rather than relabelled as a country.
+    aliases: [region, sales region, sold-to region, sold to region,
+              sold-to global region, sold to global region, global region, area,
+              sales area, territory, sales territory, geo, geography, market,
+              sub region, sub-region, zone]
+
   customer:
     type: string
     role: dimension
     description: Enables ranking shortage risk by customer exposure, not just SKU count
     aliases: [customer, customer name, customer code, customer no, sold to, sold-to,
               sold to party, account, client, ship to, buyer]
+    # A region is not a customer. `sold to` is a two-token alias and `Sold-to Region`
+    # is a three-token header, so it matches as a qualified variant — and on an export
+    # with no customer column at all, which is common on a backlog report, the
+    # geography wins the field uncontested. The run then claims `customer_dimension`
+    # is satisfied and ranks shortage risk by continent.
+    never:
+      any: [sold to region, sold-to region, sold to global region,
+            sold-to global region, ship to region, ship-to region, sold to country,
+            sold-to country, customer region, customer country, region, country]
 
   so_line_number:
     type: string
@@ -182,6 +224,21 @@ fields:
       narrow: a "delivery date" on an open order is a promise, not a shipment.
     aliases: [ship date, shipped date, actual ship date, actual shipment date,
               goods issue date, gi date, despatch date, dispatch date]
+    # A *planned* ship date is not a shipment. `promise_date` already lists
+    # `planned ship date` among its aliases, but an export carrying both `Promise Date`
+    # and `Planned Ship Date` gives the first one that field on an exact match, and the
+    # second then falls to `ship_date` on a token-subset match with nothing to stop it.
+    #
+    # That is not a cosmetic misfile. `service.latest_observed_date` treats `ship_date`
+    # as backward-looking and anchors the whole run's "now" to the newest one it finds —
+    # the function's own docstring says future-dated columns are excluded precisely so
+    # that cannot happen. A planned date mapped here walks straight past that guard and
+    # sets `as_of` to a date that has not arrived, so the order book reads as more
+    # overdue than it is and every stockout projection starts from the wrong day.
+    never:
+      any: [planned ship date, planned shipment date, plan ship date,
+            scheduled ship date, scheduled shipment date, expected ship date,
+            target ship date, planned delivery date, planned goods issue date]
 
   order_date:
     type: date

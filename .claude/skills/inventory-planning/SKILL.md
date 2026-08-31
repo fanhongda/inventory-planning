@@ -83,7 +83,7 @@ every file automatically — do not ask the user to say which file is which.
 | `item_dimension` | **yes** | item master **or** planner worksheet | cannot run |
 | `product_dimension` | no | item master **or** planner worksheet carrying `product_family` | runs, raises SEVERE — every family is guessed from the part number, so rollups by product line are the numbering scheme's |
 | `planner_baseline` | no | planner worksheet | cannot say whether the safety stock in use is above or below what the data justifies |
-| `geography_dimension` | no | sales history carrying a country | the forecast and the sales review are not split by country |
+| `geography_dimension` | no | sales history or open SOs carrying a country **or** a sales region | the forecast and the sales review are not split by geography |
 | `substitution_signal` | no | a substitution list — **only** this document merges anything | a part that changed number is planned as two items |
 
 **A pre-compiled SKU time series fully satisfies `demand_signal` on its own.** When a
@@ -457,6 +457,15 @@ Money is the reason it exists. A planner argues about units and a sales manager 
 about revenue; a forecast in units alone gets reviewed by nobody. The amount is
 `forecast_qty × ASP`, and `price_basis` on each row says where that price came from —
 `standard cost (not a price)` means there is no margin in that row.
+
+**Country and region are two levels and the pipeline keeps them apart.** `country` is
+the bill-to country; `region` is the sales area above it (`APAC`, `APAC - SEA`). An
+extract may carry either or both. Where only a region is present the split runs on the
+region and the sheet says so — a Singapore order book reports `APAC - SEA` and never
+names Korea or Vietnam, and a coarser split honestly labelled is worth more than none:
+the signal the segmentation exists for, one market growing while another shrinks,
+survives at region level. **Never describe a region as a country when relaying the
+sheet.**
 
 Where the extract carries a country the sheet is split by it, **top-down**: each SKU's
 forecast apportioned by that country's share of recent demand. The parts sum to the

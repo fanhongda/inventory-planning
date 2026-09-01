@@ -374,6 +374,7 @@ class Intake:
         tenant: str = "default",
         baseline_path: Union[str, Path] = None,
         verbose: bool = True,
+        declarations=None,
     ):
         self.contracts = contracts or default_registry()
         self.adapters = adapters or AdapterRegistry(contracts=self.contracts)
@@ -382,6 +383,12 @@ class Intake:
         self.tenant = tenant
         self.baseline_path = Path(baseline_path) if baseline_path else None
         self.verbose = verbose
+        # What a person has declared about these documents. Applied over the routed
+        # mapping so one column can be corrected without hand-authoring an adapter —
+        # the setting between "guess" and "freeze" that did not exist, and whose
+        # absence made editing headers in Excel the field remedy.
+        self.declarations = declarations
+        self._declaration_notes: List[str] = []
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -462,6 +469,14 @@ class Intake:
         suspect = self._check_key_shape(result)
         self._check_sku_agreement(result, suspect)
         self._note_mixed_formats(result)
+        # Declarations last, so what a person asked for and what became of it sit
+        # together at the end of intake rather than scrolling past between files. A
+        # declaration that matched nothing is reported here too — silence there is how
+        # someone comes to believe a mapping is corrected when it is not.
+        result.notes.extend(self._declaration_notes)
+        if self.declarations is not None:
+            result.notes.extend(self.declarations.notes())
+        self._declaration_notes = []
 
         if self.verbose:
             print(result.summary())
@@ -1000,6 +1015,7 @@ class Intake:
         route = self.adapters.route(
             raw, source_name=source_name, doc_type_hint=doc_type_hint, tenant=self.tenant
         )
+        route = self._apply_declared_mapping(route, raw, source_name)
 
         if route.contract.doc_type == "demand_timeseries" and route.profile.shape == "wide_periods":
             frame, log = self._melt_wide(raw, route)
@@ -1036,6 +1052,49 @@ class Intake:
             sheet_name=sheet_name,
             key_candidates=_key_candidates(raw, route.profile),
         )
+
+    def _apply_declared_mapping(self, route, raw: pd.DataFrame, source_name: str):
+        """
+        Merge any declared column mapping over the one routing produced.
+
+        A copy, never a mutation: adapters are cached by the registry and shared across
+        every document of their type, so editing one in place would carry a
+        declaration written for the purchase history into the open PO report — a
+        correction becoming a corruption, in the one place nobody would look.
+
+        A declaration naming a column that is not in the file is reported rather than
+        applied. Applying it would blank the field, which reads downstream as an
+        absent measure rather than as a mistake, and the person who wrote it would
+        have no way to learn it never matched.
+        """
+        if self.declarations is None:
+            return route
+        from dataclasses import replace as dc_replace
+
+        doc_type = route.contract.doc_type
+        headers = [str(c) for c in raw.columns]
+        declared = self.declarations.column_map_for(doc_type, headers, source_name)
+        if not declared:
+            return route
+
+        present = {c: col for c, col in declared.items() if col in raw.columns}
+        for field in sorted(set(declared) - set(present)):
+            column = declared[field]
+            self._declaration_notes.append(
+                f"  ⚠ The declared mapping {field} <- {column!r} names a column "
+                f"{source_name} does not have. Left unapplied — the routed mapping "
+                f"stands, and nothing was corrected.")
+        if not present:
+            return route
+
+        for field, column in sorted(present.items()):
+            was = route.adapter.column_map.get(field)
+            self._declaration_notes.append(
+                f"  ⓘ {doc_type}: {field} <- {column!r} by declaration"
+                + (f" (routing had chosen {was!r})" if was and was != column else ""))
+        adapter = dc_replace(
+            route.adapter, column_map={**route.adapter.column_map, **present})
+        return dc_replace(route, adapter=adapter)
 
     # ── Wide-format handling ─────────────────────────────────────────────────
 

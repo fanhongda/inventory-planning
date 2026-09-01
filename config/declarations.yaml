@@ -1,0 +1,100 @@
+# Declarations — what a person has said, as data.
+#
+# This file belongs in git. A mapping correction should be reviewable, diffable and
+# attributable to someone, and version control does that better than a database does.
+#
+# Nothing below is active. Every entry is a worked example from the Controls SDC run of
+# 2026-09-01, written out so the shape is clear — uncomment only after confirming the
+# claim against your own extract. An override is not a guess the pipeline makes; it is
+# an assertion you are making, and the run will trust it.
+#
+# Precedence, highest first:
+#
+#     declaration (this file)  >  frozen adapter  >  inferred mapping  >  config default
+#
+# Two things this file does not let you do quietly:
+#
+#   a declaration that matches no document in the run is reported at the end of intake.
+#   Believing you corrected something you did not is worse than not having tried.
+#
+#   a gate waiver must carry an expiry. A waiver without one is `allow_degraded=True`
+#   with extra steps — it is how a checked pipeline becomes an unchecked one without
+#   anybody deciding to make it one.
+
+version: 1
+
+overrides:
+
+  # ── Which column supplies a field ──────────────────────────────────────────
+  #
+  # `target.headers` are the columns the export must carry for this to apply. Matched
+  # on headers rather than on the file, because a file is identified by its bytes and
+  # next month's export of the same report is different bytes under a different name —
+  # a declaration tied to the file expires exactly when it starts being useful.
+  #
+  # Use `target.source: <filename>` instead for a genuinely one-off correction. It is
+  # the narrower of the two and says so.
+
+  # The purchase history carries both numbering systems. The scorer takes `PartNo.`
+  # because `Material` is emptier on intercompany lines, and a few percent of null rate
+  # outweighs the two-place lexical lead `material` has over `part no`.
+  #
+  # - scope: mapping
+  #   target:
+  #     doc_type: po_history
+  #     headers: [Material, "PartNo."]
+  #   field: sku
+  #   value: Material
+  #   reason: >
+  #     PartNo. is the commercial part number. Measured overlap with the other five
+  #     documents: Material 86.5%, PartNo. 1.0%.
+  #   by: jfanhon
+  #   at: 2026-09-01
+
+  # The planning master, after `Part Number` was renamed to `Material`. It also carries
+  # `Product code` (MS-FAC2513-0), which is the same commercial numbering the purchase
+  # history uses — and which routing prefers for the same reason.
+  #
+  # - scope: mapping
+  #   target:
+  #     doc_type: item_master
+  #     headers: [Material, "Product code"]
+  #   field: sku
+  #   value: Material
+  #   reason: >
+  #     Product code is the local commercial code; 1% of it appears in any other
+  #     document. Material is the ERP number the rest of the business joins on.
+  #   by: jfanhon
+  #   at: 2026-09-01
+
+  # ── A planner-owned parameter ──────────────────────────────────────────────
+  #
+  # - scope: parameter
+  #   target: {item_uid: "sap_matnr:1003524", location: "5051"}
+  #   field: min_order_qty
+  #   value: 500
+  #   reason: Supplier raised the MOQ in August; the master has not been updated yet.
+  #   by: jfanhon
+  #   at: 2026-09-01
+  #   expires: 2026-12-31
+
+gate_waivers:
+
+  # One check, on one document. Narrower than `allow_degraded=True` by construction:
+  # waiving the SKU-agreement finding on a whole-warehouse stock snapshot does not also
+  # wave through an open PO whose quantity was mapped to a money column.
+  #
+  # The finding is not hidden. It is downgraded to a warning, still printed, and still
+  # travels into the run manifest carrying who waived it and until when.
+
+  # A stock snapshot holds every material in the DC, most of which have no demand, no
+  # PO and no SO. 11% agreement is its expected shape, not a mis-mapping — the check
+  # measures the wrong direction for a document whose grain is a superset.
+  #
+  # - check: sku_agreement
+  #   doc_type: inventory
+  #   reason: >
+  #     Whole-warehouse snapshot: 9,132 materials against 1,869 with demand. Low
+  #     outward agreement is correct here; inward coverage is high.
+  #   by: jfanhon
+  #   expires: 2026-12-01

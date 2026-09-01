@@ -34,6 +34,7 @@ from .ingest.encoding import write_csv
 from .quality import DataQualityError, GateReport, GateThresholds
 from .quality import assess as assess_run_health
 from .quality import checks as quality_checks
+from .store.declarations import Declarations
 
 
 def _price_lookup(sop):
@@ -88,6 +89,10 @@ class InventoryPlanner:
         # travels into the manifest, so an output produced under one says so.
         self.allow_degraded = bool(allow_degraded)
         self.gate_thresholds = GateThresholds.load(self.config_dir)
+        # Per-check, per-document waivers, and the mapping corrections that reach
+        # intake. Loaded here rather than passed in so a planner built any of the four
+        # ways honours the same declared file.
+        self.declarations = Declarations.load(self.config_dir)
         self._gate_reports: list = []
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
@@ -1484,6 +1489,16 @@ class InventoryPlanner:
         a trace, and the first time a threshold turned out to be wrong on somebody's
         data the answer would be to delete the check.
         """
+        # Declared waivers first. A waiver is narrower than `allow_degraded` by
+        # construction — one check on one document — so waiving the SKU-agreement
+        # finding on a whole-warehouse stock snapshot does not also wave through an
+        # open PO quantity that was mapped to a money column. The finding is not
+        # hidden: it is downgraded, still printed, and still travels into the manifest
+        # carrying who waived it and until when.
+        declarations = getattr(self, "declarations", None)
+        if declarations is not None:
+            report = declarations.waive(report)
+
         self._gate_reports.append(report)
         if report.findings:
             print()

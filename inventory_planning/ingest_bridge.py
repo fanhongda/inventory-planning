@@ -24,6 +24,7 @@ import pandas as pd
 from .fx import FxSummary, FxTable, convert_money
 from .ingest.intake import Intake, IntakeResult
 from .node import load_planning_node
+from .store.declarations import Declarations
 
 
 # Canonical field -> the name the existing analytics expect.
@@ -56,6 +57,10 @@ class IngestBridge:
         # doc_types that carried no location of their own and took the stamp
         self._stamped: set = set()
         self.fx = FxTable.load(self.config_dir, reporting_currency=self._load_reporting_currency())
+        # What a person has declared about these documents — mapping corrections and
+        # per-check gate waivers. Loaded from the config directory so it is git-tracked
+        # and reviewable, which is the point of it being data rather than code.
+        self.declarations = Declarations.load(self.config_dir)
         self._warn_currency_mismatch()
 
     def _node_config(self) -> Dict[str, Any]:
@@ -166,7 +171,8 @@ class IngestBridge:
         baseline_path: Union[str, Path] = None,
     ) -> Dict[str, Any]:
         """Read files and adapt in one call — the normal entry point."""
-        intake = Intake(tenant=tenant, baseline_path=baseline_path, verbose=self.verbose)
+        intake = Intake(tenant=tenant, baseline_path=baseline_path, verbose=self.verbose,
+                        declarations=self.declarations)
         return self.adapt(intake.load_files(paths, hints=hints))
 
     # ── Per-document preparation ─────────────────────────────────────────────

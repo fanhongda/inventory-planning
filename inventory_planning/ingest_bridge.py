@@ -158,7 +158,7 @@ class IngestBridge:
         out["_intake"] = result
         out["_intake_plan"] = result.plan
         out["_fx"] = fx
-        if self.verbose and (fx.multi_currency or not fx.rates_configured):
+        if self.verbose and fx.needs_attention:
             print()
             print(fx.summary())
         return out

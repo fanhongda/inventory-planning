@@ -449,6 +449,33 @@ class FxSummary:
         return any(r.is_multi_currency for r in self.reports.values())
 
     @property
+    def assumed_documents(self) -> List[str]:
+        """Documents whose money was taken to be in the reporting currency already."""
+        return [r.doc_type for r in self.reports.values() if r.assumed_reporting_currency]
+
+    @property
+    def placeholder_documents(self) -> List[str]:
+        """Documents converted at a rate nobody measured."""
+        return [r.doc_type for r in self.reports.values() if r.placeholder_rates]
+
+    @property
+    def needs_attention(self) -> bool:
+        """
+        Whether the run has something to say about money, beyond a clean conversion.
+
+        The assumption cases used to be the quiet ones: a document with no currency
+        column produces no converted rows and no unrated rows, so `multi_currency` is
+        False and the summary — which has carried the warning for exactly this case all
+        along — was never printed. A single-currency run reporting the wrong currency
+        looks identical to a correct one, which is the failure this module exists to
+        stop. So the assumption is now a reason to speak, not a reason to stay silent.
+        """
+        return bool(self.multi_currency
+                    or not self.rates_configured
+                    or self.assumed_documents
+                    or self.placeholder_documents)
+
+    @property
     def gaps(self) -> Dict[str, int]:
         """Currency codes with no rate, and how many lines they left unvalued."""
         out: Dict[str, int] = {}

@@ -254,16 +254,27 @@ class Declarations:
                 self._used.add(i)
         return out
 
-    def values_for(self, scope: str, **target) -> Dict[str, Any]:
-        """Field → value for `identity`, `value` and `parameter` overrides at a target."""
-        out: Dict[str, Any] = {}
+    def overrides_for(self, scope: str, **target) -> List[Override]:
+        """
+        Every `identity`, `value` or `parameter` override that applies at a target.
+
+        `values_for` reduces these to field → value, which is all the adapter needs.
+        A caller that has to say what an override *did* needs the rest of it — who
+        asserted it and why — so the matching rule lives here once and both callers
+        share it rather than drifting apart.
+        """
+        out: List[Override] = []
         for i, override in enumerate(self.overrides):
             if override.scope != scope or not override.active_on(self.today):
                 continue
             if all(override.target.get(k) == v for k, v in target.items()):
-                out[override.field] = override.value
+                out.append(override)
                 self._used.add(i)
         return out
+
+    def values_for(self, scope: str, **target) -> Dict[str, Any]:
+        """Field → value for `identity`, `value` and `parameter` overrides at a target."""
+        return {o.field: o.value for o in self.overrides_for(scope, **target)}
 
     # ── Gate waivers ─────────────────────────────────────────────────────────
 

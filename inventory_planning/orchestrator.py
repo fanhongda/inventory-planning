@@ -510,6 +510,52 @@ class InventoryPlanner:
             self._store = False
         return self._store or None
 
+    def absorb_intake(self, loaded: dict) -> dict:
+        """
+        Take what an intake pass found, so this run can report it later.
+
+        `load_all` did this inline, which quietly made the two entry points behave
+        differently: the per-flag CLI path calls the bridge itself for the masters and
+        discarded the intake result, so a run started that way had no adapter
+        provenance to record and no assumptions to size — the same files, read the same
+        way, reporting less because of which function the caller happened to use.
+
+        Mutates and returns `loaded`, with the three private keys removed, so the rest
+        can be passed straight on as planning arguments.
+        """
+        self._intake = loaded.pop("_intake", None) or self._intake
+        self._intake_plan = loaded.pop("_intake_plan", None) or self._intake_plan
+        self._fx = loaded.pop("_fx", None) or self._fx
+        if self._intake is not None:
+            self.run.record_intake(self._intake)
+        return loaded
+
+    def _resting_on(self):
+        """
+        Every figure this run could not measure, sized against the money behind it.
+
+        Reads the intake result's own frames rather than the ones assembled above: those
+        are the canonical frames the contracts describe, and the contract is what says
+        which column is money and which is a count. The consolidated inventory frame has
+        already summed its storage locations by this point, and sizing an assumption
+        against a frame whose grain has moved is how a plausible wrong number gets made.
+        """
+        if self._intake is None:
+            return None
+        from .ingest.exposure import assemble, measure
+
+        reporting = str(getattr(self._fx, "reporting_currency", "") or "")
+        assumptions = assemble(
+            declared=self._intake.assumptions,
+            assumed_doc_types=list(getattr(self._fx, "assumed_documents", []) or []),
+            reporting_currency=reporting,
+        )
+        if not assumptions:
+            return None
+        frames = {dt: doc.frame for dt, doc in self._intake.documents.items()}
+        contracts = {dt: doc.route.contract for dt, doc in self._intake.documents.items()}
+        return measure(assumptions, frames, contracts, reporting_currency=reporting)
+
     def _shadow_write(self, frames: dict, valid_time) -> None:
         """
         Write this run's facts to the store, which nothing reads yet.
@@ -598,12 +644,8 @@ class InventoryPlanner:
             baseline_path=self.output_dir.parent / "ingest_baselines.json",
         )
 
-        plan = inputs["_intake_plan"]
-        self._intake = inputs.pop("_intake", None)
-        self._intake_plan = inputs.pop("_intake_plan", None)
-        self._fx = inputs.pop("_fx", None)
-        if self._intake is not None:
-            self.run.record_intake(self._intake)
+        self.absorb_intake(inputs)
+        plan = self._intake_plan
 
         self._write_supersession_record()
 
@@ -814,6 +856,16 @@ class InventoryPlanner:
         }, anchor=as_of)
         print()
         print(intake.summary())
+
+        # Beside the totals, and for the same reason: what the totals rest on. An
+        # assumption governing every line of the stock snapshot and one governing four
+        # rows of a sample used to print identically, so the list was read in file order
+        # rather than in the order that matters. Sorted by the money behind each one, the
+        # 12m assumption is the first line instead of the fourth.
+        resting = self._resting_on()
+        if resting is not None and resting.items:
+            print()
+            print(resting.summary())
 
         self._shadow_write({
             "sales_history": sales_df, "po_history": po_history_df,

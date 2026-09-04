@@ -78,6 +78,9 @@ def main():
         from .ingest_bridge import IngestBridge
         paths = [p for p in (args.item_master, args.planning_master) if p]
         loaded = IngestBridge(config_dir=args.config, verbose=True).load(paths)
+        # Without this the run prints no exposure ledger on this path: the intake
+        # result and the currency report are produced and then dropped on the floor.
+        planner.absorb_intake(loaded)
         item_master_df = loaded.get("item_master_df")
         planning_master_df = loaded.get("planning_master_df")
 

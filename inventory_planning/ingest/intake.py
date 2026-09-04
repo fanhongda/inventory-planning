@@ -26,6 +26,7 @@ from .capabilities import CapabilityResolver, IntakePlan
 from .contract import ContractRegistry, DocContract, default_registry
 from .contract_tests import ContractTester, ContractTestReport
 from .encoding import describe_choice, sniff_encoding
+from .exposure import Assumption, BASIS_DECLARED, GOVERNS_ALL, GOVERNS_BLANKS
 from .profiler import TableProfile
 from .registry import AdapterRegistry, RouteResult
 from .supersede import SupersessionMap, SupersessionReport
@@ -245,6 +246,11 @@ class IntakeResult:
     # Observations worth stating that are not problems. Kept apart from `failures`
     # so the run does not cry wolf about things the planner already knows.
     notes: List[str] = dc_field(default_factory=list)
+    # Fields this run did not measure — supplied by declaration, or defaulted because
+    # the export never carried them. Carried as data rather than only as a printed note
+    # so a caller can size each one against the money behind it; a list of assumptions
+    # in no particular order is a list nobody finishes reading.
+    assumptions: List[Assumption] = dc_field(default_factory=list)
 
     def frame(self, doc_type: str) -> Optional[pd.DataFrame]:
         doc = self.documents.get(doc_type)
@@ -389,6 +395,7 @@ class Intake:
         # absence made editing headers in Excel the field remedy.
         self.declarations = declarations
         self._declaration_notes: List[str] = []
+        self._assumptions: List[Assumption] = []
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -476,7 +483,9 @@ class Intake:
         result.notes.extend(self._declaration_notes)
         if self.declarations is not None:
             result.notes.extend(self.declarations.notes())
+        result.assumptions.extend(self._assumptions)
         self._declaration_notes = []
+        self._assumptions = []
 
         if self.verbose:
             print(result.summary())
@@ -1143,25 +1152,40 @@ class Intake:
         from dataclasses import replace as dc_replace
 
         doc_type = route.contract.doc_type
-        declared = self.declarations.values_for("value", doc_type=doc_type)
-        if not declared:
+        overrides = self.declarations.overrides_for("value", doc_type=doc_type)
+        if not overrides:
             return route
 
         known = set(route.contract.fields)
-        applied = {f: v for f, v in declared.items() if f in known}
-        for field in sorted(set(declared) - set(applied)):
+        applied = {o.field: o for o in overrides if o.field in known}
+        for override in overrides:
+            if override.field in applied:
+                continue
             self._declaration_notes.append(
-                f"  ⚠ The declared value {field}={declared[field]!r} names a field the "
-                f"{doc_type} contract does not have. Left unapplied.")
+                f"  ⚠ The declared value {override.field}={override.value!r} names a "
+                f"field the {doc_type} contract does not have. Left unapplied.")
         if not applied:
             return route
 
-        for field, value in sorted(applied.items()):
+        mapped = set(route.adapter.column_map)
+        for field, override in sorted(applied.items()):
             self._declaration_notes.append(
-                f"  ⓘ {doc_type}: {field} = {value!r} by declaration "
+                f"  ⓘ {doc_type}: {field} = {override.value!r} by declaration "
                 f"(supplied for {source_name}, which does not carry it)")
-        adapter = dc_replace(
-            route.adapter, defaults={**route.adapter.defaults, **applied})
+            # A default fills only what the export left empty. Where the field was
+            # never mapped it therefore governs every row and the exposure behind it is
+            # exact; where the export does supply the column, the declaration reaches
+            # only the blanks and the rows it reached cannot be recovered afterwards.
+            self._assumptions.append(Assumption(
+                doc_type=doc_type, field=field, value=override.value,
+                basis=BASIS_DECLARED,
+                governs=GOVERNS_BLANKS if field in mapped else GOVERNS_ALL,
+                reason=override.reason, by=override.by,
+            ))
+        adapter = dc_replace(route.adapter, defaults={
+            **route.adapter.defaults,
+            **{field: o.value for field, o in applied.items()},
+        })
         return dc_replace(route, adapter=adapter)
 
     # ── Wide-format handling ─────────────────────────────────────────────────

@@ -94,6 +94,17 @@ class Resolution:
     is_draft: bool
     uncertain: bool
     rows: int
+    # What `confidence` measures — see `registry.BASIS_*`. A hint's 1.0 is the caller's
+    # assertion rather than anything observed, and a screen drawing a full green bar for
+    # it would report a statement as a measurement.
+    confidence_basis: str = ""
+    stated: bool = False
+    # How far clear the winning contract was, and of what. 83% against a field of 79% is
+    # a coin toss and 83% against 4% is not, and confidence alone cannot tell them apart.
+    margin: float = 1.0
+    close_call: bool = False
+    runner_up: Optional[Dict[str, Any]] = None
+    contract_scores: List[Dict[str, Any]] = dc_field(default_factory=list)
     sheet: str = ""
     fields: List[FieldResolution] = dc_field(default_factory=list)
     unmatched_columns: List[str] = dc_field(default_factory=list)
@@ -118,6 +129,10 @@ class Resolution:
             "confidence": round(self.confidence, 4), "reason": self.reason,
             "adapter": self.adapter, "adapter_status": self.adapter_status,
             "is_draft": self.is_draft, "uncertain": self.uncertain,
+            "confidence_basis": self.confidence_basis, "stated": self.stated,
+            "margin": round(self.margin, 4), "close_call": self.close_call,
+            "runner_up": self.runner_up,
+            "contract_scores": list(self.contract_scores),
             "rows": self.rows,
             "fields": [f.to_dict() for f in self.fields],
             "unmatched_columns": list(self.unmatched_columns),
@@ -189,11 +204,23 @@ def from_document(doc, raw: pd.DataFrame, declarations=None) -> Resolution:
     report = doc.test_report
     failures = [str(line).strip() for line in (getattr(report, "failures", None) or [])]
 
+    classification = route.classification
+    runner = route.runner_up
+    ranked = (classification.ranked if classification else [])
+
     return Resolution(
         source_name=doc.source_name, sheet=doc.sheet_name,
         doc_type=doc.doc_type, confidence=route.confidence, reason=route.reason,
         adapter=adapter.name, adapter_status=adapter.status, is_draft=route.is_draft,
         uncertain=doc.route_uncertain, rows=rows, fields=fields,
+        confidence_basis=route.confidence_basis, stated=route.stated,
+        margin=route.margin, close_call=route.close_call,
+        runner_up=({"doc_type": runner[0], "score": round(runner[1], 4)}
+                   if runner else None),
+        contract_scores=[{"doc_type": t, "score": round(sc, 4),
+                          "detail": (classification.details.get(t, "")
+                                     if classification else "")}
+                         for t, sc in ranked],
         unmatched_columns=unmatched, ignored_declarations=ignored,
         tests_passed=bool(report.passed), test_failures=failures,
         transforms=[str(step) for step in doc.transform_log],

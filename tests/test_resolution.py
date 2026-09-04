@@ -125,3 +125,35 @@ class TestItSerialisesWholesale:
         for key in ("missing_required", "unmatched_columns", "ignored_declarations",
                     "transforms", "tests_passed"):
             assert key in body
+
+
+class TestTheConfidenceIsQualified:
+
+    def test_a_classified_export_carries_its_ranking(self, inventory):
+        body = inventory.to_dict()
+        assert body["confidence_basis"] == "classification"
+        assert body["stated"] is False
+        assert body["runner_up"]["doc_type"] != "inventory"
+        assert body["margin"] > 0.08
+        assert len(body["contract_scores"]) >= 3
+
+    def test_a_template_reports_its_hundred_percent_as_stated(self, tmp_path):
+        """
+        A hint's 1.0 is the caller's assertion. Anything drawing a bar from
+        `confidence` has to be able to tell that from a measurement.
+        """
+        from openpyxl import load_workbook
+
+        blank = emit("substitution", tmp_path)
+        book = load_workbook(blank)
+        for column, value in enumerate(
+                ["P-1", "P-2", "supersede", 1, "2026-01-15", "x"], start=1):
+            book["data"].cell(row=2, column=column, value=value)
+        book.save(blank)
+
+        body = resolve_file(blank)[0].to_dict()
+        assert body["confidence"] == 1.0
+        assert body["confidence_basis"] == "hint"
+        assert body["stated"] is True
+        assert body["contract_scores"] == []
+        assert body["runner_up"] is None

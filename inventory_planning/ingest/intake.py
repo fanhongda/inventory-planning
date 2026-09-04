@@ -217,8 +217,16 @@ class LoadedDocument:
 
     @property
     def route_uncertain(self) -> bool:
-        return (self.route.confidence < self._CONFIDENT
-                or "close call" in (self.route.reason or ""))
+        """
+        Whether a person should confirm this document before the run is believed.
+
+        This used to search the routing reason for the substring "close call" — a
+        property deciding whether item numbers may be rewritten, resting on the wording
+        of a sentence, switchable off by an edit nobody would think to check. The
+        classifier now records the same fact as a flag, set where the sentence is
+        written, so the two cannot come apart.
+        """
+        return self.route.confidence < self._CONFIDENT or self.route.close_call
 
     def explain(self) -> str:
         """Full provenance for this document — routing, every transform, every test."""

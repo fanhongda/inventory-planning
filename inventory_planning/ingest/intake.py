@@ -27,6 +27,7 @@ from .contract import ContractRegistry, DocContract, default_registry
 from .contract_tests import ContractTester, ContractTestReport
 from .encoding import describe_choice, sniff_encoding
 from .exposure import Assumption, BASIS_DECLARED, GOVERNS_ALL, GOVERNS_BLANKS
+from .templates import NON_DATA_SHEETS, read_meta
 from .profiler import TableProfile
 from .registry import AdapterRegistry, RouteResult
 from .supersede import SupersessionMap, SupersessionReport
@@ -435,6 +436,28 @@ class Intake:
                     result.notes.append(note)
 
             hint = hints.get(path.name) or hints.get(str(path))
+
+            # A workbook generated from a contract says what it is, so nothing about it
+            # has to be inferred: the headers are the canonical field names and the
+            # `_meta` sheet names the document. A caller's own hint still wins, being
+            # the more specific statement of the two.
+            #
+            # Its companion sheets are skipped by name rather than left to `is_tabular`.
+            # A two-column key/value sheet profiles as a perfectly good table, and a
+            # `_meta` sheet routed as a document would fail somewhere confusing instead
+            # of not happening at all.
+            meta = read_meta(path)
+            if meta is not None:
+                hint = hint or meta.doc_type
+                sheets = [(name, raw) for name, raw in sheets
+                          if name not in NON_DATA_SHEETS]
+                stale = meta.staleness(self.contracts)
+                if stale:
+                    result.notes.append(
+                        f"  ⚠ {path.name} {stale}. It is loaded as it stands — the rows "
+                        f"in it were filled in by a person and are real — but a field "
+                        f"the contract now asks for may have had no column to go in.")
+
             # Only qualify the name when the workbook actually has several sheets;
             # `stock.xlsx[Sheet1]` is noise for the ordinary single-sheet case.
             multi_sheet = len(sheets) > 1

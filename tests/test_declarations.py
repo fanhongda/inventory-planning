@@ -393,3 +393,95 @@ class TestItReachesIntake:
         assert doc.route.adapter.column_map["sku"] == "PartNo."
         assert any("does not have" in note for note in intake._declaration_notes)
 
+
+
+class TestAValueDeclarationSuppliesAFieldTheExportLacks:
+    """
+    The case is currency, and it was the one correction with nowhere to live.
+
+    A document with no currency column is taken to be in the reporting currency
+    already. That is right for a single-entity export and a silent multiple when it is
+    not — a CNY stock file read as USD is seven times its own value, and every figure
+    built on it inherits that with nothing to show. The run's own warning named the
+    remedy as `defaults: {currency: XXX}` in the adapter, which on a draft adapter
+    means hand-authoring the file the next run regenerates: exactly the practice
+    declarations exist to replace, still being prescribed because nothing read a
+    `value` declaration.
+    """
+
+    @staticmethod
+    def _stock(n=12, currency_column=False):
+        import pandas as pd
+        frame = pd.DataFrame({
+            "Material": [f"53913{i:02d}" for i in range(n)],
+            "Plant": ["5051"] * n,
+            "Unrestricted": ["10"] * n,
+            "Value Unrestricted": ["1000"] * n,
+        })
+        if currency_column:
+            frame["Currency"] = ["SGD"] * n
+        return frame
+
+    def _load(self, declarations=None, **kwargs):
+        from inventory_planning.ingest.intake import Intake
+        intake = Intake(verbose=False, declarations=declarations)
+        doc = intake.load_frame(self._stock(**kwargs), source_name="stock.xlsx",
+                               doc_type_hint="inventory")
+        return intake, doc
+
+    @pytest.fixture
+    def declared(self, tmp_path):
+        return Declarations.load(_write(tmp_path, {
+            "overrides": [{
+                "scope": "value",
+                "target": {"doc_type": "inventory"},
+                "field": "currency", "value": "CNY",
+                "reason": "stock is carried at standard cost in CNY; the export "
+                          "drops the currency because the plant only books in one",
+                "by": "jfanhon",
+            }],
+        }), today=TODAY)
+
+    def test_without_it_the_field_never_arrives(self):
+        _, doc = self._load()
+        assert "currency" not in doc.frame.columns or doc.frame["currency"].isna().all()
+
+    def test_the_declared_currency_lands_on_the_frame(self, declared):
+        _, doc = self._load(declared)
+        assert set(doc.frame["currency"].dropna().unique()) == {"CNY"}
+
+    def test_it_does_not_overwrite_a_currency_the_export_carried(self, declared):
+        """A default fills an absent field; it does not correct a stated one."""
+        _, doc = self._load(declared, currency_column=True)
+        assert set(doc.frame["currency"].dropna().unique()) == {"SGD"}
+
+    def test_it_does_not_reach_another_document_type(self, declared):
+        from inventory_planning.ingest.intake import Intake
+        import pandas as pd
+        poh = pd.DataFrame({
+            "Vendor_Name": ["ACME"] * 12,
+            "Order_date": ["2026-01-05"] * 12,
+            "PO_NO.": [f"45110209{i:02d}" for i in range(12)],
+            "Material": [f"53913{i:02d}" for i in range(12)],
+            "Qty": ["8"] * 12,
+        })
+        doc = Intake(verbose=False, declarations=declared).load_frame(
+            poh, source_name="poh.xlsx", doc_type_hint="po_history")
+        assert "currency" not in doc.frame.columns or doc.frame["currency"].isna().all()
+
+    def test_a_field_the_contract_does_not_have_is_reported_not_applied(self, tmp_path):
+        declarations = Declarations.load(_write(tmp_path, {
+            "overrides": [{
+                "scope": "value", "target": {"doc_type": "inventory"},
+                "field": "not_a_field", "value": "x", "reason": "typo",
+            }],
+        }), today=TODAY)
+        intake, doc = self._load(declarations)
+        assert "not_a_field" not in doc.frame.columns
+        assert any("does not have" in note for note in intake._declaration_notes)
+
+    def test_the_shared_adapter_is_not_mutated(self, declared):
+        _, declared_doc = self._load(declared)
+        _, plain_doc = self._load()
+        assert declared_doc.route.adapter.defaults.get("currency") == "CNY"
+        assert "currency" not in plain_doc.route.adapter.defaults

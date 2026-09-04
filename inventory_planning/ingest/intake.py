@@ -1016,6 +1016,7 @@ class Intake:
             raw, source_name=source_name, doc_type_hint=doc_type_hint, tenant=self.tenant
         )
         route = self._apply_declared_mapping(route, raw, source_name)
+        route = self._apply_declared_values(route, source_name)
 
         if route.contract.doc_type == "demand_timeseries" and route.profile.shape == "wide_periods":
             frame, log = self._melt_wide(raw, route)
@@ -1094,6 +1095,48 @@ class Intake:
                 + (f" (routing had chosen {was!r})" if was and was != column else ""))
         adapter = dc_replace(
             route.adapter, column_map={**route.adapter.column_map, **present})
+        return dc_replace(route, adapter=adapter)
+
+    def _apply_declared_values(self, route, source_name: str):
+        """
+        Supply a field the export never carried, from what a person has declared.
+
+        The case this exists for is currency. A document with no currency column is
+        taken to be in the reporting currency already — the ordinary single-entity
+        export, and a silent 7x error when it is not. The warning names the remedy as
+        `defaults: {currency: XXX}` in the adapter, which on these extracts means
+        hand-authoring a draft adapter that the next run regenerates: the exact
+        practice the declaration layer was built to replace, still being prescribed
+        because nothing was reading a `value` declaration.
+
+        Applied as an adapter default, so it fills only where the field is genuinely
+        absent or empty and never overwrites a value the export did carry. A document
+        that has a currency column keeps it, one line at a time.
+        """
+        if self.declarations is None:
+            return route
+        from dataclasses import replace as dc_replace
+
+        doc_type = route.contract.doc_type
+        declared = self.declarations.values_for("value", doc_type=doc_type)
+        if not declared:
+            return route
+
+        known = set(route.contract.fields)
+        applied = {f: v for f, v in declared.items() if f in known}
+        for field in sorted(set(declared) - set(applied)):
+            self._declaration_notes.append(
+                f"  ⚠ The declared value {field}={declared[field]!r} names a field the "
+                f"{doc_type} contract does not have. Left unapplied.")
+        if not applied:
+            return route
+
+        for field, value in sorted(applied.items()):
+            self._declaration_notes.append(
+                f"  ⓘ {doc_type}: {field} = {value!r} by declaration "
+                f"(supplied for {source_name}, which does not carry it)")
+        adapter = dc_replace(
+            route.adapter, defaults={**route.adapter.defaults, **applied})
         return dc_replace(route, adapter=adapter)
 
     # ── Wide-format handling ─────────────────────────────────────────────────

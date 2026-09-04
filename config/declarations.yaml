@@ -67,6 +67,48 @@ overrides:
   #   by: jfanhon
   #   at: 2026-09-01
 
+  # ── A fact the export never carried ────────────────────────────────────────
+  #
+  # `scope: value` supplies a field the document does not have a column for. It is
+  # applied as a default, so it fills only where the field is genuinely absent and
+  # never overwrites a value a line did carry.
+  #
+  # Currency is the case this exists for. A document with no currency column is taken
+  # to be in the reporting currency already — right for a single-entity export, and a
+  # silent multiple when it is not. A CNY stock file read as USD is seven times its own
+  # value, and nothing downstream can tell.
+  #
+  # Uncomment one per document, after confirming what the export is actually booked in.
+
+  # - scope: value
+  #   target:
+  #     doc_type: inventory
+  #   field: currency
+  #   value: CNY
+  #   reason: >
+  #     Stock is carried at standard cost in CNY. The export drops the currency column
+  #     because the plant books in one currency only.
+  #   by: jfanhon
+  #   at: 2026-09-04
+
+  # - scope: value
+  #   target:
+  #     doc_type: sales_history
+  #   field: currency
+  #   value: CNY
+  #   reason: Sales are invoiced in CNY; the OTD report carries no currency column.
+  #   by: jfanhon
+  #   at: 2026-09-04
+
+  # - scope: value
+  #   target:
+  #     doc_type: item_master
+  #   field: currency
+  #   value: CNY
+  #   reason: Master standard costs are in CNY, in the same plant currency as stock.
+  #   by: jfanhon
+  #   at: 2026-09-04
+
   # ── A planner-owned parameter ──────────────────────────────────────────────
   #
   # - scope: parameter

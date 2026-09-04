@@ -28,6 +28,7 @@ returning an empty list, which would read as "no data".
 # local to `create_app`, because importing FastAPI at module scope would make it a hard
 # dependency of a package that must install without it.
 
+import hashlib
 import shutil
 import tempfile
 from datetime import date
@@ -36,19 +37,20 @@ from typing import Any, Dict, List, Optional
 
 from ..ingest.contract import default_registry
 from ..ingest.exposure import Assumption, BASIS_ASSUMED, BASIS_DECLARED, measure
+from ..store.fact_store import FactStore, StoreUnavailable
 from ..ingest.templates import contract_fingerprint, emit
 from ..resolution import resolve_frame
 from ..store.declarations import (
     Declarations, DeclarationError, Override, SCOPE_MAPPING, SCOPE_VALUE,
 )
 from ..store.landing import LandingStore
+from ..store.query import FactQuery, KeyIncomplete, QueryUnavailable
 from ..store.ledger import BatchLedger
 
 _NOT_YET = (
-    "Not built. Facts are written by the pipeline and read back only one whole batch at "
-    "a time; there is no as-of view to query and no query engine in front of it. See "
-    "INTERFACE.md §4 — this needs the fact table and the `current` view first. Returning "
-    "an empty result here would read as 'no data', which is a different and worse claim."
+    "Not built. A run registry exists in `provenance.py` but nothing reads it back "
+    "across runs, so there is no run-to-run diff to serve. Returning an empty result "
+    "here would read as 'no runs', which is a different and worse claim."
 )
 
 
@@ -220,6 +222,12 @@ def create_app(config_dir=None, store_root=None):
         target = workdir / Path(file.filename or "upload").name
         with open(target, "wb") as fh:
             shutil.copyfileobj(file.file, fh)
+        # The bytes, hashed, carried onto the landing record and from there onto the
+        # fact batch. Without it every batch's content key is (nothing, config, as-of),
+        # so two *different* files promoted at the same as-of date collide and the
+        # second is dropped as a duplicate of the first — silently, since a duplicate
+        # is a legitimate no-op.
+        source_sha = hashlib.sha256(target.read_bytes()).hexdigest()
 
         try:
             sheets = load_sheets(target)
@@ -243,7 +251,8 @@ def create_app(config_dir=None, store_root=None):
                                        declarations=declarations,
                                        doc_type_hint=hint, sheet_name=sheet_name)
             record = service.landing.land(target, sheet=sheet_name or 0,
-                                          doc_type=resolution.doc_type)
+                                          doc_type=resolution.doc_type,
+                                          source_sha=source_sha)
             landed.append({
                 "batch_id": record["batch_id"],
                 "doc_type": resolution.doc_type,
@@ -507,6 +516,74 @@ def create_app(config_dir=None, store_root=None):
             "resolution": after.to_dict(),
         }
 
+    @app.post("/batches/{batch_id}/promote")
+    def promote(batch_id: str, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Write the canonical frame of a landed batch into the fact store.
+
+        `valid_time` is required and never inferred. It is the moment the data
+        *describes* — a stock snapshot's date — and a file's timestamp is the moment it
+        was copied, which a re-download rewrites while the data goes on describing
+        whatever it described. Guessing it is how a store loses the ability to answer
+        what was true last week.
+
+        The fact batch keeps the landing batch's id, so a fact resolves back to the
+        verbatim row it came from.
+        """
+        from ..ingest.intake import Intake
+
+        record = service.find_batch(batch_id)
+        valid_time = str(body.get("valid_time", "")).strip()
+        by = str(body.get("by", "")).strip()
+        if not valid_time:
+            raise HTTPException(
+                400, "`valid_time` is required — the date this data describes, which is "
+                     "not the date the file was downloaded and cannot be inferred from it")
+        if not by:
+            raise HTTPException(400, "`by` is required")
+        if service.status_of(batch_id) != "landed":
+            raise HTTPException(
+                409, f"batch {batch_id} is {service.status_of(batch_id)}, not landed")
+
+        frame = service.landed_frame(record)
+        doc = Intake(verbose=False, declarations=service.declarations()).load_frame(
+            frame, source_name=record.get("source_name", batch_id))
+
+        # The gate `KeyStatus.storable` was defined for and nothing had yet applied.
+        # Storing a batch that cannot be keyed is not a smaller version of storing one
+        # that can: a later correction lands as a second row, both are current, and
+        # every as-of read of the document fails or double-counts. Refusing here, with
+        # the remedy, beats accepting it and failing on every read afterwards.
+        key = getattr(doc.test_report, "key_status", None)
+        if key is not None and not key.storable:
+            raise HTTPException(422, (
+                f"{doc.doc_type} is keyed on {', '.join(key.declared)} and this export "
+                f"supplies no {', '.join(key.missing) or 'part of it'}. It plans fine on "
+                f"a partial key and cannot be stored on one, because a correction could "
+                f"not be told from a new row. Declare the missing part for this document "
+                f"— scope `value`, e.g. {(key.missing or ['location_id'])[0]} — and "
+                f"promote it again."))
+
+        try:
+            written = FactStore(service.store_root).write_batch(
+                doc_type=doc.doc_type, frame=doc.frame, valid_time=valid_time,
+                source_name=record.get("source_name", ""),
+                source_sha=record.get("source_sha"),
+                key_verdict=key.verdict if key is not None else None,
+                storable=key.storable if key is not None else None,
+                written_by=by, batch_id=batch_id)
+        except StoreUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        if written is None:
+            # Same bytes, same parameters, same as-of: already stored. Not an error and
+            # not a write — saying so is more use than a second identical batch.
+            raise HTTPException(
+                409, f"{doc.doc_type} with this content and as-of date is already in "
+                     f"the store; nothing was written")
+        return {"batch_id": written.batch_id, "doc_type": written.doc_type,
+                "valid_time": written.valid_time, "rows": written.rows,
+                "status": "promoted"}
+
     @app.post("/batches/{batch_id}/void")
     def void(batch_id: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
         """
@@ -524,9 +601,57 @@ def create_app(config_dir=None, store_root=None):
 
     # ── Deliberately not built yet ───────────────────────────────────────────
 
+    @app.get("/facts")
+    def fact_types() -> List[Dict[str, Any]]:
+        query = FactQuery(service.store_root, contracts=service.contracts)
+        return [{"doc_type": doc_type,
+                 "batches": len(query.select(doc_type).batches),
+                 "describe": query.select(doc_type).describe()}
+                for doc_type in query.doc_types()]
+
     @app.get("/facts/{doc_type}")
-    def facts(doc_type: str):
-        raise HTTPException(501, _NOT_YET)
+    def facts(doc_type: str,
+              mode: str = Query("current", pattern="^(current|latest|history)$"),
+              as_of: Optional[str] = Query(None),
+              known_at: Optional[str] = Query(None),
+              sku: Optional[str] = Query(None),
+              location_id: Optional[str] = Query(None),
+              limit: int = Query(200, ge=1, le=5000)) -> Dict[str, Any]:
+        """
+        Facts as of a moment. `mode` names the reading, because there is more than one.
+
+        `current` is the newest observation of every key ever seen; `latest` is the
+        newest batch and only it; `history` is every observation, and is the only one
+        that must not be summed. Which of the first two is right is a property of the
+        export rather than of this code — see `store/query.py` — so `carried_forward`
+        comes back with `current`, sizing the disagreement instead of hiding it.
+        """
+        query = FactQuery(service.store_root, contracts=service.contracts)
+        selection = query.select(doc_type, as_of=as_of, known_at=known_at)
+        where = {k: v for k, v in (("sku", sku), ("location_id", location_id)) if v}
+        try:
+            frame = getattr(query, mode)(doc_type, as_of=as_of, known_at=known_at,
+                                         where=where or None, limit=limit)
+        except KeyIncomplete as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except QueryUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+
+        body: Dict[str, Any] = {
+            "doc_type": doc_type, "mode": mode,
+            "as_of": as_of, "known_at": known_at,
+            "batches": [{"batch_id": b["batch_id"], "valid_time": b["valid_time"],
+                         "transaction_time": b["transaction_time"], "rows": b["rows"],
+                         "source_name": b.get("source_name", "")}
+                        for b in selection.batches],
+            "selection": selection.describe(),
+            "columns": [str(c) for c in frame.columns],
+            "rows": _jsonable(frame),
+        }
+        if mode == "current" and selection:
+            body["carried_forward"] = query.carried_forward(
+                doc_type, as_of=as_of, known_at=known_at)
+        return body
 
     @app.get("/runs")
     def runs():
@@ -542,6 +667,29 @@ def create_app(config_dir=None, store_root=None):
         app.mount("/", StaticFiles(directory=web, html=True), name="web")
 
     return app
+
+
+def _jsonable(frame) -> List[Dict[str, Any]]:
+    """Rows as plain JSON. NaN is not valid JSON and pandas will happily emit it."""
+    import numpy as np
+
+    out = []
+    for row in frame.to_dict(orient="records"):
+        clean = {}
+        for key, value in row.items():
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                clean[str(key)] = None
+            elif isinstance(value, (np.integer,)):
+                clean[str(key)] = int(value)
+            elif isinstance(value, (np.floating,)):
+                clean[str(key)] = float(value)
+            elif isinstance(value, (np.bool_,)):
+                clean[str(key)] = bool(value)
+            else:
+                clean[str(key)] = value if isinstance(value, (str, int, float, bool)) \
+                    else str(value)
+        out.append(clean)
+    return out
 
 
 def _reporting_currency(config_dir) -> str:

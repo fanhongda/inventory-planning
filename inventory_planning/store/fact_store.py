@@ -202,6 +202,7 @@ class FactStore:
         key_verdict: str = None,
         storable: bool = None,
         written_by: str = "",
+        batch_id: str = None,
     ) -> Optional[BatchRecord]:
         """
         Append one load. Returns None when these exact bytes are already stored.
@@ -236,7 +237,11 @@ class FactStore:
             return None
 
         now = datetime.now()
-        batch_id = f"{now.strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        # Generated unless the caller has one. `LandingStore.land` accepts a batch id
+        # for the same reason from the other side: `(batch_id, row_no)` on a fact is
+        # supposed to resolve to the verbatim source row, and two layers minting their
+        # own ids would make that pointer unfollowable.
+        batch_id = batch_id or f"{now.strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:6]}"
         path = self.batch_path(doc_type, batch_id)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -263,7 +268,14 @@ class FactStore:
             batch_id=batch_id,
             doc_type=doc_type,
             valid_time=valid,
-            transaction_time=now.isoformat(timespec="seconds"),
+            # Milliseconds, unlike every other timestamp in this package. Transaction
+            # time is the axis an as-of read filters on — "what did we believe before
+            # this arrived" — and at second resolution two loads in the same second are
+            # one moment, so the question has no answer for exactly the pair of batches
+            # most likely to be a file and its correction. Lexicographic comparison is
+            # unaffected: a second-resolution value written by older code still orders
+            # correctly against a millisecond one.
+            transaction_time=now.isoformat(timespec="milliseconds"),
             rows=len(frame),
             source_name=source_name,
             source_sha=sha,

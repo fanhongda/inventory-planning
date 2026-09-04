@@ -350,24 +350,39 @@ the code answer are different, and the gap is almost entirely on the query side.
 `doc_type` × `valid_time` × entity, full history or a single-grain `current` view,
 landing row beside canonical row, SQL underneath.
 
-**Today: almost nothing.** `FactStore` exposes `read_batch(batch_id)` — one whole batch,
-by id — plus `batches()` to list the ledger and `summary()`. There is no as-of read, no
-`current` view, no filter by SKU or location, no query spanning batches, and **DuckDB is
-not a dependency of this project at all**. `_shadow_write` in `orchestrator.py` writes
-faithfully and, exactly as designed for phase one, nothing reads it back.
+**Built** (`store/query.py`, DuckDB over the Parquet). Three readings, each named,
+because more than one is defensible and picking silently is how a plausible wrong number
+gets made:
 
-Two further gaps worth knowing before promising a browse screen:
+| | |
+|---|---|
+| `history` | every observation, each row carrying its batch. **Never sum this** — one PO appears once per load |
+| `current` | the newest observation of every key ever seen |
+| `latest` | the newest batch and only it |
 
-- **`store/landing.py` is not wired into the pipeline.** It is implemented and tested,
-  but only tests construct a `LandingStore`. So "raw row beside canonical row" has no
-  data behind it on a real run until landing is called from intake.
+`current` and `latest` differ by whatever the newest export dropped, and which is right
+is a property of the export — a whole-population snapshot replaces its predecessor, an
+incremental window does not — which no contract declares. So `carried_forward` returns
+the size of the disagreement rather than a caveat about it, and `current` refuses
+outright when the natural key is incomplete, since reducing on a partial key collapses
+distinct rows and looks cleaner than not reducing at all.
+
+Both time axes are honoured: `as_of` filters `valid_time`, `known_at` filters
+`transaction_time`, and the second is what reconstructs what was believed before a
+correction arrived. Promotion applies `KeyStatus.storable` — the gate that was defined
+for a fact store and that nothing had yet applied — so an export that cannot be keyed is
+refused at write with the declaration that would fix it, rather than accepted and failing
+on every read.
+
+Two gaps remain, and both matter before a browse screen is promised:
+
+- **`store/landing.py` is not wired into the pipeline.** The API lands every upload, but
+  a CLI run does not, so "raw row beside canonical row" holds only for files that came
+  in through the interface.
 - **`valid_time` is one anchor for the whole run**, not per document. An inventory
-  snapshot dated differently from the sales anchor is not yet expressible, and that is a
-  question a browse screen will ask on its first day.
-
-What closing the query gap actually takes: land the P4 fact table and the `current`
-view, wire landing into intake, add `duckdb` as a dependency, and put a single
-repository module in front of it holding all SQL.
+  snapshot dated differently from the sales anchor is not yet expressible from the
+  pipeline — the API's promote takes it per batch, which is the shape the pipeline
+  should move to.
 
 ### Change
 
@@ -434,7 +449,9 @@ needs P4.**
 3. **`inventory_planning/api/`** — the batch and resolution endpoints, over what exists.
 4. **M1** on top of them. Stop here and evaluate: if a planner will not use M1, M2 and
    M3 are not worth building.
-5. **P4**, then **M3**.
+5. **P4 read path — done.** `store/query.py`, `POST /batches/{id}/promote`,
+   `GET /facts/{doc_type}`. Not the second half of P4: the pipeline still reads its
+   files, and swapping `ingest_bridge` over to the store is its own review.
 6. **M2**, after the settings it exposes are honoured by the engine — and after
    `/runs/{a}/diff/{b}`, without which it is a form with no feedback.
 

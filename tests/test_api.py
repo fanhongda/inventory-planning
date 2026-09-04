@@ -217,15 +217,15 @@ class TestWithdrawingABatch:
 
 class TestWhatIsNotBuiltSaysSo:
 
-    @pytest.mark.parametrize("path", ["/facts/inventory", "/runs"])
-    def test_it_is_501_naming_what_is_missing_not_an_empty_list(self, client, path):
+    def test_the_run_registry_is_501_naming_what_is_missing_not_an_empty_list(
+            self, client):
         """
-        An empty list would read as "no data", which is a different and worse claim
-        than "there is no query engine in front of this yet".
+        An empty list would read as "no runs", which is a different and worse claim
+        than "nothing reads the registry back across runs yet".
         """
-        response = client.get(path)
+        response = client.get("/runs")
         assert response.status_code == 501
-        assert "as-of" in response.json()["detail"]
+        assert "run registry" in response.json()["detail"]
 
 
 class TestABlankTemplateSaysWhatIsWrongWithIt:
@@ -255,7 +255,7 @@ class TestTheReviewScreenIsServedWithoutShadowingTheApi:
         """
         assert client.get("/health").json()["ok"] is True
         assert client.get("/contracts").status_code == 200
-        assert client.get("/facts/inventory").status_code == 501
+        assert client.get("/runs").status_code == 501
 
 
 class TestTheSummaryIsTheQuestionAReaderCanAnswer:
@@ -371,3 +371,132 @@ class TestTheChecklistOfWhatIsStillMissing:
         assert lead_time["satisfied"] is False
         assert "po_history" in lead_time["withheld_by"]
         assert lead_time["fallback"]
+
+
+class TestPromotingAndReadingFacts:
+
+    def _storable(self, client):
+        """
+        Upload, then declare the key part the sample export does not carry.
+
+        The sample has no plant column, and `inventory` is keyed on sku + location_id.
+        That is not incidental to these tests: it is the ordinary shape of a
+        single-plant export, and the declaration is the intended remedy.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        client.post(f"/batches/{batch_id}/declarations",
+                    json={"scope": "value", "field": "location_id", "value": "DC-01",
+                          "by": "jfanhon",
+                          "reason": "single-plant export; the DC is DC-01"})
+        return batch_id
+
+    def _promote(self, client, batch_id, valid_time="2024-07-01"):
+        return client.post(f"/batches/{batch_id}/promote",
+                           json={"valid_time": valid_time, "by": "jfanhon"})
+
+    def test_a_promotion_needs_the_date_the_data_describes(self, client):
+        batch_id = self._storable(client)
+        response = client.post(f"/batches/{batch_id}/promote", json={"by": "jfanhon"})
+        assert response.status_code == 400
+        assert "valid_time" in response.json()["detail"]
+
+    def test_a_batch_that_cannot_be_keyed_is_refused_with_the_remedy(self, client):
+        """
+        `KeyStatus.storable` was defined as the gate a fact store applies and nothing
+        applied it. Storing an unkeyable batch is not a smaller version of storing a
+        keyable one — a later correction lands as a second row, both are current, and
+        every as-of read of the document then fails or double-counts.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        response = self._promote(client, batch_id)
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert "location_id" in detail and "scope `value`" in detail
+
+    def test_the_fact_batch_keeps_the_landing_batch_id(self, client):
+        """`(batch_id, row_no)` on a fact is supposed to resolve to the verbatim row."""
+        batch_id = self._storable(client)
+        body = self._promote(client, batch_id).json()
+        assert body["batch_id"] == batch_id
+        assert body["rows"] == 10
+        assert client.get(f"/batches/{batch_id}").json()["status"] == "promoted"
+
+    def test_a_batch_already_promoted_is_not_promoted_again(self, client):
+        batch_id = self._storable(client)
+        self._promote(client, batch_id)
+        again = self._promote(client, batch_id)
+        assert again.status_code == 409
+        assert "not landed" in again.json()["detail"]
+
+    def test_the_same_file_uploaded_twice_is_stored_once(self, client):
+        """Same bytes, same parameters, same as-of date: a second batch would be a
+        second copy of one observation, and every quantity would double."""
+        first = self._storable(client)
+        self._promote(client, first)
+        second = _upload(client).json()["landed"][0]["batch_id"]
+        again = self._promote(client, second)
+        assert again.status_code == 409
+        assert "already in the store" in again.json()["detail"]
+
+    def test_two_different_files_do_not_collide_on_the_same_as_of_date(self, client,
+                                                                       tmp_path):
+        """
+        The content key is (source bytes, parameters, as-of). Landing was not recording
+        the source hash, so it was (nothing, parameters, as-of) and a second, genuinely
+        different export promoted at the same date was dropped as a duplicate.
+        """
+        self._promote(client, self._storable(client))
+
+        other = tmp_path / "inventory_dc2.csv"
+        other.write_text("Item Code,On Hand,In Transit,Base Unit,Report Date\n"
+                         "SKU-900,7,0,EA,2024-07-01\n", encoding="utf-8")
+        batch_id = _upload(client, other).json()["landed"][0]["batch_id"]
+        client.post(f"/batches/{batch_id}/declarations",
+                    json={"scope": "value", "field": "location_id", "value": "DC-02",
+                          "by": "jfanhon", "reason": "second plant, same report"})
+        assert self._promote(client, batch_id).status_code == 200
+        assert len(client.get("/facts").json()) == 1
+        assert client.get("/facts/inventory").json()["batches"].__len__() == 2
+
+    def test_facts_come_back_as_of_a_moment(self, client):
+        batch_id = self._storable(client)
+        self._promote(client, batch_id)
+
+        body = client.get("/facts/inventory").json()
+        assert body["mode"] == "current"
+        assert len(body["rows"]) == 10
+        assert body["batches"][0]["valid_time"] == "2024-07-01"
+        assert body["carried_forward"]["carried"] == 0
+
+        earlier = client.get("/facts/inventory", params={"as_of": "2024-01-01"}).json()
+        assert earlier["rows"] == []
+        assert "no batch matches" in earlier["selection"]
+
+    def test_the_three_readings_are_named_and_history_is_not_a_position(self, client):
+        batch_id = self._storable(client)
+        self._promote(client, batch_id)
+        for mode in ("current", "latest", "history"):
+            body = client.get("/facts/inventory", params={"mode": mode}).json()
+            assert body["mode"] == mode and len(body["rows"]) == 10
+        assert client.get("/facts/inventory",
+                          params={"mode": "guess"}).status_code == 422
+
+    def test_a_filter_narrows_it(self, client):
+        batch_id = self._storable(client)
+        self._promote(client, batch_id)
+        body = client.get("/facts/inventory", params={"sku": "SKU-003"}).json()
+        assert len(body["rows"]) == 1
+        assert body["rows"][0]["sku"] == "SKU-003"
+
+    def test_the_index_lists_what_the_store_holds(self, client):
+        assert client.get("/facts").json() == []
+        batch_id = self._storable(client)
+        self._promote(client, batch_id)
+        listed = client.get("/facts").json()
+        assert listed[0]["doc_type"] == "inventory" and listed[0]["batches"] == 1
+
+    def test_a_voided_batch_cannot_be_promoted(self, client):
+        batch_id = self._storable(client)
+        client.post(f"/batches/{batch_id}/void",
+                    json={"reason": "wrong month", "by": "jfanhon"})
+        assert self._promote(client, batch_id).status_code == 409

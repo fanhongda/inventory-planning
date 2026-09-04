@@ -1,25 +1,25 @@
 <!doctype html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>导入检查 — 库存计划</title>
+<title>Import review — inventory planning</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header>
-  <h1>导入检查</h1>
+  <h1>Import review</h1>
   <p class="lede">
-    上传一个导出文件，先看它被读成了什么。<strong>这一步不会进入计划</strong> —— 确认之前，
-    什么都不会被用到。
+    Upload an export and see what it was read as. <strong>Nothing here enters a
+    planning run</strong> — not until you say so.
   </p>
 </header>
 
 <main>
   <section id="drop" class="drop">
     <input type="file" id="file" hidden>
-    <button id="pick" class="primary">选择文件</button>
-    <span class="hint">或把文件拖到这里 · CSV / Excel</span>
+    <button id="pick" class="primary">Choose a file</button>
+    <span class="hint">or drop one here &middot; CSV / Excel</span>
     <p id="status" class="status" hidden></p>
   </section>
 

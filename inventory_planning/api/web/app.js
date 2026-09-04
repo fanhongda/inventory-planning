@@ -63,6 +63,31 @@ async function api(path, options) {
   return body;
 }
 
+// The checklist, grouped. Nine documents in one flat list is a wall, and translating
+// nine contract descriptions would put a second copy of the schema's prose in here to
+// go stale. So the plain-language explanation lives at the section — six of them, each
+// a thing a planner already has a word for — and the documents keep the identifiers the
+// contracts, the CLI and the workbook all use.
+//
+// `catch_all` is not decoration. A contract added later belongs to no section, and a
+// checklist that quietly stopped listing it would be worse than an ugly one.
+const SECTIONS = [
+  { title: "Demand", gloss: "what you are planning for, and how much of it sold",
+    docs: ["sales_history", "demand_timeseries"] },
+  { title: "Stock", gloss: "what is on hand right now",
+    docs: ["inventory"] },
+  { title: "Master data", gloss: "the standing attributes and planning parameters per item",
+    docs: ["item_master", "planning_master"] },
+  { title: "On order and backlog", gloss: "placed but not received, promised but not shipped",
+    docs: ["open_po", "open_so"] },
+  { title: "Purchase history", gloss: "how long deliveries actually took, and how often you order",
+    docs: ["po_history"] },
+  { title: "Renumbering", gloss: "the same item under a new number, or old and new side by side",
+    docs: ["substitution"] },
+  { title: "Other", gloss: "documents that fit none of the sections above",
+    docs: [], catch_all: true },
+];
+
 // ── Panels ──────────────────────────────────────────────────────────────────
 
 // What a run still needs, and what has arrived. Standing on the page from the first
@@ -87,17 +112,19 @@ function requirementsCard(req) {
   const state = (doc) => {
     if (doc.landed) {
       return doc.fields.every((f) => f.present)
-        ? { mark: "✓", cls: "ok", note: `${num(doc.landed.rows)} 行 · ${doc.landed.source_name}` }
+        ? { mark: "\u2713", cls: "ok",
+            note: `${num(doc.landed.rows)} rows \u00b7 ${doc.landed.source_name}` }
         : { mark: "!", cls: "part",
-            note: `${num(doc.landed.rows)} 行，但有必需字段没读到` };
+            note: `${num(doc.landed.rows)} rows, but a required field found no column` };
     }
     if (satisfiedBy[doc.doc_type]) {
-      return { mark: "–", cls: "spare", note: `不需要了 —— 已由 ${satisfiedBy[doc.doc_type]} 满足` };
+      return { mark: "\u2013", cls: "spare",
+               note: `not needed \u2014 ${satisfiedBy[doc.doc_type]} already supplies this` };
     }
     return { mark: "○", cls: "todo",
              note: alternatives[doc.doc_type]
-               ? `还没上传（与 ${alternatives[doc.doc_type].join("、")} 二选一）`
-               : "还没上传" };
+               ? `not uploaded (either this or ${alternatives[doc.doc_type].join(", ")})`
+               : "not uploaded" };
   };
 
   const line = (doc) => {
@@ -105,40 +132,64 @@ function requirementsCard(req) {
     return el("li", { class: `req ${st.cls}` },
       el("span", { class: "mark" }, st.mark),
       el("div", {},
-        el("div", { class: "name" }, el("code", {}, doc.doc_type),
-           el("span", { class: "desc", title: doc.description || "" },
-              firstSentence(doc.description))),
+        el("div", { class: "name" },
+           el("code", { title: doc.description || "" }, doc.doc_type),
+           el("span", { class: "k" }, st.note)),
         el("div", { class: "chips" }, doc.fields.map((f) =>
           el("span", { class: `chip ${f.present ? "on" : "off"}` },
-             `${f.present ? "✓" : "○"} ${f.field}`))),
-        el("div", { class: "k" }, st.note)));
+             `${f.present ? "✓" : "○"} ${f.field}`)))));
   };
 
-  const required = req.documents.filter((d) => d.required);
-  const optional = req.documents.filter((d) => !d.required);
-  const outstanding = req.missing_required.length;
+  const byType = new Map(req.documents.map((d) => [d.doc_type, d]));
+  const claimed = new Set(SECTIONS.flatMap((s) => s.docs));
+  const groups = SECTIONS.map((section) => {
+    const docs = (section.catch_all
+      ? req.documents.filter((d) => !claimed.has(d.doc_type))
+      : section.docs.map((t) => byType.get(t)).filter(Boolean));
+    return { ...section, docs };
+  }).filter((g) => g.docs.length);
 
-  const optionalBlock = el("div", { hidden: true },
-    el("ul", { class: "reqs" }, optional.map(line)),
+  // Done means every document in it has arrived, or is covered by the sibling that
+  // satisfies the same requirement. Not "or is optional": that ticked every optional
+  // section on an empty store, which is the one thing this panel exists not to do.
+  const done = (g) => g.docs.every((d) => d.landed || satisfiedBy[d.doc_type]);
+  const block = (g) => el("div", { class: `group ${done(g) ? "done" : "todo"}` },
+    el("div", { class: "ghead" },
+      el("span", { class: "gmark" }, done(g) ? "✓" : "○"),
+      el("span", { class: "gtitle" }, g.title),
+      el("span", { class: "gloss" }, g.gloss),
+      g.docs.some((d) => d.required) ? null : el("span", { class: "tag" }, "optional")),
+    el("ul", { class: "reqs" }, g.docs.map(line)));
+
+  const outstanding = req.missing_required.length;
+  const needed = groups.filter((g) => g.docs.some((d) => d.required));
+  const extra = groups.filter((g) => !g.docs.some((d) => d.required));
+
+  const extraBlock = el("div", { hidden: true },
+    extra.map(block),
     el("ul", { class: "degrades" },
       req.degradations.slice(0, 6).map((d) => el("li", {}, d))));
 
   return el("section", { class: "card" },
-    el("h2", {}, "需要的文件",
+    el("h2", {}, "What a run needs",
        el("span", { class: outstanding ? "badge todo" : "badge ok" },
-          outstanding ? `还差 ${outstanding} 项` : "齐了")),
+          outstanding ? `${outstanding} still missing` : "all here")),
     el("p", { class: "sub" },
        outstanding
-         ? "灰色的还没上传。上传后打勾，字段也逐个打勾 —— 打不上勾的字段说明这份导出里没有它。"
-         : "必需的信息都齐了。这不代表数字是对的，只代表跑得起来。"),
-    el("ul", { class: "reqs" }, required.map(line)),
-    el("p", {}, el("button", { class: "link", onclick: (e) => {
-      optionalBlock.hidden = !optionalBlock.hidden;
-      e.target.textContent = optionalBlock.hidden
-        ? `其余 ${optional.length} 项是可选的 —— 缺了会降级，看看少了什么`
-        : "收起可选项";
-    } }, `其余 ${optional.length} 项是可选的 —— 缺了会降级，看看少了什么`)),
-    optionalBlock);
+         ? "Greyed out means not uploaded yet. Each field ticks separately, so a column "
+           + "this export does not carry shows up here without opening the mapping."
+         : "Everything required is here. That is not a claim the numbers are right \u2014 "
+           + "only that a run can start."),
+    needed.map(block),
+    extra.length
+      ? el("p", {}, el("button", { class: "link", onclick: (e) => {
+          extraBlock.hidden = !extraBlock.hidden;
+          e.target.textContent = extraBlock.hidden
+            ? `${extra.length} more sections are optional \u2014 see what a run loses without them`
+            : "Hide the optional sections";
+        } }, `${extra.length} more sections are optional \u2014 see what a run loses without them`))
+      : null,
+    extraBlock);
 }
 
 
@@ -147,9 +198,9 @@ function requirementsCard(req) {
 function totalsCard(doc, batch, onDisagree) {
   const figures = [
     el("div", { class: "figure" }, el("div", { class: "n" }, num(doc.rows)),
-       el("div", { class: "k" }, "行")),
+       el("div", { class: "k" }, "rows")),
     el("div", { class: "figure" }, el("div", { class: "n" }, num(doc.skus)),
-       el("div", { class: "k" }, "个物料")),
+       el("div", { class: "k" }, "items")),
   ];
   for (const r of doc.readings) {
     const value = r.kind === "date"
@@ -162,17 +213,19 @@ function totalsCard(doc, batch, onDisagree) {
   }
 
   return el("section", { class: "card ask" },
-    el("h2", {}, `这份文件被读成 ${batch.doc_type}`),
+    el("h2", {}, `This file was read as ${batch.doc_type}`),
     el("p", { class: "sub" },
-       "下面是它说的数。对不上，就说明有一列读错了 —— 这比看字段映射快得多。"),
+       "Here is what it says. If these do not look right, a column was read as the "
+       + "wrong thing \u2014 far quicker to see here than in a mapping table."),
     el("div", { class: "figures" }, figures),
     el("div", { class: "answer" },
       el("button", { class: "primary", onclick: (e) => {
         mount(e.target.closest(".answer"),
-          el("span", { class: "changed" }, "好。这份文件可以用了 —— 它仍未进入计划。"));
-      } }, "对得上"),
-      el("button", { onclick: onDisagree }, "对不上 / 我要看字段"),
-      el("span", { class: "hint" }, "对不上时打开下面的字段表，逐列核对。")));
+          el("span", { class: "changed" },
+             "Good. Nothing here has entered the planning run."));
+      } }, "Looks right"),
+      el("button", { onclick: onDisagree }, "Does not look right"),
+      el("span", { class: "hint" }, "Opens the field table below, column by column.")));
 }
 
 // Shown only when the router did not win clearly. A document that won by 56 points is
@@ -181,33 +234,34 @@ function totalsCard(doc, batch, onDisagree) {
 function routingCard(res) {
   if (res.stated) {
     return el("section", { class: "card" },
-      el("h2", {}, "文件类型是被指定的，不是判断出来的"),
+      el("h2", {}, "The document type was stated, not judged"),
       el("p", { class: "sub" },
-         `这份文件按 ${res.doc_type} 处理，因为模板或调用方这么说的 —— ` +
-         `不是比对出来的结果。系统没有对此做过独立判断。`));
+         `This file is handled as ${res.doc_type} because the template or the caller ` +
+         `said so. Nothing was measured, and no independent check was made.`));
   }
   if (!res.close_call && !res.uncertain) return null;
 
   const rival = res.runner_up;
-  // A margin under half a point rounds to "只差 0%", which reads as a typo rather than
+  // A margin under half a point rounds to "0% apart", which reads as a typo rather than
   // as the tie it is. A tie is the strongest form of this warning, not the weakest.
   const gap = res.margin < 0.005
-    ? `${rival && rival.doc_type} 的得分与它完全相同`
-    : `也很像 ${rival && rival.doc_type} —— 两者只差 ${pct(res.margin)}`;
+    ? `${rival && rival.doc_type} scored exactly the same`
+    : `it also looks like ${rival && rival.doc_type} \u2014 ${pct(res.margin)} apart`;
   return el("section", { class: "card warn" },
-    el("h2", {}, "这个判断不保险，请确认"),
+    el("h2", {}, "A close call \u2014 please confirm"),
     el("p", { class: "sub" },
        rival
-         ? `按列名看它最像 ${res.doc_type}，但${gap}。` +
-           `这两种单据的列几乎一样，光看表头分不开。`
-         : `按列名判断的把握只有 ${pct(res.confidence)}。`),
+         ? `On column names it looks most like ${res.doc_type}, but ${gap}. These two ` +
+           `documents share nearly every column, so headers cannot separate them.`
+         : `Judged on column names with only ${pct(res.confidence)} confidence.`),
     el("p", { class: "note" },
-       "如果认错了，这份文件的每一个数都会被算进错误的地方，而且不会报错。" +
-       "请确认这份导出到底是什么，再往下走。"));
+       "If this is the wrong one, every figure in the file is counted into the wrong "
+       + "place and nothing raises an error. Confirm what this export actually is "
+       + "before going on."));
 }
 
 // Every figure the run could not measure, largest exposure first. The currency case
-// gets a dropdown rather than a default, because "这个文件记的是什么货币" is business
+// gets a dropdown rather than a default, because "what is this booked in" is business
 // knowledge this reader has and a 7x error is not something they can spot afterwards.
 function restingCard(resting, batch, refresh) {
   const items = resting.resting_on || [];
@@ -217,44 +271,48 @@ function restingCard(resting, batch, refresh) {
     const magnitude = item.money !== null && item.money !== undefined
       ? `${num(item.money)} ${resting.reporting_currency} (${item.money_field})`
       : item.priced_rows
-        ? `${num(item.priced_rows)} 行带单价 —— 是费率，不是总额`
+        ? `${num(item.priced_rows)} rows priced \u2014 a rate, not a total`
         : item.qty !== null && item.qty !== undefined
           ? `${num(item.qty)} (${item.qty_field})`
-          : "无法量化";
+          : "cannot be sized";
     return el("tr", { class: "attention" },
       el("td", {}, el("code", {}, item.field)),
       el("td", {}, String(item.value)),
       el("td", {}, item.basis === "declared"
-        ? `${item.by || "未署名"} 声明` : "系统假设"),
-      el("td", { class: "num" }, `${item.upper_bound ? "≤ " : ""}${num(item.rows)} 行`),
+        ? `declared by ${item.by || "nobody named"}` : "assumed"),
+      el("td", { class: "num" }, `${item.upper_bound ? "\u2264 " : ""}${num(item.rows)} rows`),
       el("td", {}, magnitude));
   });
 
   const currency = items.find((i) => i.field === "currency" && i.basis === "assumed");
   return el("section", { class: "card warn" },
-    el("h2", {}, "这些数字压在没量到的东西上"),
+    el("h2", {}, "What these figures rest on"),
     el("p", { class: "sub" },
-       "导出文件没带这些信息，系统只能先按默认处理。默认错了，下面这些金额就是错的。"),
+       "The export did not carry these, so a default was used. Where the default is "
+       + "wrong, the money below is wrong by whatever the difference is."),
     el("div", { class: "scroll" }, el("table", {},
       el("thead", {}, el("tr", {},
-        ["字段", "当前取值", "来源", "影响行数", "背后的量"].map((h) => el("th", {}, h)))),
+        ["Field", "Reading as", "Source", "Rows", "What rests on it"]
+          .map((h) => el("th", {}, h)))),
       el("tbody", {}, rows))),
     currency ? currencyForm(batch, currency, refresh) : null);
 }
 
 function currencyForm(batch, item, refresh) {
   const select = el("select", { id: "cur" },
-    el("option", { value: "" }, "请选择 —"),
+    el("option", { value: "" }, "Choose \u2014"),
     ["CNY", "USD", "EUR", "SGD", "JPY", "HKD", "GBP", "AUD"].map(
       (c) => el("option", { value: c }, c)));
-  const reason = el("textarea", { placeholder: "为什么是这个币种？例如：本厂只按标准成本以人民币记账，导出模板不带币种列。" });
-  const by = el("input", { placeholder: "你的名字 / 工号" });
+  const reason = el("textarea", { placeholder:
+    "Why this currency? e.g. the plant books at standard cost in CNY only, and the "
+    + "export template carries no currency column." });
+  const by = el("input", { placeholder: "Your name" });
   const out = el("p", { class: "note" });
 
   return el("form", { class: "declare", onsubmit: async (e) => {
     e.preventDefault();
     out.className = "note";
-    if (!select.value) { out.textContent = "先选一个币种。"; return; }
+    if (!select.value) { out.textContent = "Choose a currency first."; return; }
     try {
       const body = await api(`/batches/${batch.batch_id}/declarations`, {
         method: "POST", headers: { "content-type": "application/json" },
@@ -262,22 +320,25 @@ function currencyForm(batch, item, refresh) {
                                reason: reason.value, by: by.value }),
       });
       out.className = "changed";
-      out.textContent = `已记录：${body.declaration.split("/").pop()} —— ${body.changed.length} 个字段的读法变了。`;
+      out.textContent = `Recorded as ${body.declaration.split("/").pop()} \u2014 `
+        + `${body.changed.length} field(s) now read differently.`;
       refresh();
     } catch (err) { out.textContent = String(err.message); }
   } },
-    el("label", {}, `这个文件里的金额记的是什么货币？现在按 ${item.value} 处理。`),
+    el("label", {},
+       `What currency is the money in this file booked in? Read as ${item.value} now.`),
     select,
-    el("label", {}, "为什么（必填 —— 这是日后唯一能说明当时依据的记录）"), reason,
+    el("label", {},
+       "Why (required \u2014 the only account of what this rested on)"), reason,
     el("div", { class: "row2" },
-      el("div", {}, el("label", {}, "谁说的（必填）"), by),
+      el("div", {}, el("label", {}, "Who says so (required)"), by),
       el("div", {}, el("label", {}, " "),
-         el("button", { class: "primary", type: "submit" }, "记下这条声明"))),
+         el("button", { class: "primary", type: "submit" }, "Record it"))),
     out);
 }
 
 // Collapsed to what needs attention. Opening the whole table is a click away and is
-// what the "对不上" button does.
+// what the "Does not look right" button does.
 function fieldsCard(res, batch, refresh, openAll) {
   const needs = (f) => f.required || f.source === "absent" || f.empty;
   let showAll = openAll;
@@ -290,33 +351,37 @@ function fieldsCard(res, batch, refresh, openAll) {
          el("div", { class: "k", style: "color:var(--muted);font-size:12px" },
             f.description || "")),
       el("td", {}, el("span", { class: `tag ${f.source}` }, {
-        mapped: "取自列", declared: "有人指定", default: "补的默认值",
-        derived: "算出来的", absent: "没有",
+        mapped: "from a column", declared: "declared", default: "supplied default",
+        derived: "computed", absent: "no column",
       }[f.source] || f.source)),
       el("td", {}, f.column || "—"),
       el("td", { class: "num" }, f.source === "absent" ? "—" : pct(f.fill_rate)),
       el("td", {}, el("button", { class: "link", onclick: () =>
-        card.append(mappingForm(res, batch, f, refresh)) }, "换一列"))));
+        card.append(mappingForm(res, batch, f, refresh)) }, "use another column"))));
 
     mount(card,
-      el("h2", {}, "字段是从哪几列读出来的"),
+      el("h2", {}, "Which column each field was read from"),
       el("p", { class: "sub" },
-         showAll ? `全部 ${res.fields.length} 个字段。带 * 的是必需的。`
-                 : `只列出必需的和没读到的。其余 ${res.fields.length - fields.length} 个字段正常。`),
+         showAll
+           ? `All ${res.fields.length} fields. A * marks a required one.`
+           : `Only the required ones and the ones that found no column. The other `
+             + `${res.fields.length - fields.length} are fine.`),
       res.ignored_declarations.length
         ? el("p", { class: "note", style: "color:var(--stop)" },
-             "⚠ 有声明指向了这个文件没有的列，未生效：" +
+             "\u26a0 A declaration names a column this file does not have, so it was "
+             + "left unapplied: " +
              res.ignored_declarations.map((d) => `${d.field} ← ${d.column}`).join("、"))
         : null,
       el("div", { class: "scroll" }, el("table", {},
         el("thead", {}, el("tr", {},
-          ["字段", "来源", "对应的列", "有值的比例", ""].map((h) => el("th", {}, h)))),
+          ["Field", "Source", "Column", "Filled", ""].map((h) => el("th", {}, h)))),
         el("tbody", {}, rows))),
       el("p", {}, el("button", { class: "link", onclick: () => { showAll = !showAll; render(); } },
-        showAll ? "只看需要注意的" : `显示全部 ${res.fields.length} 个字段`)),
+        showAll ? "Show only what needs attention"
+                : `Show all ${res.fields.length} fields`)),
       res.unmatched_columns.length
         ? el("p", { class: "note" },
-             `文件里有 ${res.unmatched_columns.length} 列没有对应到任何字段：` +
+             `${res.unmatched_columns.length} column(s) in the file matched no field: ` +
              res.unmatched_columns.join("、"))
         : null);
   };
@@ -327,16 +392,16 @@ function fieldsCard(res, batch, refresh, openAll) {
 function mappingForm(res, batch, field, refresh) {
   const columns = [...new Set([...res.fields.map((f) => f.column).filter(Boolean),
                                ...res.unmatched_columns])].sort();
-  const select = el("select", {}, el("option", { value: "" }, "请选择 —"),
+  const select = el("select", {}, el("option", { value: "" }, "Choose \u2014"),
     columns.map((c) => el("option", { value: c, selected: c === field.column }, c)));
-  const reason = el("textarea", { placeholder: "为什么这一列才对？" });
-  const by = el("input", { placeholder: "你的名字 / 工号" });
+  const reason = el("textarea", { placeholder: "Why is this the right column?" });
+  const by = el("input", { placeholder: "Your name" });
   const out = el("p", { class: "note" });
 
   const form = el("form", { class: "declare", onsubmit: async (e) => {
     e.preventDefault();
     out.className = "note";
-    if (!select.value) { out.textContent = "先选一列。"; return; }
+    if (!select.value) { out.textContent = "Choose a column first."; return; }
     try {
       const body = await api(`/batches/${batch.batch_id}/declarations`, {
         method: "POST", headers: { "content-type": "application/json" },
@@ -345,18 +410,20 @@ function mappingForm(res, batch, field, refresh) {
       });
       out.className = "changed";
       out.textContent = body.changed.length
-        ? `已记录。变化：${body.changed.map((c) => c.field).join("、")}`
-        : "已记录，但什么都没变 —— 多半是这一列在文件里不存在。往上看未生效的声明。";
+        ? `Recorded. Changed: ${body.changed.map((c) => c.field).join(", ")}`
+        : "Recorded, and nothing changed \u2014 most likely the column is not in this "
+          + "file. See the unapplied declaration noted above.";
       refresh();
     } catch (err) { out.textContent = String(err.message); }
   } },
-    el("label", {}, `${field.field} 应该取自哪一列？现在取自 ${field.column || "（无）"}。`),
+    el("label", {}, `Which column should ${field.field} come from? `
+       + `Currently ${field.column || "none"}.`),
     select,
-    el("label", {}, "为什么（必填）"), reason,
+    el("label", {}, "Why (required)"), reason,
     el("div", { class: "row2" },
-      el("div", {}, el("label", {}, "谁说的（必填）"), by),
+      el("div", {}, el("label", {}, "Who says so (required)"), by),
       el("div", {}, el("label", {}, " "),
-         el("button", { class: "primary", type: "submit" }, "记下这条声明"))),
+         el("button", { class: "primary", type: "submit" }, "Record it"))),
     out);
   return form;
 }
@@ -364,9 +431,10 @@ function mappingForm(res, batch, field, refresh) {
 function rowsCard(rows) {
   if (!rows.rows.length) return null;
   return el("section", { class: "card" },
-    el("h2", {}, "文件里的原始行"),
+    el("h2", {}, "The rows as the file wrote them"),
     el("p", { class: "sub" },
-       `原样保存的前 ${rows.rows.length} 行，共 ${num(rows.total)} 行。表头是文件本来的写法。`),
+       `The first ${rows.rows.length} of ${num(rows.total)} rows, stored verbatim. `
+       + `The headers are the file\u2019s own spelling.`),
     el("div", { class: "scroll" }, el("table", {},
       el("thead", {}, el("tr", {}, rows.columns.map((c) => el("th", {}, c)))),
       el("tbody", {}, rows.rows.map((row) =>
@@ -406,17 +474,18 @@ async function upload(file) {
   const results = $("#results");
   status.hidden = false;
   status.className = "status";
-  status.textContent = `正在读取 ${file.name} …`;
+  status.textContent = `Reading ${file.name} \u2026`;
   results.replaceChildren();
 
   const form = new FormData();
   form.append("file", file);
   try {
     const body = await api("/uploads", { method: "POST", body: form });
-    status.textContent = `${body.source_name} —— 已原样保存，尚未进入计划。`;
+    status.textContent = `${body.source_name} \u2014 stored verbatim. `
+      + `Nothing has entered the planning run.`;
     if (body.stale_template) {
       results.append(el("section", { class: "card warn" },
-        el("h2", {}, "这份模板不是最新的"),
+        el("h2", {}, "This template is out of date"),
         el("p", { class: "sub" }, body.stale_template)));
     }
     for (const landed of body.landed) {

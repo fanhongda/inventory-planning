@@ -245,7 +245,7 @@ class TestABlankTemplateSaysWhatIsWrongWithIt:
 class TestTheReviewScreenIsServedWithoutShadowingTheApi:
 
     def test_the_page_and_its_module_load(self, client):
-        assert "导入检查" in client.get("/").text
+        assert "Import review" in client.get("/").text
         assert client.get("/app.js").status_code == 200
 
     def test_routes_registered_before_the_mount_still_win(self, client):

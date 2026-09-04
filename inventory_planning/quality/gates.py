@@ -176,9 +176,13 @@ class DataQualityError(ValueError):
         )
         body = "\n".join(f.summary(indent="  ") for f in blocking)
         tail = (
-            "\n\n  Fix the cause and re-run. To proceed anyway — every figure then rests "
-            "on data that did not pass, and the run records that it was overridden — "
-            "construct the planner with allow_degraded=True."
+            "\n\n  Fix the cause and re-run. If this finding is a false positive for "
+            "this document — not a real defect — add a `gate_waivers` entry in "
+            "config/declarations.yaml scoped to this one check, with an expiry: it is "
+            "recorded, attributable, and narrower than the alternative below.\n\n"
+            "  To proceed anyway regardless of cause — every figure then rests on data "
+            "that did not pass, and the run records that it was overridden — construct "
+            "the planner with allow_degraded=True."
         )
         super().__init__(head + body + tail)
 

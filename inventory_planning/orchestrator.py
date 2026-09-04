@@ -635,8 +635,12 @@ class InventoryPlanner:
                 "no alias and could not be derived:\n"
                 f"{detail}\n\n"
                 "    Run `python -m inventory_planning.explain <file>` to see which "
-                "source columns went unmatched, then add the right one as an alias to "
-                "the contract."
+                "source columns went unmatched.\n\n"
+                "    Check config/declarations.yaml first: a `scope: mapping` override "
+                "there is reviewed and attributable, and it outranks a frozen adapter "
+                "without you having to hand-edit one — see the worked examples already "
+                "in that file. Add an alias to the contract only when the right column "
+                "will never be ambiguous for anyone else's export of this document."
             )
         # Everything above is about a document being absent or unreadable. This is
         # about the documents being present, readable, and not describing the same

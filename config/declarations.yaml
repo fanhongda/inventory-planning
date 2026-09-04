@@ -129,9 +129,16 @@ gate_waivers:
   # The finding is not hidden. It is downgraded to a warning, still printed, and still
   # travels into the run manifest carrying who waived it and until when.
 
-  # A stock snapshot holds every material in the DC, most of which have no demand, no
-  # PO and no SO. 11% agreement is its expected shape, not a mis-mapping — the check
-  # measures the wrong direction for a document whose grain is a superset.
+  # The worked example this section was written from — a stock snapshot whose 11%
+  # agreement was its expected shape — is **no longer a waiver case**. `sku_agreement`
+  # now measures both directions and reports a superset as a warning on its own, so
+  # there is nothing left to waive: see `sku_superset_coverage` in quality/gates.py.
+  #
+  # It is left here as the shape of a waiver, and as the reason to prefer fixing the
+  # check. A waiver silences one check on one document for everyone who runs this
+  # repo, including the tests: waiving `sku_agreement` on `inventory` would also have
+  # waved through a stock file numbered `Z-*` against sales numbered `P-*`, which is
+  # the defect the check exists for. Two tests caught exactly that when it was tried.
   #
   # - check: sku_agreement
   #   doc_type: inventory

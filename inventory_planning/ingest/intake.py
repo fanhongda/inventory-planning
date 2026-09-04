@@ -680,6 +680,10 @@ class Intake:
 
     # Below this share of its SKUs meeting any other document, a file is not joining.
     _SKU_AGREEMENT_FLOOR = 0.20
+    # Held in step with `sku_superset_coverage` in quality/gates.py, which is the
+    # blocking half of the same judgement. The two disagreeing would print a warning
+    # the gate then contradicts.
+    _SKU_SUPERSET_COVERAGE = 0.50
 
     @classmethod
     def _check_sku_agreement(cls, result: IntakeResult, suspect: set = frozenset()) -> None:
@@ -716,9 +720,17 @@ class Intake:
             others = set().union(*(s for dt, s in skus.items() if dt != doc_type))
             if not others:
                 continue
-            share = len(own & others) / len(own)
+            shared = own & others
+            share = len(shared) / len(own)
             if share >= cls._SKU_AGREEMENT_FLOOR:
                 continue
+            # A document whose grain is wider than the rest — a whole-warehouse stock
+            # snapshot against the items that actually sell — has a low outward share
+            # by construction. Saying it "keys on something the other documents do not
+            # use" is then wrong, and it is the wording that sent a planner to
+            # `allow_degraded=True`. The gate makes the same distinction on the same
+            # two directions; see `sku_superset_coverage`.
+            superset = len(shared) / len(others) >= cls._SKU_SUPERSET_COVERAGE
 
             doc = keyed[doc_type]
             mapped = doc.route.adapter.column_map.get("sku", "?")
@@ -728,6 +740,19 @@ class Intake:
                 if len(values) >= _MIN_KEY_DISTINCT
             ]
             best = max(better, default=(0.0, None))
+            if superset:
+                result.notes.append("\n".join([
+                    f"  ⓘ {doc_type} covers more items than the rest of the run.",
+                    f"      {doc.source_name}: sku <- {mapped!r}. Only "
+                    f"{share:.0%} of its {len(own):,} SKUs appear elsewhere, but it "
+                    f"carries {len(shared) / len(others):.0%} of the SKUs the other "
+                    f"documents use — a wider grain, not a different numbering system.",
+                    "      The joins that matter still land. A rollup over its own row "
+                    "count covers a different population from one over the planned "
+                    "items.",
+                ]))
+                continue
+
             lines = [
                 f"  ⚠ {doc_type} keys on something the other documents do not use.",
                 f"      {doc.source_name}: sku <- {mapped!r}, and only "

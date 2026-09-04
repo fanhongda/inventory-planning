@@ -112,6 +112,7 @@ def _check_sku_agreement(documents: Dict[str, Any],
     output is not a control.
     """
     floor = thresholds["sku_agreement_floor"]
+    superset_floor = thresholds["sku_superset_coverage"]
     keyed = {dt: doc for dt, doc in documents.items()
              if "sku" in getattr(doc, "frame", pd.DataFrame()).columns and len(doc.frame)}
     if len(keyed) < 2:
@@ -125,9 +126,15 @@ def _check_sku_agreement(documents: Dict[str, Any],
         others = set().union(*(s for dt, s in skus.items() if dt != doc_type))
         if not others:
             continue
-        share = len(own & others) / len(own)
+        shared = own & others
+        share = len(shared) / len(own)
         if share >= floor:
             continue
+        # Which direction is low decides whether this is a different numbering system
+        # or a wider grain. A stock snapshot covering most of what the rest of the run
+        # references is a superset, and the low outward share is its expected shape.
+        coverage = len(shared) / len(others)
+        superset = coverage >= superset_floor
         doc = keyed[doc_type]
         mapped = getattr(getattr(doc.route, "adapter", None), "column_map", {}).get("sku", "?")
         # The suggestion is the useful half. That `sku` matches nothing is a puzzle;
@@ -142,16 +149,28 @@ def _check_sku_agreement(documents: Dict[str, Any],
                else "Check which column the rest of the business uses as the item "
                     "number, and map `sku` to it in an adapter for this export.")
         out.append(Finding(
-            stage="intake", check="sku_agreement", severity=BLOCK,
+            stage="intake", check="sku_agreement",
+            severity=(WARN if superset else BLOCK),
             what=(f"{doc_type} ({doc.source_name}) keys on {mapped!r}, and only "
                   f"{share:.0%} of its {len(own):,} item numbers appear in any other "
-                  f"document."),
-            why=("Every join in the pipeline is on `sku`. At this rate the merges "
+                  f"document."
+                  + (f" It does carry {coverage:.0%} of the item numbers the rest of "
+                     f"the run uses." if superset else "")),
+            why=("A wider grain, not a different numbering system: this document "
+                 "holds items the rest of the run has no demand, order or receipt "
+                 "for, which is what a whole-warehouse snapshot is. The joins that "
+                 "matter still land. Read any rollup over *its* row count — not over "
+                 "the planned items — as covering a different population."
+                 if superset else
+                 "Every join in the pipeline is on `sku`. At this rate the merges "
                  "return nothing, and nothing reads as zero rather than as missing — "
                  "a full report of confident zeroes with no error in it."),
-            fix=fix,
+            fix=("Nothing, if the wider grain is intended. If this export was meant to "
+                 "be scoped to the planned items, it is carrying more than you think."
+                 if superset else fix),
             evidence={"doc_type": doc_type, "source": doc.source_name,
                       "mapped_from": mapped, "agreement": round(share, 4),
+                      "coverage": round(coverage, 4), "superset": superset,
                       "distinct_skus": len(own)},
         ))
     return out

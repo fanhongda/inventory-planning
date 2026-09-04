@@ -35,11 +35,43 @@ still be worse than repeating last month's number, and nothing in the output wou
 so. `vs_naive` is the winner's error over the naive one's: 1.0 means the model earned
 nothing, and a model that cannot beat repeating last month simply loses to it.
 
+## How the winner is scored, and why not on a percentage
+
+MAPE divides by the actual, so it exists only on the periods that carried demand. On an
+intermittent item that is a minority of them, and discarding the rest is not a smaller
+sample of the same question — it has a direction. A model forecasting the order size
+every month is never charged for the months it invented; one forecasting near zero is
+charged in full on the few it missed. The highest line wins, and a quarterly item comes
+out forecast as if it ordered monthly.
+
+RMSE over every period tilts the other way: mostly-zero actuals are best fitted by
+predicting zero, so a genuinely recurring lumpy item is forecast flat at nothing.
+
+**MASE** decides wherever the backtest saw a zero — defined on every period, scaled by
+the series' own period-to-period movement, so neither tilt survives it. MAPE is kept for
+the case it is honest in, no zero actuals anywhere, because a percentage is what a
+planner reads. Both are reported either way.
+
+Where the backtest window caught **no demand at all**, it has measured nothing: every
+model that says zero ties at perfect and the ranking is an accident. Those items defer
+to TSB, whose probability decays with the length of the quiet run — which is the actual
+question, whether the item has stopped or is merely between orders.
+
+## The rate, and the lump behind it
+
+Every method answers with a per-period rate. That is what safety stock integrates and
+what a planner misreads: 33 a month on an item that orders 100 once a quarter is the
+right rate and a false plan, and a projection built on it draws a ramp where the real
+position is a sawtooth. So `expected_order_size` and `expected_interval` travel beside
+the rate. On a smooth item the interval is 1 and the two descriptions coincide.
+
 Key outputs:
   forecast_next_period  — point forecast for t+1 (used by purchase_recommender)
   forecast_avg_monthly  — mean of 6-month window (for planning horizon view only)
   forecast_rmse         — error used for σDL: the backtest error where the model was
                           chosen by one, otherwise the in-sample residual as before
+  expected_order_size   — how much arrives when something arrives
+  expected_interval     — how many periods apart, counting the run since the last one
 """
 
 import warnings
@@ -89,8 +121,9 @@ class Forecaster:
         time_series: pivot DataFrame (period index × SKU columns).
         classified: output of DemandClassifier.classify() — provides demand_pattern per SKU.
         policy: frame carrying `sku` and `stocking_policy` (MTS/MTO) from the ERP.
-                MTS is backtested; MTO goes straight to Croston; absent means the old
-                pattern-based routing.
+                Both are backtested wherever there is enough history; the policy only
+                decides the fallback for series too short to hold anything out, where
+                MTO and an intermittent pattern both route to TSB.
 
         Returns long-format DataFrame:
           sku, period, forecast_qty, model_used, trend_detected, seasonal_detected,
@@ -127,10 +160,10 @@ class Forecaster:
             model_used, forecast_values, rmse, scores = self._select_by_backtest(series)
             selected_by = scores.pop("_metric")
         elif policy == MTO:
-            model_used, forecast_values, rmse = self._croston(series)
+            model_used, forecast_values, rmse = self._tsb(series)
             selected_by = "policy:MTO"
         elif pattern in ("intermittent", "erratic", "lumpy"):
-            model_used, forecast_values, rmse = self._croston(series)
+            model_used, forecast_values, rmse = self._tsb(series)
             selected_by = "pattern"
         else:
             trend_detected = self._detect_trend(series)
@@ -142,6 +175,7 @@ class Forecaster:
         last_period = series.index[-1]
         future_periods = pd.period_range(start=last_period + 1, periods=self.horizon,
                                          freq=last_period.freq)
+        shape = self._demand_shape(series)
 
         return [
             {
@@ -155,8 +189,14 @@ class Forecaster:
                 "forecast_rmse": round(rmse, 3),
                 "selected_by": selected_by,
                 "backtest_mape": scores.get("mape"),
+                "backtest_mase": scores.get("mase"),
                 "backtest_rmse": scores.get("rmse"),
                 "vs_naive": scores.get("vs_naive"),
+                # The rate above is what the period carries on average; these two say
+                # what actually arrives and how often, so a lumpy item can be read as
+                # lumpy downstream instead of as a flat line.
+                "expected_order_size": shape["expected_order_size"],
+                "expected_interval": shape["expected_interval"],
             }
             for i, (p, v) in enumerate(zip(future_periods, forecast_values))
         ]
@@ -211,6 +251,9 @@ class Forecaster:
         for name, build in candidates + [
             ("SMA", lambda: self._fit_sma(series, horizon)),
             ("Croston", lambda: self._croston(series, horizon)[1]),
+            # Croston's estimate of the interval cannot fall while an item is quiet, so
+            # it competes against a version that can.
+            ("TSB", lambda: self._tsb(series, horizon)[1]),
             # The floor every other model has to clear: repeat the last observation.
             ("Naive", lambda: np.full(horizon, float(series.iloc[-1]))),
         ]:
@@ -257,6 +300,31 @@ class Forecaster:
             model, values, rmse = self._fit_smooth(series, trend, seasonal)
             return model, values, rmse, {"_metric": "in-sample (too short to backtest)"}
 
+        # A window that caught no demand has not measured anything.
+        #
+        # The backtest evaluates the last few periods of the series. On an item that
+        # orders twice a year, those periods routinely fall between two orders — so
+        # every actual is zero, forecasting zero scores perfectly, and the ranking is
+        # decided by which model happened to sit lowest rather than by which one
+        # describes the item. A real SKU ordering ~200 twice a year came out of this
+        # forecast at zero for all six months, and its should-be with it.
+        #
+        # The question the window cannot answer is whether the quiet run means the item
+        # has stopped or that it is between orders, and that is precisely what TSB
+        # answers: its probability decays with the length of the run, so a long-dormant
+        # item still falls to nothing while one inside its normal rhythm does not.
+        # Deferring to it is narrower than distrusting the backtest generally — the
+        # competition still decides every item whose window saw demand.
+        if not any(np.any(np.asarray(a["act"], dtype=float) != 0) for a in pooled.values()):
+            model, values, rmse = self._tsb(series)
+            return model, values, rmse, {
+                "_metric": "no demand in backtest window — deferred to TSB"}
+
+        # The scale MASE divides by: how much the series moves from one period to the
+        # next. A property of the item, so it is measured once on the whole series
+        # rather than per fold, for the same reason `allow_arima` is.
+        mase_scale = float(np.mean(np.abs(np.diff(series.values.astype(float)))))
+
         scored = {}
         for name, acc in pooled.items():
             err = np.asarray(acc["err"], dtype=float)
@@ -266,10 +334,36 @@ class Forecaster:
                 "rmse": float(np.sqrt(np.mean(err ** 2))),
                 "mape": (float(np.mean(np.abs(err[nz] / act[nz]))) if nz.sum() >= _MIN_MAPE_POINTS
                          else None),
+                "mase": (float(np.mean(np.abs(err)) / mase_scale) if mase_scale > 0 else None),
                 "n_nonzero": int(nz.sum()),
             }
 
-        metric = ("mape" if all(s["mape"] is not None for s in scored.values()) else "rmse")
+        # Which metric ranks the models, and why it is not always MAPE.
+        #
+        # MAPE is defined only where the actual is non-zero, so on an intermittent item
+        # it scores the months that had demand and silently discards the months that did
+        # not. That is not a smaller sample of the same question — it is a different
+        # question, and it has a direction: a model forecasting the order size every
+        # month is never charged for the months it invented, while a model forecasting
+        # near zero is charged in full on the few months it missed. The highest line
+        # wins, which is how an item ordering once a quarter comes out forecast as if it
+        # ordered monthly.
+        #
+        # RMSE over every period has the opposite tilt on the same series: it is
+        # minimised by predicting zero when most periods are zero, so a genuinely
+        # recurring lumpy item comes out forecast flat at nothing.
+        #
+        # MASE is defined on every period, zeros included, and is scaled by the series'
+        # own period-to-period movement, so neither tilt survives it. MAPE is kept for
+        # the case it is honest in — no zero actuals anywhere in the backtest — because
+        # a percentage is what a planner reads, and reported either way.
+        any_zero_actual = any(0 in np.asarray(a["act"], dtype=float) for a in pooled.values())
+        if not any_zero_actual and all(s["mape"] is not None for s in scored.values()):
+            metric = "mape"
+        elif all(s["mase"] is not None for s in scored.values()):
+            metric = "mase"
+        else:
+            metric = "rmse"
         # The same admission the folds were judged under, so the winner of the ranking
         # is guaranteed to be among the models refitted to produce the forecast.
         final = self._candidates(series, self.horizon, allow_arima)
@@ -285,6 +379,7 @@ class Forecaster:
         return best, values, scored[best]["rmse"], {
             "_metric": f"backtest:{metric}",
             "mape": scored[best]["mape"],
+            "mase": scored[best]["mase"],
             "rmse": scored[best]["rmse"],
             "vs_naive": (None if not naive else round(scored[best][metric] / naive, 3)),
         }
@@ -426,6 +521,90 @@ class Forecaster:
         fc = np.full(horizon, max(0.0, per_period_forecast))
         rmse = float(np.sqrt(np.mean(np.array(residuals) ** 2))) if residuals else float(series.std())
         return "Croston", fc, rmse
+
+    # ── Intermittent that may have stopped: TSB ───────────────────────────────
+
+    def _tsb(self, series: pd.Series, horizon: int = None):
+        """
+        Teunter–Syntetos–Babai: Croston's split, with the probability updated every
+        period instead of only when an order arrives.
+
+        Croston updates its interval estimate at demand epochs only, and measures the
+        gaps *between* orders — never the gap between the last order and today. So an
+        item that ordered monthly for six months and has ordered nothing in the
+        eighteen since carries an interval of 1.0 forever, and is forecast at its old
+        rate indefinitely. Nothing in the method can express "this has stopped",
+        because the only evidence that it stopped is the run of zeros it never reads.
+
+        TSB reads them. `p` — the probability a period carries demand — decays by
+        `(1-beta)` on every zero period, so the forecast `p·z` falls away on its own as
+        an item goes quiet, and recovers when it orders again. The magnitude estimate
+        `z` still updates only on demand epochs, because a period with no order carries
+        no information about how big the next one will be.
+        """
+        horizon = self.horizon if horizon is None else horizon
+        alpha = 0.2   # magnitude smoothing
+        beta = 0.2    # probability smoothing
+
+        values = series.values.astype(float)
+        nonzero = np.flatnonzero(values > 0)
+        if len(nonzero) == 0:
+            avg = float(series.mean())
+            return "TSB", np.full(horizon, avg), float(series.std())
+
+        # Initialised from what was observed, for the same reason Croston's is: an
+        # estimate that starts at a guess and moves 20% of the way per period survives
+        # for as long as the history is short, and short history is the case.
+        z_hat = float(values[nonzero].mean())
+        p_hat = float(len(nonzero) / len(values))
+
+        residuals = []
+        for t in range(int(nonzero[0]) + 1, len(values)):
+            forecast_t = p_hat * z_hat
+            if values[t] > 0:
+                z_hat = alpha * values[t] + (1 - alpha) * z_hat
+                p_hat = beta * 1.0 + (1 - beta) * p_hat
+                residuals.append(values[t] - forecast_t)
+            else:
+                p_hat = (1 - beta) * p_hat
+
+        fc = np.full(horizon, max(0.0, p_hat * z_hat))
+        rmse = (float(np.sqrt(np.mean(np.array(residuals) ** 2))) if residuals
+                else float(series.std()))
+        return "TSB", fc, rmse
+
+    @staticmethod
+    def _demand_shape(series: pd.Series) -> dict:
+        """
+        The lump behind the rate: how big an order is, and how often one arrives.
+
+        Every method in the pool answers with a per-period rate, because that is what
+        safety stock and the projection integrate. For an item that orders 100 once a
+        quarter the rate is 33 a month, and it is the right number to carry into σDL —
+        but read as a plan it says demand arrives every month, which is the one thing
+        known not to happen. The S&OP sheet shows it to a planner who can see that it
+        is wrong, and a projection built on it draws a smooth ramp where the real
+        position is a sawtooth, hiding the month the stock actually runs out.
+
+        So the shape travels beside the rate rather than replacing it: `ẑ` is what
+        arrives when something arrives, and the interval is how many periods apart. On
+        a smooth item the interval is 1 and the two descriptions coincide.
+        """
+        values = series.values.astype(float)
+        nonzero = np.flatnonzero(values > 0)
+        if len(nonzero) == 0:
+            return {"expected_order_size": 0.0, "expected_interval": None}
+        size = float(values[nonzero].mean())
+        # Intervals between orders, plus the run of zeros since the last one — a gap
+        # still open is evidence about the rhythm too, and it is the only evidence that
+        # an item has gone quiet.
+        gaps = list(np.diff(nonzero))
+        trailing = len(values) - 1 - int(nonzero[-1])
+        if trailing > 0:
+            gaps.append(trailing)
+        interval = float(np.mean(gaps)) if gaps else float(len(values))
+        return {"expected_order_size": round(size, 1),
+                "expected_interval": round(max(1.0, interval), 2)}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

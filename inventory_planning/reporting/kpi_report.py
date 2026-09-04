@@ -1455,7 +1455,7 @@ class KPIReport:
              ("net_requirement", "Net requirement", "num0")],
             note="Ranked by the money the action moves, not by urgency alone — the "
                  "shortest cover on a cheap part is rarely the first call to make. "
-                 "Items already in balance are held, and are in the recommendations CSV "
+                 "Items already in balance are held, and are on the workbook's Purchase sheet "
                  "rather than here.",
             empty="Nothing to change.",
         )

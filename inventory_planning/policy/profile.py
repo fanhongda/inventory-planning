@@ -134,7 +134,7 @@ class PolicyProfile:
                     f" — {row.get('policy_implied_because', '')}"
                 )
             if len(disagree) > 3:
-                lines.append(f"      +{len(disagree) - 3} more in the profile CSV")
+                lines.append(f"      +{len(disagree) - 3} more on the Parameters sheet")
         return "\n".join(lines)
 
 

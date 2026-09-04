@@ -693,8 +693,12 @@ class Forecaster:
         if forecast_detail is None or forecast_detail.empty:
             return pd.DataFrame()
 
-        meta_cols = ["model_used", "selected_by", "backtest_mape", "backtest_rmse",
-                     "vs_naive", "forecast_rmse"]
+        meta_cols = ["model_used", "selected_by", "backtest_mape", "backtest_mase",
+                     "backtest_rmse", "vs_naive", "forecast_rmse",
+                     # The lump behind the rate. A reader checking whether a forecast is
+                     # sane needs to know that the flat 33 a month is one order of 100 a
+                     # quarter, and the row is where that judgement is being made.
+                     "expected_order_size", "expected_interval"]
         meta = (forecast_detail[forecast_detail["is_next_period"]]
                 .set_index("sku")
                 .reindex(columns=[c for c in meta_cols if c in forecast_detail.columns]))

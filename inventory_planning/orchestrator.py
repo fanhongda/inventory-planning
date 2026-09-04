@@ -282,18 +282,9 @@ class InventoryPlanner:
         print()
         print(suggestions.summary())
         stamp = self.run.run_id
-        csv_path = suggestions.to_csv(self.output_dir / f"parameter_suggestions_{stamp}.csv")
         md_path = self.output_dir / f"suggested_rules_{stamp}.md"
         suggestions.to_rules_markdown(md_path)
-        print(f"\n    Per-SKU suggestions : {csv_path}")
-        print(f"    Paste-able rules    : {md_path}")
-
-        if len(health.by_family):
-            write_csv(health.by_family, self.output_dir / f"dioh_by_family_{stamp}.csv")
-        if len(health.slow_moving):
-            write_csv(health.slow_moving, self.output_dir / f"slow_moving_{stamp}.csv")
-        if len(health.long_aging):
-            write_csv(health.long_aging, self.output_dir / f"long_aging_{stamp}.csv")
+        print(f"\n    Paste-able rules    : {md_path}")
 
         if len(crosscheck.all_disagreements):
             xc_path = self.output_dir / f"source_crosscheck_{stamp}.csv"
@@ -329,6 +320,12 @@ class InventoryPlanner:
             print()
             print(frontier.summary())
             out["frontier"] = frontier
+
+        # Rewritten now that the policy stage has produced the half of the workbook the
+        # planning stage could not: should-be, the suggestions, the S&IOP projection.
+        workbook = self._save_workbook(results, out)
+        if workbook is not None:
+            print(f"\n    Planning workbook   : {workbook}")
 
         self._quality_log.append({
             "doc_type": "policy",
@@ -1218,39 +1215,45 @@ class InventoryPlanner:
             as_of=as_of,
         )
 
+    def _save_workbook(self, results: dict, policy: dict = None):
+        """
+        The run as one file. Never allowed to fail the run it reports on.
+
+        Called twice — once with what planning produced, once with the policy stage's
+        additions on top — because a run that stops at the gate in between should still
+        leave something readable rather than a folder of nothing.
+        """
+        from .reporting.workbook import build_workbook
+
+        path = self.output_dir / f"planning_{self.run.run_id}.xlsx"
+        try:
+            written = build_workbook(
+                path, results, policy,
+                currency=str(getattr(self._fx, "reporting_currency", "USD") or "USD"))
+        except Exception as e:                     # pragma: no cover - reported, not raised
+            print(f"  Warning: workbook not written ({e})")
+            return None
+        if written is not None:
+            self.run.record_output(written)
+        return written
+
     def _save_outputs(self, results: dict) -> None:
         ts_str = self.run.run_id
         out = self.output_dir
 
-        # ── CSV outputs ───────────────────────────────────────────────────────
-        write_csv(results["supplier_lt"], out / "supplier_params.csv")
-        write_csv(results["classified_demand"], out / "sku_planning_params.csv")
-        write_csv(results["projection"], out / f"inventory_projection_{ts_str}.csv")
-        write_csv(results["forecast_detail"], out / f"forecast_detail_{ts_str}.csv")
-        sheet = self.forecaster.history_and_forecast(
+        # ── The workbook ──────────────────────────────────────────────────────
+        #
+        # Sixteen CSVs named for the stage that produced them, where the question a
+        # planner arrives with is answered by joining four of them. Written here with
+        # whatever the planning stage has, and again by the policy stage with the rest —
+        # same path, so a run that stops early still leaves a readable file.
+        results["forecast_sheet"] = self.forecaster.history_and_forecast(
             results["time_series"], results["forecast_detail"])
-        if len(sheet):
-            write_csv(sheet, out / f"forecast_{ts_str}.csv")
+        self._save_workbook(results)
 
-        # The review sheet, in the format the reviewer opens it in. CSV as well as
-        # xlsx: the xlsx is what goes to sales, and the CSV is what survives being
-        # read back by anything else.
-        accuracy = results.get("forecast_accuracy")
-        if accuracy is not None:
-            if len(accuracy.by_sku):
-                write_csv(accuracy.by_sku, out / f"forecast_bias_by_sku_{ts_str}.csv")
-            if len(accuracy.by_family):
-                write_csv(accuracy.by_family,
-                          out / f"forecast_bias_by_family_{ts_str}.csv")
-            if len(accuracy.adjustments):
-                write_csv(accuracy.adjustments,
-                          out / f"sales_review_adjustments_{ts_str}.csv")
-
-        siop = results.get("siop")
-        if siop is not None and len(siop.by_period):
-            write_csv(siop.by_period, out / f"siop_by_period_{ts_str}.csv")
-            if len(siop.by_family):
-                write_csv(siop.by_family, out / f"siop_by_family_{ts_str}.csv")
+        # Kept as its own CSV: SKU x supplier, which no per-SKU sheet can hold without
+        # either dropping a supplier or repeating an item.
+        write_csv(results["supplier_lt"], out / "supplier_params.csv")
 
         sop = results.get("sop")
         if sop is not None and len(sop.sheet):
@@ -1261,15 +1264,6 @@ class InventoryPlanner:
                 self.run.record_output(xlsx, rows=len(sop.sheet))
             except Exception as e:
                 print(f"  Warning: S&OP workbook not written ({e})")
-        write_csv(results["recommendations"], out / f"purchase_recommendations_{ts_str}.csv")
-
-        profile = results.get("policy_profile")
-        if profile is not None and len(profile.frame):
-            write_csv(profile.frame, out / f"policy_profile_{ts_str}.csv")
-
-        realization = results.get("backlog_realization")
-        if realization is not None and len(realization.per_sku):
-            write_csv(realization.per_sku, out / f"backlog_realization_{ts_str}.csv")
 
         # What each checkpoint found, including the ones that passed. Written every run
         # rather than only on failure: "the gates found nothing" is a statement about
@@ -1441,7 +1435,7 @@ class InventoryPlanner:
                 print(f"    {str(r['sku']):<14} {r['on_hand_cover_days']:>6.1f}d on the shelf, "
                       f"bare for {r['supply_gap_days']:>5.1f}d — {nxt}{late}")
             if len(gap) > 10:
-                print(f"    … and {len(gap) - 10} more, in the recommendations CSV")
+                print(f"    … and {len(gap) - 10} more, on the Purchase sheet")
 
         purchase_skus = recommendations[recommendations["recommended_action"] == "PURCHASE-REQUEST"]
         if len(purchase_skus):

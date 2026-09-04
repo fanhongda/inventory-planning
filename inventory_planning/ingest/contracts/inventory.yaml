@@ -127,8 +127,17 @@ fields:
     unit: currency
     role: measure
     description: Extended stock value
+    # The `unrestricted` spellings are MB52's, and they are the ones that matter: the
+    # quantity side already reads `Unrestricted`, so a stock export whose value column
+    # is `Value Unrestricted` mapped its quantity and dropped its money. `unit_cost` is
+    # derived from this field, so losing it does not leave a blank column — it leaves
+    # every SKU unpriced, and the value totals silently cover a different population
+    # from the quantity ones.
     aliases: [inventory value, stock value, total value, extended value, value,
-              amount, valuation, book value]
+              amount, valuation, book value,
+              value unrestricted, unrestricted value, val unrestricted,
+              value unrestricted use, unrestricted stock value,
+              value of unrestricted stock, total stock value]
 
   currency:
     type: string

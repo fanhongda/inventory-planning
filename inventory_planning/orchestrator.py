@@ -251,7 +251,8 @@ class InventoryPlanner:
             )
 
         calculator = ShouldBeCalculator(self.config_dir)
-        should_be = calculator.calculate(resolved, actual=inventory_df)
+        should_be = calculator.calculate(resolved, actual=inventory_df,
+                                         committed=results.get("mto_schedule"))
         print()
         print(should_be.summary())
 
@@ -1056,6 +1057,12 @@ class InventoryPlanner:
             "crosscheck": crosscheck,
             "policy_profile": profile,
             "backlog_realization": realization,
+            # Carried so the policy layer sizes an order-on-demand item against the same
+            # commitment the recommender buys for. Rebuilding it there would give the
+            # two stages their own copy of one number, and the first time they drifted
+            # the report would call excess the stock the recommendation had just asked
+            # for.
+            "mto_schedule": mto_schedule,
             "sop": sop,
             "siop": siop,
             "forecast_accuracy": accuracy,

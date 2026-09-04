@@ -47,6 +47,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 DECLARATIONS_NAME = "declarations.yaml"
 
+# Declarations written by a program rather than typed by a person go here, one file
+# each. Not appended to `declarations.yaml`: that file is a hand-authored template whose
+# comments carry most of its value, and no round-trip through a YAML dumper preserves
+# them. Separate files also keep the two authorships legible in a diff — a correction
+# made through an interface and one reasoned out in an editor are both reviewable, and
+# it is worth being able to see which is which.
+DECLARATIONS_DIRNAME = "declarations.d"
+
 SCOPE_MAPPING = "mapping"
 SCOPE_IDENTITY = "identity"
 SCOPE_VALUE = "value"
@@ -166,10 +174,24 @@ class Declarations:
         """
         if config_dir is None:
             config_dir = Path(__file__).parents[2] / "config"
-        target = Path(config_dir) / DECLARATIONS_NAME
-        if not target.exists():
+        config_dir = Path(config_dir)
+        target = config_dir / DECLARATIONS_NAME
+        extra = sorted((config_dir / DECLARATIONS_DIRNAME).glob("*.yaml"))
+        if not target.exists() and not extra:
             return cls(source=target, today=today)
 
+        overrides: List[Override] = []
+        waivers: List[GateWaiver] = []
+        for path in ([target] if target.exists() else []) + extra:
+            raw = cls._read(path)
+            overrides.extend(cls._parse_override(item, path, i)
+                             for i, item in enumerate(raw.get("overrides") or []))
+            waivers.extend(cls._parse_waiver(item, path, i)
+                           for i, item in enumerate(raw.get("gate_waivers") or []))
+        return cls(overrides=overrides, waivers=waivers, source=target, today=today)
+
+    @staticmethod
+    def _read(target: Path) -> Dict[str, Any]:
         import yaml
         try:
             raw = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
@@ -177,14 +199,54 @@ class Declarations:
             raise DeclarationError(f"{target} is not valid YAML: {exc}") from exc
         if not isinstance(raw, dict):
             raise DeclarationError(f"{target} must be a mapping, not {type(raw).__name__}")
+        return raw
 
-        return cls(
-            overrides=[cls._parse_override(item, target, i)
-                       for i, item in enumerate(raw.get("overrides") or [])],
-            waivers=[cls._parse_waiver(item, target, i)
-                     for i, item in enumerate(raw.get("gate_waivers") or [])],
-            source=target, today=today,
-        )
+    @staticmethod
+    def write_override(override: "Override", config_dir=None) -> Path:
+        """
+        Persist one override as its own file, and return where it went.
+
+        This is the whole of what an interface may write. It is the same statement, in
+        the same syntax, in the same directory as a hand-written one, so a correction
+        made by clicking and one made by typing are indistinguishable to every later
+        run — which is the property that keeps a headless run reproducing a UI run.
+
+        `reason` and `by` are required here though the parser tolerates their absence.
+        A declaration typed into the template file sits under a comment explaining
+        itself; one written by a program has only these two fields to say who asserted
+        this and why, and an unattributed assertion is the thing this layer exists to
+        replace.
+        """
+        if not str(override.reason or "").strip():
+            raise DeclarationError(
+                "an override written through an interface must carry a reason — it is "
+                "the only account of why the pipeline was overruled")
+        if not str(override.by or "").strip():
+            raise DeclarationError(
+                "an override written through an interface must name who asserted it")
+
+        import yaml
+        if config_dir is None:
+            config_dir = Path(__file__).parents[2] / "config"
+        target_dir = Path(config_dir) / DECLARATIONS_DIRNAME
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in override.field)
+        path = target_dir / f"{stamp}-{override.scope}-{safe}.yaml"
+        body = {"version": 1, "overrides": [{
+            "scope": override.scope,
+            "target": dict(override.target),
+            "field": override.field,
+            "value": override.value,
+            "reason": " ".join(str(override.reason).split()),
+            "by": override.by,
+            "at": (override.at or date.today()).isoformat(),
+            **({"expires": override.expires.isoformat()} if override.expires else {}),
+        }]}
+        path.write_text(yaml.safe_dump(body, sort_keys=False, allow_unicode=True),
+                        encoding="utf-8")
+        return path
 
     @staticmethod
     def _parse_override(item: Dict[str, Any], target: Path, index: int) -> Override:

@@ -23,12 +23,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-cov", "pyarrow>=14"]
+dev = ["pytest>=7", "pytest-cov", "pyarrow>=14", "fastapi>=0.110",
+       "httpx>=0.27", "python-multipart>=0.0.9"]
 # The fact store writes parquet rather than CSV because it sits exactly where the type
 # damage happens — a CSV round trip turns `000000000000123456` back into 123456. Kept
 # optional so a planning-only install stays small; without it the store declines to
 # write and says so, and the run still produces a plan.
 store = ["pyarrow>=14"]
+# The HTTP surface. Optional because the planning pipeline does not depend on it and a
+# planner installing this to produce a workbook should not be made to carry a web
+# framework. `httpx` is FastAPI's test client, not a runtime dependency of the app.
+api = ["fastapi>=0.110", "uvicorn>=0.27", "python-multipart>=0.0.9", "pyarrow>=14"]
 
 [project.scripts]
 inventory-plan = "inventory_planning.cli:main"

@@ -127,6 +127,17 @@ class BatchLedger:
             out.append(entry)
         return out
 
+    def voided(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Every withdrawal, by batch id.
+
+        Separate from `batches()` because a batch can be voided without ever having had
+        a fact record: a load withdrawn while it is still only landed leaves a void and
+        nothing for it to hide, and asking `batches()` about it answers about the wrong
+        thing.
+        """
+        return {e["batch_id"]: e for e in self._lines() if e.get("op") == "void"}
+
     def void(self, batch_id: str, reason: str = "", by: str = "") -> VoidRecord:
         record = VoidRecord(
             batch_id=batch_id,

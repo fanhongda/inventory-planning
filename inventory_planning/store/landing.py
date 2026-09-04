@@ -270,6 +270,33 @@ class LandingStore:
 
     # ── Reading ──────────────────────────────────────────────────────────────
 
+    def batches(self, doc_type: str = None) -> List[Dict[str, Any]]:
+        """
+        Every landed batch under this root, newest first.
+
+        The header map is the record — it carries the batch id, the doc type it was
+        landed under, the source file and the columns as they were spelled — so listing
+        is a glob over those rather than a second index that could disagree with them.
+        """
+        pattern = f"{doc_type or '*'}/*.headers.json"
+        out: List[Dict[str, Any]] = []
+        for path in self.raw_dir.glob(pattern):
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                # A half-written record is not a reason to refuse the listing. It is
+                # reported by its absence from a list the caller can compare against
+                # the directory, which is more use than an exception here.
+                continue
+        return sorted(out, key=lambda r: str(r.get("landed_at", "")), reverse=True)
+
+    def find(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        """One landed batch by id, without the caller having to know its doc type."""
+        for record in self.batches():
+            if record.get("batch_id") == batch_id:
+                return record
+        return None
+
     def header_map(self, doc_type: str, batch_id: str) -> Optional[Dict[str, Any]]:
         target = self.header_path(doc_type, batch_id)
         if not target.exists():

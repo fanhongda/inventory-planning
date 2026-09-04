@@ -297,3 +297,77 @@ class TestTheSummaryIsTheQuestionAReaderCanAnswer:
         assert body["confidence_basis"] == "classification"
         assert body["stated"] is False
         assert body["confidence"] < 1.0
+
+
+class TestTheChecklistOfWhatIsStillMissing:
+
+    def test_an_empty_store_lists_everything_as_outstanding(self, client):
+        body = client.get("/requirements").json()
+        assert body["can_run"] is False
+        assert {"demand_signal", "position_signal"} <= set(body["missing_required"])
+        required = [d for d in body["documents"] if d["required"]]
+        assert required, "a run has required documents"
+        for doc in required:
+            assert doc["landed"] is None
+            assert all(f["present"] is False for f in doc["fields"])
+            assert doc["fields"], f"{doc['doc_type']} should name its core fields"
+
+    def test_an_upload_ticks_its_document_and_its_fields(self, client):
+        _upload(client)
+        body = client.get("/requirements").json()
+        assert "position_signal" not in body["missing_required"]
+        inventory = [d for d in body["documents"] if d["doc_type"] == "inventory"][0]
+        assert inventory["landed"]["rows"] == 10
+        assert {f["field"] for f in inventory["fields"]} == {"sku", "qty_on_hand"}
+        assert all(f["present"] for f in inventory["fields"])
+
+    def test_alternatives_are_reported_as_alternatives_not_as_two_gaps(self, client):
+        """
+        `item_dimension` takes either master. Listing both as missing would ask for a
+        file the run does not need.
+        """
+        with open("sample_data/item_master.csv", "rb") as fh:
+            client.post("/uploads",
+                        files={"file": ("item_master.csv", fh.read(), "text/csv")})
+        body = client.get("/requirements").json()
+        assert "item_dimension" not in body["missing_required"]
+        item_dimension = [c for c in body["capabilities"]
+                          if c["name"] == "item_dimension"][0]
+        assert item_dimension["satisfied"] is True
+        assert len(item_dimension["suppliers"]) > 1
+
+    def test_it_is_recomputed_from_the_store_not_accumulated(self, client):
+        """
+        A checklist that remembers what it was told drifts from the store the moment a
+        batch is voided — and being a checklist, a person trusts it over the store.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        assert "position_signal" not in client.get("/requirements").json()["missing_required"]
+
+        client.post(f"/batches/{batch_id}/void",
+                    json={"reason": "wrong month", "by": "jfanhon"})
+        body = client.get("/requirements").json()
+        assert "position_signal" in body["missing_required"]
+        assert [d for d in body["documents"]
+                if d["doc_type"] == "inventory"][0]["landed"] is None
+
+    def test_a_document_that_cannot_back_what_it_declares_says_which(self, client,
+                                                                     tmp_path):
+        """
+        A purchase history with no goods-receipt date is a real record of ordering
+        behaviour and no record of lead time at all. The checklist has to show the
+        capability as still outstanding, or the item-master fallback looks unnecessary.
+        """
+        path = tmp_path / "po_history.csv"
+        path.write_text(
+            "PO Number,Line,Item Code,PO Qty,PO Date,Unit Price\n"
+            "PO-1,10,SKU-001,100,2024-01-05,12.5\n"
+            "PO-2,10,SKU-002,50,2024-02-05,8.0\n", encoding="utf-8")
+        with open(path, "rb") as fh:
+            client.post("/uploads", files={"file": (path.name, fh.read(), "text/csv")})
+
+        lead_time = [c for c in client.get("/requirements").json()["capabilities"]
+                     if c["name"] == "lead_time_signal"][0]
+        assert lead_time["satisfied"] is False
+        assert "po_history" in lead_time["withheld_by"]
+        assert lead_time["fallback"]

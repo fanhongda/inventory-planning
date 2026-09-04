@@ -60,6 +60,36 @@ def _same_layout(a: "LoadedDocument", b: "LoadedDocument") -> bool:
     return overlap >= _PARTITION_HEADER_SIMILARITY
 
 
+def unsupplied_capabilities(frame: pd.DataFrame, contract) -> set:
+    """
+    Capabilities the contract declares but this particular extract cannot back.
+
+    The contract says what a document type *can* provide; only the frame says what
+    arrived. An SAP purchase-record export with no goods-receipt date declares
+    `lead_time_signal` by virtue of being a po_history, and has not one lead time in it.
+    Left unchecked the plan reports the capability satisfied, the analytics find
+    nothing, and the item-master fallback that should have covered for it is never
+    consulted.
+
+    Module level rather than a method, because "what can this document actually supply"
+    is asked by anything showing a person what is still missing, not only by the loader
+    assembling a run.
+    """
+    if not contract.capability_requires:
+        return set()
+
+    missing = set()
+    for capability, needed in contract.capability_requires.items():
+        if capability not in contract.capabilities:
+            continue
+        has_data = any(
+            field in frame.columns and frame[field].notna().any() for field in needed
+        )
+        if not has_data:
+            missing.add(capability)
+    return missing
+
+
 def is_tabular(df: pd.DataFrame) -> Tuple[bool, str]:
     """
     Whether a sheet is a data table at all.
@@ -891,31 +921,7 @@ class Intake:
         )
 
     def _unsupplied_capabilities(self, doc: LoadedDocument, doc_type: str) -> set:
-        """
-        Capabilities the contract declares but this particular extract cannot back.
-
-        The contract says what a document type *can* provide; only the frame says what
-        arrived. An SAP purchase-record export with no goods-receipt date declares
-        `lead_time_signal` by virtue of being a po_history, and has not one lead time
-        in it. Left unchecked the plan reports the capability satisfied, the analytics
-        find nothing, and the item-master fallback that should have covered for it is
-        never consulted.
-        """
-        contract = self.contracts.get(doc_type)
-        if not contract.capability_requires:
-            return set()
-
-        missing = set()
-        for capability, needed in contract.capability_requires.items():
-            if capability not in contract.capabilities:
-                continue
-            has_data = any(
-                field in doc.frame.columns and doc.frame[field].notna().any()
-                for field in needed
-            )
-            if not has_data:
-                missing.add(capability)
-        return missing
+        return unsupplied_capabilities(doc.frame, self.contracts.get(doc_type))
 
     # ── Reconciling several claims on one document type ──────────────────────
 

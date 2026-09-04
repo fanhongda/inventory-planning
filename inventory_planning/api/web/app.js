@@ -48,6 +48,14 @@ const num = (v, digits = 0) =>
                                           maximumFractionDigits: digits });
 const pct = (v) => `${Math.round((v ?? 0) * 100)}%`;
 
+// Contract descriptions are written for someone reading the YAML and run to a
+// paragraph. The first sentence is the label; the rest belongs in a tooltip, not in a
+// checklist row where it buries the thing being checked.
+const firstSentence = (text, cap = 96) => {
+  const one = String(text || "").replace(/\s+/g, " ").split(/(?<=[.。])\s/)[0].trim();
+  return one.length > cap ? `${one.slice(0, cap - 1)}…` : one;
+};
+
 async function api(path, options) {
   const response = await fetch(path, options);
   const body = await response.json().catch(() => ({}));
@@ -56,6 +64,83 @@ async function api(path, options) {
 }
 
 // ── Panels ──────────────────────────────────────────────────────────────────
+
+// What a run still needs, and what has arrived. Standing on the page from the first
+// load rather than appearing after an upload: the question "what else do you want from
+// me" is the one a person has before they have uploaded anything, and answering it only
+// afterwards is answering it too late.
+//
+// Capability-shaped underneath, document-shaped on the surface. The pipeline requires a
+// demand signal; the person has files. Where two documents can satisfy one requirement
+// they are shown as the alternatives they are, rather than as two missing items.
+function requirementsCard(req) {
+  const satisfiedBy = {};       // doc_type -> the sibling that already covers it
+  const alternatives = {};      // doc_type -> other doc_types for the same requirement
+  for (const cap of req.capabilities) {
+    if (!cap.required || cap.suppliers.length < 2) continue;
+    for (const doc of cap.suppliers) {
+      alternatives[doc] = cap.suppliers.filter((d) => d !== doc);
+      if (cap.satisfied && cap.supplied_by !== doc) satisfiedBy[doc] = cap.supplied_by;
+    }
+  }
+
+  const state = (doc) => {
+    if (doc.landed) {
+      return doc.fields.every((f) => f.present)
+        ? { mark: "✓", cls: "ok", note: `${num(doc.landed.rows)} 行 · ${doc.landed.source_name}` }
+        : { mark: "!", cls: "part",
+            note: `${num(doc.landed.rows)} 行，但有必需字段没读到` };
+    }
+    if (satisfiedBy[doc.doc_type]) {
+      return { mark: "–", cls: "spare", note: `不需要了 —— 已由 ${satisfiedBy[doc.doc_type]} 满足` };
+    }
+    return { mark: "○", cls: "todo",
+             note: alternatives[doc.doc_type]
+               ? `还没上传（与 ${alternatives[doc.doc_type].join("、")} 二选一）`
+               : "还没上传" };
+  };
+
+  const line = (doc) => {
+    const st = state(doc);
+    return el("li", { class: `req ${st.cls}` },
+      el("span", { class: "mark" }, st.mark),
+      el("div", {},
+        el("div", { class: "name" }, el("code", {}, doc.doc_type),
+           el("span", { class: "desc", title: doc.description || "" },
+              firstSentence(doc.description))),
+        el("div", { class: "chips" }, doc.fields.map((f) =>
+          el("span", { class: `chip ${f.present ? "on" : "off"}` },
+             `${f.present ? "✓" : "○"} ${f.field}`))),
+        el("div", { class: "k" }, st.note)));
+  };
+
+  const required = req.documents.filter((d) => d.required);
+  const optional = req.documents.filter((d) => !d.required);
+  const outstanding = req.missing_required.length;
+
+  const optionalBlock = el("div", { hidden: true },
+    el("ul", { class: "reqs" }, optional.map(line)),
+    el("ul", { class: "degrades" },
+      req.degradations.slice(0, 6).map((d) => el("li", {}, d))));
+
+  return el("section", { class: "card" },
+    el("h2", {}, "需要的文件",
+       el("span", { class: outstanding ? "badge todo" : "badge ok" },
+          outstanding ? `还差 ${outstanding} 项` : "齐了")),
+    el("p", { class: "sub" },
+       outstanding
+         ? "灰色的还没上传。上传后打勾，字段也逐个打勾 —— 打不上勾的字段说明这份导出里没有它。"
+         : "必需的信息都齐了。这不代表数字是对的，只代表跑得起来。"),
+    el("ul", { class: "reqs" }, required.map(line)),
+    el("p", {}, el("button", { class: "link", onclick: (e) => {
+      optionalBlock.hidden = !optionalBlock.hidden;
+      e.target.textContent = optionalBlock.hidden
+        ? `其余 ${optional.length} 项是可选的 —— 缺了会降级，看看少了什么`
+        : "收起可选项";
+    } }, `其余 ${optional.length} 项是可选的 —— 缺了会降级，看看少了什么`)),
+    optionalBlock);
+}
+
 
 // The first thing on the page, because it is the only question the reader is qualified
 // to answer without knowing anything about this pipeline.
@@ -296,7 +381,7 @@ async function showBatch(batch, container, openFields = false) {
     api(`/batches/${batch.batch_id}/resolution`),
     api(`/batches/${batch.batch_id}/rows?limit=8`),
   ]);
-  const refresh = () => showBatch(batch, container, true);
+  const refresh = () => { showRequirements(); return showBatch(batch, container, true); };
   const doc = summary.documents[0];
 
   mount(container,
@@ -305,6 +390,15 @@ async function showBatch(batch, container, openFields = false) {
     restingCard(summary.resting_on, batch, refresh),
     fieldsCard(resolution, batch, refresh, openFields),
     rowsCard(rows));
+}
+
+async function showRequirements() {
+  const host = $("#requirements");
+  try {
+    mount(host, requirementsCard(await api("/requirements")));
+  } catch (err) {
+    mount(host, el("p", { class: "status bad" }, String(err.message)));
+  }
 }
 
 async function upload(file) {
@@ -330,11 +424,14 @@ async function upload(file) {
       results.append(section);
       await showBatch(landed, section);
     }
+    await showRequirements();
   } catch (err) {
     status.className = "status bad";
     status.textContent = String(err.message);
   }
 }
+
+showRequirements();
 
 const drop = $("#drop");
 $("#pick").addEventListener("click", () => $("#file").click());

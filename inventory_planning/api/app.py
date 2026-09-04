@@ -307,6 +307,103 @@ def create_app(config_dir=None, store_root=None):
                      for row in window.to_dict(orient="records")],
         }
 
+    @app.get("/requirements")
+    def requirements() -> Dict[str, Any]:
+        """
+        What a run still needs, against everything landed so far.
+
+        Capability-shaped rather than file-shaped, because that is what the pipeline
+        actually requires: a demand signal, supplied by either a pre-aggregated series
+        or a sales history. Listing five filenames would state one of the two answers as
+        though it were the only one, and would go stale the moment a contract gains a
+        supplier.
+
+        Recomputed on every call from the landed batches rather than accumulated as the
+        uploads arrive. A checklist that remembers what it was told, rather than reading
+        what is there, drifts from the store the first time a batch is voided — and it
+        is a checklist, so a person will trust it over the store.
+        """
+        from ..ingest.capabilities import CAPABILITIES, CapabilityResolver
+        from ..ingest.intake import Intake, unsupplied_capabilities
+        from ..resolution import SOURCE_ABSENT, from_document
+
+        declarations = service.declarations()
+        intake = Intake(verbose=False, declarations=declarations)
+
+        documents: Dict[str, str] = {}
+        withheld: Dict[str, Any] = {}
+        landed: Dict[str, Dict[str, Any]] = {}
+        # Newest first, so where two batches claim one document type the later upload is
+        # the one described — the same rule a re-export follows everywhere else.
+        for record in service.landing.batches():
+            doc_type = record.get("doc_type") or ""
+            if doc_type in landed or service.status_of(record["batch_id"]) == "void":
+                continue
+            frame = service.landed_frame(record)
+            doc = intake.load_frame(
+                frame, source_name=record.get("source_name", record["batch_id"]))
+            if doc.doc_type != doc_type:
+                # Re-classified since it landed. Believe the reading, not the folder.
+                doc_type = doc.doc_type
+                if doc_type in landed:
+                    continue
+            resolved = from_document(doc, frame, declarations=declarations)
+            documents[doc_type] = record.get("source_name", record["batch_id"])
+            missing = unsupplied_capabilities(doc.frame, doc.route.contract)
+            if missing:
+                withheld[doc_type] = missing
+            landed[doc_type] = {
+                "batch_id": record["batch_id"],
+                "source_name": record.get("source_name", ""),
+                "rows": record.get("rows", 0),
+                "fields": [
+                    {"field": f.field, "present": f.source != SOURCE_ABSENT and not f.empty,
+                     "source": f.source, "column": f.column}
+                    for f in resolved.fields if f.required
+                ],
+            }
+
+        plan = CapabilityResolver().resolve(documents, withheld=withheld)
+
+        capabilities = []
+        for name, cap in CAPABILITIES.items():
+            entry = plan.resolved.get(name)
+            capabilities.append({
+                "name": name, "description": cap.description,
+                "required": cap.required, "suppliers": list(cap.suppliers),
+                "satisfied": bool(entry and entry.satisfied),
+                "supplied_by": entry.supplied_by if entry and entry.satisfied else None,
+                "withheld_by": sorted(d for d, caps in withheld.items() if name in caps),
+                "fallback": cap.fallback, "degrades": list(cap.degrades),
+            })
+
+        wanted: Dict[str, Dict[str, Any]] = {}
+        for cap in CAPABILITIES.values():
+            for doc_type in cap.suppliers:
+                slot = wanted.setdefault(doc_type, {"doc_type": doc_type,
+                                                    "supplies": [], "required": False})
+                slot["supplies"].append(cap.name)
+                slot["required"] = slot["required"] or cap.required
+
+        for doc_type, slot in wanted.items():
+            contract = service.contracts.get(doc_type)
+            slot["description"] = contract.description
+            got = landed.get(doc_type)
+            slot["landed"] = got
+            slot["fields"] = got["fields"] if got else [
+                {"field": name, "present": False, "source": SOURCE_ABSENT, "column": None}
+                for name, spec in contract.fields.items() if spec.required
+            ]
+
+        return {
+            "can_run": plan.can_run,
+            "missing_required": [c.name for c in plan.missing_required],
+            "degradations": plan.degradations,
+            "capabilities": capabilities,
+            "documents": sorted(wanted.values(),
+                                key=lambda d: (not d["required"], d["doc_type"])),
+        }
+
     @app.get("/batches/{batch_id}/summary")
     def summary(batch_id: str) -> Dict[str, Any]:
         """

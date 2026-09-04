@@ -38,6 +38,16 @@ api = ["fastapi>=0.110", "uvicorn>=0.27", "python-multipart>=0.0.9", "pyarrow>=1
 [project.scripts]
 inventory-plan = "inventory_planning.cli:main"
 
+# Not code, and not optional. The contracts *are* the schema, the adapters are frozen
+# mappings, and the review screen is served from the package — an install that carried
+# only the .py files would import cleanly and then fail to route anything.
+[tool.setuptools.package-data]
+inventory_planning = [
+    "ingest/contracts/*.yaml",
+    "ingest/adapters/**/*.yaml",
+    "api/web/*",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["inventory_planning*"]

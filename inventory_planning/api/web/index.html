@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>导入检查 — 库存计划</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>导入检查</h1>
+  <p class="lede">
+    上传一个导出文件，先看它被读成了什么。<strong>这一步不会进入计划</strong> —— 确认之前，
+    什么都不会被用到。
+  </p>
+</header>
+
+<main>
+  <section id="drop" class="drop">
+    <input type="file" id="file" hidden>
+    <button id="pick" class="primary">选择文件</button>
+    <span class="hint">或把文件拖到这里 · CSV / Excel</span>
+    <p id="status" class="status" hidden></p>
+  </section>
+
+  <div id="results"></div>
+</main>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

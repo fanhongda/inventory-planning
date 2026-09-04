@@ -240,3 +240,60 @@ class TestABlankTemplateSaysWhatIsWrongWithIt:
         detail = response.json()["detail"]
         assert "substitution template with no rows" in detail
         assert "`data` sheet" in detail
+
+
+class TestTheReviewScreenIsServedWithoutShadowingTheApi:
+
+    def test_the_page_and_its_module_load(self, client):
+        assert "导入检查" in client.get("/").text
+        assert client.get("/app.js").status_code == 200
+
+    def test_routes_registered_before_the_mount_still_win(self, client):
+        """
+        Starlette matches in registration order and a mount at "/" swallows everything
+        after it. The mount is added last for that reason, and this is what says so.
+        """
+        assert client.get("/health").json()["ok"] is True
+        assert client.get("/contracts").status_code == 200
+        assert client.get("/facts/inventory").status_code == 501
+
+
+class TestTheSummaryIsTheQuestionAReaderCanAnswer:
+
+    def test_it_carries_the_totals_and_what_they_rest_on(self, client):
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        body = client.get(f"/batches/{batch_id}/summary").json()
+        doc = body["documents"][0]
+        assert doc["doc_type"] == "inventory"
+        assert doc["rows"] == 10 and doc["skus"] == 10
+        totals = {r["column"]: r["total"] for r in doc["readings"] if r["kind"] == "qty"}
+        assert totals["qty_on_hand"] == 2125.0
+        assert body["resting_on"]["resting_on"][0]["field"] == "currency"
+
+    def test_a_declaration_is_attributed_in_the_exposure_list(self, client):
+        """
+        `values_for` reduces an override to its value and drops who asserted it, which
+        rendered on screen as "someone declared".
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        client.post(f"/batches/{batch_id}/declarations",
+                    json={"scope": "value", "field": "currency", "value": "CNY",
+                          "by": "jfanhon", "reason": "plant books in CNY"})
+        resting = client.get(f"/batches/{batch_id}/summary").json()["resting_on"]
+        item = resting["resting_on"][0]
+        assert item["basis"] == "declared"
+        assert item["by"] == "jfanhon"
+        assert item["reason"] == "plant books in CNY"
+
+    def test_re_reading_a_batch_classifies_it_again_rather_than_trusting_the_first_call(
+            self, client):
+        """
+        Handing the landed doc type back as a hint pins the first decision: the
+        classifier never runs again and every re-read reports the type as stated, at a
+        flat 100%, where it should report what it measured.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        body = client.get(f"/batches/{batch_id}/resolution").json()
+        assert body["confidence_basis"] == "classification"
+        assert body["stated"] is False
+        assert body["confidence"] < 1.0

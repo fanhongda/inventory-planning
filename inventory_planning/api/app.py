@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..ingest.contract import default_registry
+from ..ingest.exposure import Assumption, BASIS_ASSUMED, BASIS_DECLARED, measure
 from ..ingest.templates import contract_fingerprint, emit
 from ..resolution import resolve_frame
 from ..store.declarations import (
@@ -306,13 +307,57 @@ def create_app(config_dir=None, store_root=None):
                      for row in window.to_dict(orient="records")],
         }
 
+    @app.get("/batches/{batch_id}/summary")
+    def summary(batch_id: str) -> Dict[str, Any]:
+        """
+        The totals a person would check by hand if they thought to, and what they rest on.
+
+        Served beside the resolution because it is the question the reader is actually
+        qualified to answer. Nobody who runs a warehouse can adjudicate `sku <- Material`
+        against `sku <- PartNo.`; everybody who runs one knows whether the stock is
+        twelve million or eighty-seven.
+        """
+        from ..ingest.intake import Intake
+        from ..reporting.intake_summary import summarise_intake
+
+        record = service.find_batch(batch_id)
+        frame = service.landed_frame(record)
+        declarations = service.declarations()
+        # No `doc_type_hint`. Handing back the doc type the batch was landed under pins
+        # the first decision permanently: the classifier never runs again, a misroute
+        # can never be revised, and — because a hint routes at a flat 1.0 — every
+        # re-read reports its type as stated where it should report what it measured.
+        doc = Intake(verbose=False, declarations=declarations).load_frame(
+            frame, source_name=record.get("source_name", batch_id))
+
+        totals = summarise_intake({doc.doc_type: doc.frame})
+        documents = [
+            {"doc_type": d.doc_type, "rows": d.rows, "skus": d.skus,
+             "implied_unit_value": d.implied_unit_value, "flags": list(d.flags),
+             "readings": [
+                 {"column": r.column, "kind": r.kind, "non_null": r.non_null,
+                  "total": None if r.total != r.total else r.total,
+                  "median": None if r.median != r.median else r.median,
+                  "integer_share": (None if r.integer_share != r.integer_share
+                                    else r.integer_share),
+                  "earliest": str(r.earliest)[:10] if r.earliest is not None else None,
+                  "latest": str(r.latest)[:10] if r.latest is not None else None,
+                  "flags": list(r.flags)}
+                 for r in d.readings]}
+            for d in totals.documents
+        ]
+
+        return {"batch_id": batch_id, "doc_type": doc.doc_type,
+                "documents": documents,
+                "resting_on": _resting(service, doc, declarations).to_dict()}
+
     @app.get("/batches/{batch_id}/resolution")
     def resolution(batch_id: str) -> Dict[str, Any]:
         record = service.find_batch(batch_id)
         frame = service.landed_frame(record)
+        # Deliberately un-hinted; see the note in `summary`.
         resolved = resolve_frame(frame, source_name=record.get("source_name", batch_id),
-                                 declarations=service.declarations(),
-                                 doc_type_hint=record.get("doc_type") or None)
+                                 declarations=service.declarations())
         return resolved.to_dict()
 
     @app.post("/batches/{batch_id}/declarations")
@@ -339,8 +384,7 @@ def create_app(config_dir=None, store_root=None):
 
         frame = service.landed_frame(record)
         before = resolve_frame(frame, source_name=record.get("source_name", batch_id),
-                               declarations=service.declarations(),
-                               doc_type_hint=doc_type or None)
+                               declarations=service.declarations())
 
         # Matched on headers, never on the file: a file is identified by its bytes and
         # next month's export of the same report is different bytes under a different
@@ -359,8 +403,7 @@ def create_app(config_dir=None, store_root=None):
             raise HTTPException(400, str(exc)) from exc
 
         after = resolve_frame(frame, source_name=record.get("source_name", batch_id),
-                              declarations=service.declarations(),
-                              doc_type_hint=doc_type or None)
+                              declarations=service.declarations())
         return {
             "declaration": str(written),
             "changed": _diff(before, after),
@@ -392,7 +435,62 @@ def create_app(config_dir=None, store_root=None):
     def runs():
         raise HTTPException(501, _NOT_YET)
 
+    # Mounted last, and it matters: routes match in registration order and a mount at
+    # "/" swallows everything after it. The screen is a client of this API and nothing
+    # more — no state of its own, no second opinion about a mapping — which is what
+    # makes it replaceable without touching anything above.
+    web = Path(__file__).parent / "web"
+    if web.is_dir():
+        from fastapi.staticfiles import StaticFiles
+        app.mount("/", StaticFiles(directory=web, html=True), name="web")
+
     return app
+
+
+def _reporting_currency(config_dir) -> str:
+    """The currency the run reports in, from the node config the pipeline reads."""
+    import json
+
+    root = Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
+    try:
+        return str(json.loads((root / "node_config.json").read_text(
+            encoding="utf-8")).get("currency") or "USD")
+    except (OSError, ValueError):
+        return "USD"
+
+
+def _resting(service, doc, declarations):
+    """
+    What this document's figures rest on: what a person declared, and what defaulted.
+
+    The defaulted case is read off the resolution rather than re-derived. A document
+    with no currency column is taken by `fx.convert_money` to be in the reporting
+    currency already, and the condition for that is exactly "the field found no column"
+    — which the resolution has already established. Restating the rule here would give
+    the interface its own opinion about when money is being assumed.
+    """
+    from ..resolution import SOURCE_ABSENT, from_document
+
+    reporting = _reporting_currency(service.config_dir)
+    # `overrides_for`, not `values_for`: the second reduces an override to its value and
+    # drops who asserted it and why. An assumption listed without a name beside it is
+    # exactly the unattributed statement this layer exists to replace, and the screen
+    # rendered it as "someone declared".
+    declared = [
+        Assumption(doc_type=doc.doc_type, field=o.field, value=o.value,
+                   basis=BASIS_DECLARED, reason=o.reason, by=o.by)
+        for o in declarations.overrides_for("value", doc_type=doc.doc_type)
+    ]
+    resolved = from_document(doc, doc.frame, declarations=declarations)
+    absent = {f.field for f in resolved.fields if f.source == SOURCE_ABSENT}
+    assumed = ["currency"] if ("currency" in absent
+                               and "currency" in doc.route.contract.fields) else []
+
+    from ..ingest.exposure import assemble
+
+    assumptions = assemble(declared, [doc.doc_type] if assumed else [], reporting)
+    return measure(assumptions, {doc.doc_type: doc.frame},
+                   {doc.doc_type: doc.route.contract}, reporting_currency=reporting)
 
 
 def _diff(before, after) -> List[Dict[str, Any]]:

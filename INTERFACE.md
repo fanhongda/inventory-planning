@@ -318,15 +318,24 @@ front and fill `by:` from the token instead of the config.
 Build the API first regardless of the UI. It is the load-bearing part and it is
 identical under either choice.
 
-**Recommendation: React + TypeScript over HTTP, not Streamlit.** The tempting shortcut
-is Streamlit calling the package directly — a day's work, as DATA_LAYER.md estimated.
-The problem is that it skips the API, and skipping the API is what makes the C/S move
-never happen: the UI logic ends up in Python that runs in the same process as the store,
-and the interface's decisions never become resources. M1 is also a stateful multi-step
-wizard over a wide table, which is where Streamlit's rerun model is least comfortable.
+The argument that decides it is not React versus Streamlit. It is that **the UI must be
+an HTTP client**. The tempting shortcut is Streamlit calling the package directly — a
+day's work, as DATA_LAYER.md estimated — and the problem with it is that it skips the
+API. Skipping the API is what makes the C/S move never happen: the UI logic ends up in
+Python running in the same process as the store, and the interface's decisions never
+become resources.
 
-If a planner needs to see something within a week, a Streamlit page is a legitimate
-throwaway — **provided it talks to the same HTTP API** and is deleted rather than grown.
+**M1 shipped as a no-build ES-module client served by the API itself** — three files
+under `api/web/`, no toolchain, no `node_modules`. This was a change from the React +
+TypeScript recommendation this section originally carried, made once the API existed and
+the screen turned out to be five panels. It keeps every property the recommendation was
+protecting: it talks only to HTTP, holds no state of its own, and has no second opinion
+about a mapping. What it gives up is what React buys at ten times this size, and the cost
+of changing course later is the contents of one directory.
+
+Revisit that when the client grows past one screen with shared state across it — a batch
+list with live status, a policy editor, and the review wizard at once is where hand-rolled
+rendering stops paying.
 
 ---
 

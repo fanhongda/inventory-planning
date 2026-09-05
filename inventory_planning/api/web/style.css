@@ -10,7 +10,8 @@ body {
 }
 header { padding: 32px 28px 12px; max-width: 980px; margin: 0 auto; }
 h1 { font-size: 22px; margin: 0 0 6px; font-weight: 600; }
-.lede { color: var(--muted); margin: 0; max-width: 62ch; }
+.lede { color: var(--muted); margin: 0 0 4px; max-width: 62ch; }
+header { padding-bottom: 6px; }
 main { max-width: 980px; margin: 0 auto; padding: 12px 28px 64px; }
 
 .drop {
@@ -124,3 +125,15 @@ ul.degrades { margin: 10px 0 0 18px; padding: 0; color: var(--muted); font-size:
 .group ul.reqs { margin-left: 27px; }
 .group li.req { border-top: 0; padding: 6px 0; }
 .group li.req .mark { flex: 0 0 18px; width: 18px; height: 18px; line-height: 17px; }
+
+nav#tabs { max-width: 980px; margin: 0 auto; padding: 4px 28px 0; display: flex; gap: 4px; }
+button.tab {
+  border: 1px solid var(--line); border-bottom: 0; background: #f2f0ea;
+  border-radius: 7px 7px 0 0; color: var(--muted); padding: 7px 16px;
+}
+button.tab.on { background: var(--card); color: var(--ink); font-weight: 600; }
+.controls { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-end; }
+.controls label { display: block; font-size: 12px; color: var(--muted); }
+.controls input, .controls select { width: auto; min-width: 150px; }
+.card h3 { font-size: 13px; margin: 16px 0 4px; color: var(--muted); font-weight: 600; }
+form.declare .row2 input { width: 100%; }

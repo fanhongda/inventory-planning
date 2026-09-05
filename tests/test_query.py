@@ -128,6 +128,10 @@ class TestSelectionAndFilters:
         """
         The second timestamp. An extract loaded today may describe last week, and only
         transaction time can answer what was believed before it arrived.
+
+        Rests on the two batches having distinguishable load times, which is why
+        `transaction_time` is recorded to the microsecond: at millisecond resolution
+        this passed alone and failed inside a full run.
         """
         batches = query.select("inventory").batches
         before_second = batches[0]["transaction_time"]

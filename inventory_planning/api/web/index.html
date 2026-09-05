@@ -8,14 +8,17 @@
 </head>
 <body>
 <header>
-  <h1>Import review</h1>
+  <h1>Inventory planning &middot; intake</h1>
+</header>
+
+<nav id="tabs"></nav>
+
+<main>
+<div id="screen-review">
   <p class="lede">
     Upload an export and see what it was read as. <strong>Nothing here enters a
     planning run</strong> — not until you say so.
   </p>
-</header>
-
-<main>
   <section id="drop" class="drop">
     <input type="file" id="file" hidden>
     <button id="pick" class="primary">Choose a file</button>
@@ -25,6 +28,17 @@
 
   <div id="requirements"></div>
   <div id="results"></div>
+</div>
+
+<div id="screen-browse" hidden>
+  <p class="lede">
+    What has been promoted into the store. Facts are appended and never edited: a
+    correction is a new batch or an override, and a withdrawal voids a whole batch.
+  </p>
+  <div id="browse-top"></div>
+  <div id="browse-body"></div>
+  <div id="batch-detail"></div>
+</div>
 </main>
 
 <script type="module" src="/app.js"></script>

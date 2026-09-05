@@ -457,6 +457,29 @@ def create_app(config_dir=None, store_root=None):
                 "documents": documents,
                 "resting_on": _resting(service, doc, declarations).to_dict()}
 
+    @app.get("/batches/{batch_id}/canonical")
+    def canonical(batch_id: str, limit: int = Query(50, ge=1, le=1000),
+                  offset: int = Query(0, ge=0)) -> Dict[str, Any]:
+        """
+        The batch after the adapter has run, in canonical field names.
+
+        Served beside `/rows`, which is the same batch before anything decided what it
+        meant. Reading the two side by side is how a person without the vocabulary to
+        adjudicate a mapping still finds a mis-mapped column: the value is visibly the
+        wrong kind of thing under a name that expects another.
+        """
+        from ..ingest.intake import Intake
+
+        record = service.find_batch(batch_id)
+        frame = service.landed_frame(record)
+        doc = Intake(verbose=False, declarations=service.declarations()).load_frame(
+            frame, source_name=record.get("source_name", batch_id))
+        window = doc.frame.iloc[offset:offset + limit]
+        return {"batch_id": batch_id, "doc_type": doc.doc_type,
+                "total": len(doc.frame), "offset": offset,
+                "columns": [str(c) for c in doc.frame.columns],
+                "rows": _jsonable(window)}
+
     @app.get("/batches/{batch_id}/resolution")
     def resolution(batch_id: str) -> Dict[str, Any]:
         record = service.find_batch(batch_id)

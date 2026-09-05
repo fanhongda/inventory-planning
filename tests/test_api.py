@@ -500,3 +500,56 @@ class TestPromotingAndReadingFacts:
         client.post(f"/batches/{batch_id}/void",
                     json={"reason": "wrong month", "by": "jfanhon"})
         assert self._promote(client, batch_id).status_code == 409
+
+
+class TestOneBatchBeforeAndAfterTheAdapter:
+
+    def test_the_canonical_rows_are_served_beside_the_verbatim_ones(self, client):
+        """
+        Reading the two together is how a person without the vocabulary to adjudicate a
+        mapping still finds a mis-mapped column: the value is visibly the wrong kind of
+        thing under a name that expects another.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        raw = client.get(f"/batches/{batch_id}/rows", params={"limit": 3}).json()
+        canonical = client.get(f"/batches/{batch_id}/canonical",
+                               params={"limit": 3}).json()
+
+        assert canonical["doc_type"] == "inventory"
+        assert canonical["total"] == raw["total"] == 10
+        assert len(canonical["rows"]) == 3
+        # The point of the pairing: the same row under two vocabularies.
+        assert "Item Code" in raw["columns"] and "sku" in canonical["columns"]
+        assert canonical["rows"][0]["sku"] == raw["rows"][0]["Item Code"]
+
+    def test_it_reflects_a_declaration_without_a_re_upload(self, client):
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        assert "location_id" not in client.get(
+            f"/batches/{batch_id}/canonical").json()["columns"]
+
+        client.post(f"/batches/{batch_id}/declarations",
+                    json={"scope": "value", "field": "location_id", "value": "DC-01",
+                          "by": "jfanhon", "reason": "single-plant export"})
+        body = client.get(f"/batches/{batch_id}/canonical").json()
+        assert body["rows"][0]["location_id"] == "DC-01"
+
+    def test_a_missing_batch_is_404(self, client):
+        assert client.get("/batches/nope/canonical").status_code == 404
+
+
+class TestTheClientIsServedAsModules:
+
+    def test_every_module_the_shell_imports_is_there(self, client):
+        """
+        No build step means no bundler to notice a missing file: a bad import path is a
+        blank page at runtime and nothing at test time.
+        """
+        shell = client.get("/app.js")
+        assert shell.status_code == 200
+        for module in ("/ui.js", "/review.js", "/browse.js"):
+            assert module in shell.text
+            assert client.get(module).status_code == 200
+
+    def test_the_page_hosts_both_screens(self, client):
+        page = client.get("/").text
+        assert 'id="screen-review"' in page and 'id="screen-browse"' in page

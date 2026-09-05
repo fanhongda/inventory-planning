@@ -253,10 +253,16 @@ verbs mean something here that is not an `UPDATE`:
 | **Update** | either a re-resolve (mapping changed, same landed bytes) or an override row (`who` / `when` / `why`) — never a fact rewritten |
 | **Delete** | void a batch — appended to the ledger, original rows untouched |
 
-`store/ledger.py` already implements void and `store/fact_store.py` the batch identity,
-so M3 is mostly a read surface over things that exist. What it needs that does not exist
-is P4 — the fact table and the `current` view — since a browse against `ingest_bridge`
-output can only show the newest read, not history.
+Built, on the second screen. Picking a document type gives an as-of date, a named
+reading, a SKU filter, the batches behind the answer with both their timestamps, and any
+one batch shown before and after the adapter — the verbatim rows above, the canonical
+ones below. Voiding is done from there, with the reason and the name it requires.
+
+The one thing it promised and does not do is resolve a *single fact row* back to the
+verbatim row it came from. The batch id is shared between the two layers now, but the
+canonical frame carries no row number, so the pointer `(batch_id, row_no)` is followable
+only at batch granularity. Adding a row number to the canonical frame crosses into the
+contracts and the adapters, and belongs with P5 rather than here.
 
 **Planning and analysis get no UI.** Excel stays the output, as asked. That is a defence
 as much as a preference: the run's five-sheet workbook is what gets handed round a
@@ -449,9 +455,10 @@ needs P4.**
 3. **`inventory_planning/api/`** — the batch and resolution endpoints, over what exists.
 4. **M1** on top of them. Stop here and evaluate: if a planner will not use M1, M2 and
    M3 are not worth building.
-5. **P4 read path — done.** `store/query.py`, `POST /batches/{id}/promote`,
-   `GET /facts/{doc_type}`. Not the second half of P4: the pipeline still reads its
-   files, and swapping `ingest_bridge` over to the store is its own review.
+5. **P4 read path, then M3 — both done.** `store/query.py`,
+   `POST /batches/{id}/promote`, `GET /facts/{doc_type}`, and the stored-facts screen.
+   Not the second half of P4: the pipeline still reads its files, and swapping
+   `ingest_bridge` over to the store is its own review.
 6. **M2**, after the settings it exposes are honoured by the engine — and after
    `/runs/{a}/diff/{b}`, without which it is a form with no feedback.
 

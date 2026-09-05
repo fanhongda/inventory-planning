@@ -268,14 +268,17 @@ class FactStore:
             batch_id=batch_id,
             doc_type=doc_type,
             valid_time=valid,
-            # Milliseconds, unlike every other timestamp in this package. Transaction
+            # Microseconds, unlike every other timestamp in this package. Transaction
             # time is the axis an as-of read filters on — "what did we believe before
-            # this arrived" — and at second resolution two loads in the same second are
-            # one moment, so the question has no answer for exactly the pair of batches
-            # most likely to be a file and its correction. Lexicographic comparison is
-            # unaffected: a second-resolution value written by older code still orders
-            # correctly against a millisecond one.
-            transaction_time=now.isoformat(timespec="milliseconds"),
+            # this arrived" — and two loads sharing a timestamp are one moment, so the
+            # question has no answer for exactly the pair most likely to be a file and
+            # its correction. Seconds collided constantly; milliseconds still collided
+            # under a fast test run, which is a weaker guarantee than it looks because
+            # writes here are sequential and a store has one writer. Microseconds cannot
+            # collide across two writes that each touch the filesystem. Lexicographic
+            # comparison is unaffected: a coarser value written by older code still
+            # orders correctly against a finer one.
+            transaction_time=now.isoformat(timespec="microseconds"),
             rows=len(frame),
             source_name=source_name,
             source_sha=sha,

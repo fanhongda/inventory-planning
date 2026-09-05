@@ -162,11 +162,13 @@ Output files are stamped with the `run_id` rather than the minute. Four independ
 `datetime.now()` calls could disagree within one run, and two runs seconds apart — a
 planner trying a rule change, which is the whole point — overwrote each other's CSVs.
 
-What a planner-facing UI still needs on top of this: somewhere to edit a rule set
-without hand-writing markdown, and a diff view over two `run_id`s — which SKUs changed
-class, what the safety stock total moved by, which recommendations flipped. Neither
-needs new identity work; `policy/parameters.py` already counts per-rule hits and skip
-reasons, and throws them away at the end of the run.
+A UI now exists over this — see [INTERFACE.md](INTERFACE.md) — and the run diff it
+serves answers only *whether* a difference is attributable, not what moved. What it still
+needs, in order: **per-rule hits retained on the manifest** (`policy/parameters.py`
+counts them and throws them away, so the policy screen has to say it cannot show them),
+and then a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the
+safety-stock total moved by, which recommendations flipped. Neither needs new identity
+work.
 
 **Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the
 root (`--store` / `$INVENTORY_PLANNING_STORE` / `$XDG_DATA_HOME` / `~/.local/share`),
@@ -188,12 +190,15 @@ orchestrator resolves it to the store, so the location no longer depends on the 
 `history/` is ignored; they stay on disk because `feedback.loss` reads a snapshot by
 path. The 223 under `output/history/` are untouched and still readable the same way.
 
-**Nothing reads the store yet, deliberately.** That is what makes this safe to merge:
-the pipeline goes on reading its files, and history starts accumulating now because
-history not collected cannot be recovered. What remains of the rollout:
+**The store has a read path; the pipeline is not on it.** `store/query.py` reads across
+batches with both time axes and three named readings, and the interface serves them — but
+planning still reads its files, which is what keeps the rollout safe. What remains:
 
 - **Phase two** — read from the store behind a flag, and compare a run's outputs field
-  by field against the file path.
+  by field against the file path. Two known differences to expect: the canonical frame
+  applies the contract's `default_filters` and the legacy readers do not (200 po_history
+  rows against 198 on the sample), and the per-flag CLI path stores `prepared` frames
+  rather than canonical ones.
 - **Phase three** — flip the default; keep the file path one release longer.
 - **Migration** — a `_schema_version` bump needs somewhere for migrations to live. There
   is a version and a refusal, and no migration path yet; the first bump has to bring
@@ -213,9 +218,10 @@ Two items above depend on master data the coverage worksheet locates: the P0 top
 needs `MARD-INSME` / `SPEME` to tell quarantine from sellable, and the P1 phase-out cap
 needs `MARC-AUSDT` for the end date.
 
-Deliberately not here: a front end (the editable surface is ~46 planner-owned fields and
-adapter review, which YAML in git serves better), and moving the rule engine into the
-database.
+Deliberately not here: moving the rule engine into the database. The front end this
+section used to rule out was built once the reason changed from correctness to planner
+adoption — [INTERFACE.md](INTERFACE.md) carries that decision and its constraint, which
+is unchanged: it writes declarations and overrides, never a fact.
 
 ## Smaller items
 

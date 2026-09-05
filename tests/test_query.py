@@ -7,12 +7,17 @@ purchase order once per load, the inbound quantity comes out multiplied by the n
 times the file was imported, nothing raises, and the number merely looks high.
 """
 
+import json
+
 import pandas as pd
 import pytest
 
 from inventory_planning.store.fact_store import FactStore
+from inventory_planning.store.ledger import (
+    LAYER_CANONICAL, LAYER_PREPARED, LAYER_UNKNOWN,
+)
 from inventory_planning.store.query import (
-    BATCH_COLUMN, VALID_COLUMN, FactQuery, KeyIncomplete,
+    BATCH_COLUMN, VALID_COLUMN, FactQuery, KeyIncomplete, MixedLayers,
 )
 
 pytest.importorskip("duckdb", reason="the read path is an optional extra")
@@ -163,3 +168,59 @@ class TestSchemaDrift:
         frame = query.current("inventory").set_index("sku")
         assert frame.loc["A", "qty_on_hand"] == 15
         assert frame.loc["A", "qty_in_transit"] == 7
+
+
+class TestLayersAreNotBlended:
+    """
+    Two writers put two different things in one store before anyone noticed. The shadow
+    write stored frames the bridge had already converted into the reporting currency;
+    the interface stored the canonical frame the adapter produced. The money columns of
+    the two are not the same measure, and nothing said so.
+    """
+
+    def test_a_batch_records_which_layer_it_holds(self, store, query):
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 1}])
+        assert query.select("inventory").layers == [LAYER_CANONICAL]
+        assert query.select("inventory").mixed is False
+
+    def test_a_batch_written_before_the_distinction_reads_back_as_unknown(self, store,
+                                                                          query):
+        """Not as a guess about what it holds — the store has 389 of these."""
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 1}])
+        lines = store.ledger.path.read_text(encoding="utf-8").splitlines()
+        entry = json.loads(lines[0])
+        del entry["frame_layer"]
+        store.ledger.path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        assert query.select("inventory").layers == [LAYER_UNKNOWN]
+
+    def test_a_reading_across_two_layers_is_refused_with_the_cutoff(self, store, query):
+        store.write_batch(doc_type="inventory",
+                          frame=pd.DataFrame([{"sku": "A", "location_id": "DC-01",
+                                               "qty_on_hand": 10}]),
+                          valid_time="2024-06-01", source_name="june.csv",
+                          source_sha="june", written_by="tests",
+                          frame_layer=LAYER_PREPARED)
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 15}])
+
+        with pytest.raises(MixedLayers) as raised:
+            query.current("inventory")
+        message = str(raised.value)
+        assert "canonical" in message and "prepared" in message
+        assert "2024-07-01" in message          # the cutoff that stays inside one layer
+
+    def test_narrowing_to_one_layer_reads_normally(self, store, query):
+        store.write_batch(doc_type="inventory",
+                          frame=pd.DataFrame([{"sku": "A", "location_id": "DC-01",
+                                               "qty_on_hand": 10}]),
+                          valid_time="2024-06-01", source_name="june.csv",
+                          source_sha="june", written_by="tests",
+                          frame_layer=LAYER_PREPARED)
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 15}])
+
+        older = query.current("inventory", as_of="2024-06-15")
+        assert older["qty_on_hand"].tolist() == [10]
+        assert query.select("inventory", as_of="2024-06-15").layers == [LAYER_PREPARED]

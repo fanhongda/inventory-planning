@@ -51,6 +51,39 @@ So: create is a new batch, read is an as-of query, update is either a new batch 
 override, delete is a batch marked void. What must never exist is an `UPDATE` against
 a fact row.
 
+## Which layer the store holds
+
+Decided 2026-09-05, after finding that two writers were putting two different things in
+it. The shadow write stored the frames `ingest_bridge._prepare` had already worked on —
+money converted into the reporting currency at whatever `fx_rates.json` said that day, a
+location stamped on from `node_config.json`. The interface's promote stored the canonical
+frame the adapter produced. Same store, same document type, money columns that are not
+the same measure, and nothing saying so.
+
+**The store holds the canonical frame.** Storing the prepared one makes the stored number
+depend on two config files: correct a rate and yesterday's fact changes meaning, with no
+record that it did. A fact whose value moves when a config file is edited is not a fact.
+Both the conversion and the stamp are recoverable by replaying them over the canonical
+frame, which is the argument the landing layer already rests on — keep what was read,
+replay what was decided.
+
+This weakens one existing rationale and it is worth saying so. `content_key` includes
+`config_fingerprint` because "the same file read under a different FX table is different
+content and has to be storable alongside". With the canonical frame that is no longer
+true, so the fingerprint is now broader than what actually transforms source into stored
+frame (the contract, the adapter, the declarations). The failure direction is the safe
+one — an FX edit re-stores a file that did not need re-storing, a duplicate rather than a
+corruption — so it is left as it is and noted here rather than narrowed in passing.
+
+Batches say which layer they hold, and old ones say `unknown` rather than being assumed
+into either. A reading refuses to blend layers, naming the cutoff that stays inside one:
+a `prepared` batch and a `canonical` one summed together give a money column that is
+partly converted and partly not, which adds up cleanly and is wrong by whatever the rate
+was. The per-flag CLI path still loads the five core documents through the legacy readers
+and has no canonical frame to offer, so those are written `prepared` — history not
+collected cannot be recovered later, and the mark is what keeps it from being added to
+something it is not.
+
 ## Why bitemporal is the floor, not a refinement
 
 Every batch carries two timestamps, and they are routinely different:

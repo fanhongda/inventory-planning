@@ -28,7 +28,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .ledger import BatchLedger, BatchRecord, STATUS_ACTIVE
+from .ledger import (
+    BatchLedger, BatchRecord, LAYER_CANONICAL, LAYER_PREPARED, LAYER_UNKNOWN,
+    STATUS_ACTIVE,
+)
 from .location import resolve_store_root, warn_if_inside_repo
 
 # Bumped when the on-disk layout changes in a way old code would misread. The check
@@ -203,6 +206,7 @@ class FactStore:
         storable: bool = None,
         written_by: str = "",
         batch_id: str = None,
+        frame_layer: str = LAYER_CANONICAL,
     ) -> Optional[BatchRecord]:
         """
         Append one load. Returns None when these exact bytes are already stored.
@@ -288,6 +292,7 @@ class FactStore:
             key_verdict=key_verdict,
             storable=storable,
             status=STATUS_ACTIVE,
+            frame_layer=frame_layer,
             written_by=written_by,
             path=str(path.relative_to(self.root)),
         )

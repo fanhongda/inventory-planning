@@ -12,7 +12,10 @@ from .identity import (
     AliasVersion, IdentityBuilder, SYSTEM_MATNR, SYSTEM_PARTNO, classify_code,
 )
 from .landing import LandingStore, find_header_row, read_verbatim
-from .ledger import BatchLedger, BatchRecord, STATUS_ACTIVE, STATUS_VOID
+from .ledger import (
+    BatchLedger, BatchRecord, LAYER_CANONICAL, LAYER_PREPARED, LAYER_UNKNOWN,
+    STATUS_ACTIVE, STATUS_VOID,
+)
 from .location import ENV_VAR, default_store_root, resolve_store_root
 
 __all__ = [
@@ -20,5 +23,6 @@ __all__ = [
     "LandingStore", "find_header_row", "read_verbatim",
     "AliasVersion", "IdentityBuilder", "SYSTEM_MATNR", "SYSTEM_PARTNO", "classify_code",
     "BatchLedger", "BatchRecord", "STATUS_ACTIVE", "STATUS_VOID",
+    "LAYER_CANONICAL", "LAYER_PREPARED", "LAYER_UNKNOWN",
     "ENV_VAR", "default_store_root", "resolve_store_root",
 ]

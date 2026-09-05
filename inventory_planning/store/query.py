@@ -64,7 +64,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import pandas as pd
 
 from .fact_store import FactStore, StoreUnavailable
-from .ledger import BatchLedger
+from .ledger import BatchLedger, LAYER_UNKNOWN
 from .location import resolve_store_root
 
 # Columns the reader adds. Named so they cannot collide with a canonical field, and
@@ -80,6 +80,10 @@ class QueryUnavailable(StoreUnavailable):
 
 class KeyIncomplete(ValueError):
     """`current` was asked for on a document whose stored batches lack a key column."""
+
+
+class MixedLayers(ValueError):
+    """A reading would have blended batches holding different layers of the pipeline."""
 
 
 def _connect():
@@ -106,13 +110,23 @@ class Selection:
     def __bool__(self) -> bool:
         return bool(self.batches)
 
+    @property
+    def layers(self) -> List[str]:
+        """Which layers of the pipeline the selected batches hold. See `ledger.LAYER_*`."""
+        return sorted({str(b.get("frame_layer") or LAYER_UNKNOWN) for b in self.batches})
+
+    @property
+    def mixed(self) -> bool:
+        return len(self.layers) > 1
+
     def describe(self) -> str:
         if not self.batches:
             return f"{self.doc_type}: no batch matches"
         first, last = self.batches[0], self.batches[-1]
+        layers = f", {'/'.join(self.layers)}" if self.layers != ["canonical"] else ""
         return (f"{self.doc_type}: {len(self.batches)} batch(es), "
                 f"valid {first['valid_time']} → {last['valid_time']}, "
-                f"{sum(int(b.get('rows') or 0) for b in self.batches):,} rows")
+                f"{sum(int(b.get('rows') or 0) for b in self.batches):,} rows{layers}")
 
 
 class FactQuery:
@@ -253,6 +267,26 @@ class FactQuery:
               limit=None, dedupe=False) -> pd.DataFrame:
         if not selection:
             return pd.DataFrame()
+
+        # Blending layers is the one thing a reading must not do quietly. A `prepared`
+        # batch holds money already converted into the reporting currency and a
+        # `canonical` one holds the source currency; putting them in one frame produces
+        # a column that is partly one and partly the other, sums cleanly, and is wrong
+        # by whatever the rate was. Refusing names the boundary and the cutoff that
+        # stays inside one layer, which is a one-time answer rather than a caveat
+        # carried forever.
+        if selection.mixed:
+            boundary = min(str(b.get("valid_time") or "") for b in selection.batches
+                           if str(b.get("frame_layer") or LAYER_UNKNOWN)
+                           == selection.layers[0])
+            raise MixedLayers(
+                f"{doc_type} has batches from more than one layer of the pipeline "
+                f"({', '.join(selection.layers)}), and their money columns are not the "
+                f"same measure: a `prepared` batch was converted into the reporting "
+                f"currency before it was stored and a `canonical` one was not. Narrow "
+                f"the read to one layer with `as_of` or `known_at` — the earliest "
+                f"{selection.layers[0]} batch describes {boundary} — or void the batches "
+                f"of the layer you are not using.")
 
         paths = [str(self.root / b["path"]) for b in selection.batches]
         # `union_by_name` because an export that gained a column mid-history is the

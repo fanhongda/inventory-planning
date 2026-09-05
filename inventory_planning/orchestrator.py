@@ -572,6 +572,22 @@ class InventoryPlanner:
         whatever it described. Per-document valid times — an inventory snapshot date
         that differs from the sales anchor — belong with the merge interface, which
         needs a reviewed plan in front of a human anyway.
+
+        **What is stored is the canonical frame, not the prepared one.** The frames this
+        method is handed have been through `ingest_bridge._prepare`: money converted into
+        the reporting currency at whatever `config/fx_rates.json` said today, a location
+        stamped on from `node_config.json`. Storing those makes the stored number depend
+        on two config files — correct a rate and yesterday's fact changes meaning, with
+        no record that it did. A fact whose value moves when a config file is edited is
+        not a fact. Both are recoverable from the canonical frame by replaying the
+        conversion, which is the same argument the landing layer rests on: keep what was
+        read, replay what was decided.
+
+        So the canonical frame is preferred wherever intake produced one. The per-flag
+        CLI path loads the five core documents through the legacy readers instead, and
+        there is no canonical frame to prefer — those are still written, marked
+        `prepared`, because history not collected cannot be recovered later. The mark is
+        what stops the two being added together afterwards.
         """
         store = self.store
         if store is None:
@@ -581,10 +597,19 @@ class InventoryPlanner:
                   "batch with a guessed valid_time is worse than no batch")
             return
 
+        from .store.ledger import LAYER_CANONICAL, LAYER_PREPARED
+
         by_source = {i.doc_type: i for i in self.run.inputs}
+        canonical = {dt: doc.frame for dt, doc in self._intake.documents.items()} \
+            if self._intake is not None else {}
         seen_notes = len(store.notes)
         written = 0
-        for doc_type, frame in frames.items():
+        prepared_only = []
+        for doc_type, prepared in frames.items():
+            frame = canonical.get(doc_type, prepared)
+            layer = LAYER_CANONICAL if doc_type in canonical else LAYER_PREPARED
+            if layer == LAYER_PREPARED:
+                prepared_only.append(doc_type)
             if frame is None or not len(frame):
                 continue
             record = by_source.get(doc_type)
@@ -592,6 +617,7 @@ class InventoryPlanner:
                 batch = store.write_batch(
                     doc_type=doc_type,
                     frame=frame,
+                    frame_layer=layer,
                     valid_time=valid_time,
                     source_name=record.name if record else "",
                     source_sha=record.sha256 if record else None,
@@ -608,6 +634,11 @@ class InventoryPlanner:
                 written += 1
         if written:
             print(f"  Retained: {written} batch(es) as of {valid_time} -> {store.root}")
+        if prepared_only:
+            print(f"  Note: {', '.join(sorted(prepared_only))} came from the legacy "
+                  f"readers, so what was retained is the prepared frame — money already "
+                  f"converted, location already stamped. Marked as such; a reading will "
+                  f"not mix it with a canonical batch of the same document.")
         # A run that retained nothing is the normal case for a re-run of the same
         # extract, and saying so is the difference between "already have this" and a
         # store that has quietly stopped working.

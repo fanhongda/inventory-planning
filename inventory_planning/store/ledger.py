@@ -35,6 +35,15 @@ LEDGER_NAME = "batches.jsonl"
 STATUS_ACTIVE = "active"
 STATUS_VOID = "void"
 
+# Which layer of the pipeline a batch's frame came from. Recorded rather than assumed,
+# because two writers put two different things here before anyone noticed: the shadow
+# write stored frames the bridge had already converted into the reporting currency and
+# stamped with a location, while the interface stored the canonical frame the adapter
+# produced. The money columns of the two are not comparable, and nothing said so.
+LAYER_CANONICAL = "canonical"   # straight from the adapter — the frame the contract describes
+LAYER_PREPARED = "prepared"     # after `ingest_bridge._prepare`: money converted, location stamped
+LAYER_UNKNOWN = "unknown"       # written before the distinction was recorded
+
 
 @dataclass
 class BatchRecord:
@@ -62,6 +71,9 @@ class BatchRecord:
     key_verdict: Optional[str] = None
     storable: Optional[bool] = None
     status: str = STATUS_ACTIVE
+    # See LAYER_* above. Absent on batches written before this was recorded, which read
+    # back as `unknown` rather than as a guess about what they hold.
+    frame_layer: str = LAYER_UNKNOWN
     written_by: str = ""
     path: str = ""
     note: str = ""

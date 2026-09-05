@@ -44,7 +44,7 @@ from ..store.declarations import (
     Declarations, DeclarationError, Override, SCOPE_MAPPING, SCOPE_VALUE,
 )
 from ..store.landing import LandingStore
-from ..store.query import FactQuery, KeyIncomplete, QueryUnavailable
+from ..store.query import FactQuery, KeyIncomplete, MixedLayers, QueryUnavailable
 from ..store.ledger import BatchLedger
 
 _NOT_YET = (
@@ -655,7 +655,7 @@ def create_app(config_dir=None, store_root=None):
         try:
             frame = getattr(query, mode)(doc_type, as_of=as_of, known_at=known_at,
                                          where=where or None, limit=limit)
-        except KeyIncomplete as exc:
+        except (KeyIncomplete, MixedLayers) as exc:
             raise HTTPException(422, str(exc)) from exc
         except QueryUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc
@@ -663,6 +663,7 @@ def create_app(config_dir=None, store_root=None):
         body: Dict[str, Any] = {
             "doc_type": doc_type, "mode": mode,
             "as_of": as_of, "known_at": known_at,
+            "layers": selection.layers,
             "batches": [{"batch_id": b["batch_id"], "valid_time": b["valid_time"],
                          "transaction_time": b["transaction_time"], "rows": b["rows"],
                          "source_name": b.get("source_name", "")}

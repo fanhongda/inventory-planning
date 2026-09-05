@@ -215,19 +215,6 @@ class TestWithdrawingABatch:
         assert listed[batch_id]["status"] == "void"
 
 
-class TestWhatIsNotBuiltSaysSo:
-
-    def test_the_run_registry_is_501_naming_what_is_missing_not_an_empty_list(
-            self, client):
-        """
-        An empty list would read as "no runs", which is a different and worse claim
-        than "nothing reads the registry back across runs yet".
-        """
-        response = client.get("/runs")
-        assert response.status_code == 501
-        assert "run registry" in response.json()["detail"]
-
-
 class TestABlankTemplateSaysWhatIsWrongWithIt:
 
     def test_it_names_the_template_and_the_next_action(self, client, tmp_path):
@@ -255,7 +242,7 @@ class TestTheReviewScreenIsServedWithoutShadowingTheApi:
         """
         assert client.get("/health").json()["ok"] is True
         assert client.get("/contracts").status_code == 200
-        assert client.get("/runs").status_code == 501
+        assert client.get("/runs").json()["runs"] == []
 
 
 class TestTheSummaryIsTheQuestionAReaderCanAnswer:
@@ -553,3 +540,121 @@ class TestTheClientIsServedAsModules:
     def test_the_page_hosts_both_screens(self, client):
         page = client.get("/").text
         assert 'id="screen-review"' in page and 'id="screen-browse"' in page
+
+
+class TestPolicyIsShownAndNotEdited:
+
+    @pytest.fixture
+    def client(self, workspace):
+        """
+        The shipped config, copied in. These assertions are about the real parameter
+        file — the rules it declares and the conventions it fixes — so testing against
+        an empty directory would test the 404 and nothing else.
+        """
+        import shutil
+
+        config, store = workspace
+        for name in ("planning_parameters.md", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store))
+
+    def test_the_rules_come_back_with_the_reason_each_one_exists(self, client):
+        body = client.get("/policy").json()
+        assert body["source"].endswith("planning_parameters.md")
+        assert body["rules"], "the shipped parameter file declares rules"
+        for rule in body["rules"]:
+            assert rule["rule_id"] and rule["scope"] and rule["sets"]
+            assert rule["rationale"], "a rule without a rationale cannot be judged later"
+
+    def test_the_conventions_that_change_every_figure_are_shown(self, client):
+        body = client.get("/policy").json()
+        assert "safety_stock_exposure" in body["conventions"]
+        assert "days_per_year" in body["conventions"]
+
+    def test_it_says_hit_counts_are_not_retained_rather_than_showing_none(self, client):
+        """
+        A rule's reach is computed during a run and printed, never stored. Showing an
+        empty count would read as "this rule matched nothing", which is a finding.
+        """
+        body = client.get("/policy").json()
+        assert body["hits"] is None
+        assert "not retained" in body["note"]
+
+    def test_no_endpoint_writes_policy(self, client):
+        for method in ("post", "put", "patch", "delete"):
+            assert getattr(client, method)("/policy").status_code in (404, 405)
+
+    def test_macro_reads_currencies_through_the_fx_table(self, client):
+        """
+        Parsing `fx_rates.json` here reported its top-level keys — `rates`,
+        `reporting_currency` — as currency codes. A second implementation of a read the
+        package already does is the mistake this interface is meant to make impossible.
+        """
+        body = client.get("/policy/macro").json()
+        settings = {s["name"]: s for s in body["settings"]}
+        assert settings["reporting_currency"]["value"] == "USD"
+        assert "USD" in settings["fx_currencies"]["value"]
+        assert "rates" not in settings["fx_currencies"]["value"]
+
+    def test_macro_lists_only_settings_the_engine_reads(self, client):
+        """No working-day switch: the distinction does not exist in the pipeline."""
+        names = {s["name"] for s in client.get("/policy/macro").json()["settings"]}
+        assert "days_per_year" in names
+        assert not {n for n in names if "working" in n or "growth" in n}
+
+
+class TestRunsAndTheirDifferences:
+
+    def _registry(self, tmp_path):
+        from inventory_planning.provenance import RunRegistry
+
+        registry = RunRegistry(tmp_path)
+        registry.dir.mkdir(parents=True, exist_ok=True)
+        return registry
+
+    def _write(self, registry, run_id, *, inputs="I", config="C", policy="P", code="G"):
+        import json
+
+        entry = {"run_id": run_id, "run_at": f"2026-09-05T10:00:0{run_id[-1]}",
+                 "input_fingerprint": inputs, "config_fingerprint": config,
+                 "policy_fingerprint": policy, "git_sha": code}
+        with open(registry.index_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+        (registry.dir / f"{run_id}.json").write_text(json.dumps(entry), encoding="utf-8")
+
+    @pytest.fixture
+    def runs_client(self, workspace, tmp_path):
+        config, store = workspace
+        registry = self._registry(tmp_path / "out")
+        self._write(registry, "run-1")
+        self._write(registry, "run-2", policy="P2")     # parameters only
+        self._write(registry, "run-3", inputs="I2", code="G2")
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    def test_the_registry_is_listed_newest_first(self, runs_client):
+        runs = runs_client.get("/runs").json()["runs"]
+        assert [r["run_id"] for r in runs] == ["run-3", "run-2", "run-1"]
+
+    def test_one_run_comes_back_whole(self, runs_client):
+        assert runs_client.get("/runs/run-1").json()["run_id"] == "run-1"
+        assert runs_client.get("/runs/nope").status_code == 404
+
+    def test_a_parameter_only_difference_is_attributable(self, runs_client):
+        body = runs_client.get("/runs/run-1/diff/run-2").json()
+        assert body["basis"] == "scenario"
+        assert body["moved"] == ["parameters"]
+        assert "attributable to the policy change" in body["describe"]
+
+    def test_two_axes_moving_attributes_nothing(self, runs_client):
+        """
+        The point of recording the basis. A comparison where facts and code both moved
+        cannot be read as a policy result, and saying so is more use than a number.
+        """
+        body = runs_client.get("/runs/run-2/diff/run-3").json()
+        assert body["basis"] == "mixed"
+        assert set(body["moved"]) == {"facts", "parameters", "code"}
+        assert "nothing here is attributable" in body["describe"]
+
+    def test_an_unknown_run_is_404(self, runs_client):
+        assert runs_client.get("/runs/run-1/diff/nope").status_code == 404

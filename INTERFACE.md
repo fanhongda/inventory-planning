@@ -231,8 +231,28 @@ of two runs, not a state view.** Edit a parameter file → run as a scenario →
 against the baseline `run_id`. That is the `run_id` pivot DATA_LAYER.md identified, and
 without it a settings page is a form that changes a number a person cannot evaluate.
 
-> **Check before building this page.** Two of the settings named — calendar versus
-> working days, and a growth target — **do not exist anywhere in the engine today**
+**Built, read-only.** The settings the engine actually reads with the file each came
+from; the conventions, defaults and segmentation as declared; the rules with their scope,
+values and rationale; the run registry; and the diff of any two runs with its `basis` —
+`scenario`, `new_data`, `identical` or `mixed`. That last is the feature: a parameter
+change is not a state to inspect, and whether a difference between two runs is
+attributable to the change depends on whether anything else moved. Two runs of the sample
+under different parameter files come back `scenario`; the same pair with a commit in
+between comes back `mixed`, and refuses to attribute.
+
+Read-only is the design rather than a stage of it, and the page says so. Editing is still
+the file.
+
+One thing the page cannot yet show, and says instead of implying: a rule's hit count.
+`policy/parameters.py` computes which SKUs each rule reached and which it skipped, prints
+it, and throws it away — so there is nothing to display without re-running, and an empty
+count would read as "this rule matched nothing", which is a finding rather than an
+absence. Retaining `ParameterSet.hits` on the run manifest is the next piece of this
+screen and the one worth doing.
+
+> **Checked before building this page, and the answer stood.** Two of the settings
+> originally named — calendar versus working days, and a growth target — **do not exist
+> anywhere in the engine today**
 > (grepped: no `working_day` / `business_day` / `growth` in `inventory_planning/` or
 > `config/`). Lead time in working days read as calendar days is a systematic ~1.4×
 > error on every safety stock, so the setting is worth having; but a toggle that is
@@ -459,8 +479,9 @@ needs P4.**
    `POST /batches/{id}/promote`, `GET /facts/{doc_type}`, and the stored-facts screen.
    Not the second half of P4: the pipeline still reads its files, and swapping
    `ingest_bridge` over to the store is its own review.
-6. **M2**, after the settings it exposes are honoured by the engine — and after
-   `/runs/{a}/diff/{b}`, without which it is a form with no feedback.
+6. **M2 — done, read-only.** `/policy`, `/policy/macro`, `/runs`,
+   `/runs/{a}/diff/{b}`, and the policy screen. The editing half stays unbuilt on
+   purpose; what is missing before it is worth revisiting is retained rule hits.
 
 ## Not in scope
 

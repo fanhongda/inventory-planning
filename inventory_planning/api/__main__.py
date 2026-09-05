@@ -21,6 +21,9 @@ def main(argv=None) -> int:
                         help="Store root. Overrides INVENTORY_PLANNING_STORE — the "
                              "store path is the isolation between a dev run and a real "
                              "one, exactly as a branch is for code.")
+    parser.add_argument("--output", default="output",
+                        help="Output directory. The run registry lives under it, so "
+                             "this is where the policy screen reads runs from.")
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args(argv)
 
@@ -33,7 +36,8 @@ def main(argv=None) -> int:
 
     from .app import create_app
 
-    uvicorn.run(create_app(config_dir=args.config, store_root=args.store),
+    uvicorn.run(create_app(config_dir=args.config, store_root=args.store,
+                           output_dir=args.output),
                 host=args.host, port=args.port, reload=args.reload)
     return 0
 

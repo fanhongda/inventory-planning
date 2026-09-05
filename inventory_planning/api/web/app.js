@@ -8,10 +8,12 @@
 import { $, mount, el } from "/ui.js";
 import { mountReview } from "/review.js";
 import { mountBrowse } from "/browse.js";
+import { mountPolicy } from "/policy.js";
 
 const SCREENS = {
   review: { label: "Import review", start: mountReview },
   browse: { label: "Stored facts", start: mountBrowse },
+  policy: { label: "Policy & runs", start: mountPolicy },
 };
 
 let started = {};
@@ -26,8 +28,8 @@ function show(name) {
   if (!started[name]) {
     started[name] = true;
     SCREENS[name].start();
-  } else if (name === "browse") {
-    SCREENS[name].start();          // the store may have changed on the other screen
+  } else if (name !== "review") {
+    SCREENS[name].start();          // the store may have changed on another screen
   }
   location.hash = name;
 }

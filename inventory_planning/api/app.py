@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional
 
 from ..ingest.contract import default_registry
 from ..ingest.exposure import Assumption, BASIS_ASSUMED, BASIS_DECLARED, measure
+from ..provenance import RunRegistry
 from ..store.fact_store import FactStore, StoreUnavailable
 from ..ingest.templates import contract_fingerprint, emit
 from ..resolution import resolve_frame
@@ -46,13 +47,6 @@ from ..store.declarations import (
 from ..store.landing import LandingStore
 from ..store.query import FactQuery, KeyIncomplete, MixedLayers, QueryUnavailable
 from ..store.ledger import BatchLedger
-
-_NOT_YET = (
-    "Not built. A run registry exists in `provenance.py` but nothing reads it back "
-    "across runs, so there is no run-to-run diff to serve. Returning an empty result "
-    "here would read as 'no runs', which is a different and worse claim."
-)
-
 
 def _require_fastapi():
     try:
@@ -74,9 +68,13 @@ class Service:
     mechanism for data exactly as a branch is for code.
     """
 
-    def __init__(self, config_dir=None, store_root=None):
+    def __init__(self, config_dir=None, store_root=None, output_dir=None):
         self.config_dir = Path(config_dir) if config_dir else None
         self.store_root = store_root
+        # Where the runs are. The registry lives under the output directory the pipeline
+        # writes to, so the interface reads the runs the CLI produced rather than
+        # keeping a second record that could disagree with it.
+        self.output_dir = Path(output_dir) if output_dir else Path("output")
         self.contracts = default_registry()
 
     @property
@@ -128,14 +126,15 @@ class Service:
         return "landed"
 
 
-def create_app(config_dir=None, store_root=None):
+def create_app(config_dir=None, store_root=None, output_dir=None):
     """Build the application. Importing this module does not require FastAPI; calling
     this does."""
     _require_fastapi()
     from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
     from fastapi.responses import FileResponse
 
-    service = Service(config_dir=config_dir, store_root=store_root)
+    service = Service(config_dir=config_dir, store_root=store_root,
+                      output_dir=output_dir)
     app = FastAPI(
         title="Inventory planning — intake",
         description=__doc__,
@@ -677,9 +676,135 @@ def create_app(config_dir=None, store_root=None):
                 doc_type, as_of=as_of, known_at=known_at)
         return body
 
+    @app.get("/policy")
+    def policy() -> Dict[str, Any]:
+        """
+        The parameter set in force, read-only.
+
+        Read-only is the design, not a stage of it. What a rule needs is review, a diff,
+        a rationale and an owner, and markdown in git gives all four; a form that wrote
+        them into a database would have to rebuild every one. The value an interface adds
+        here is not editing — it is showing which rule reached which SKUs, and what a
+        change to one did to a run, neither of which a text editor can show.
+        """
+        from ..policy.parameters import PlanningParameters
+
+        path = ((service.config_dir or Path(__file__).parents[2] / "config")
+                / "planning_parameters.md")
+        try:
+            params = PlanningParameters(path)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+        return {
+            "source": str(params.path),
+            "conventions": params.conventions,
+            "defaults": params.defaults,
+            "segmentation": params.segmentation,
+            "rules": [
+                {"rule_id": r.rule_id, "name": r.name, "scope": r.scope,
+                 "sets": r.overrides, "rationale": " ".join(r.rationale.split()),
+                 "owner": r.owner, "date": r.date}
+                for r in params.rules
+            ],
+            # Deliberately absent, and worth saying rather than leaving to be noticed:
+            # a rule's hit count is computed during a run and printed, never stored, so
+            # there is nothing to show here without re-running.
+            "hits": None,
+            "note": "Rule hit counts are computed during a run and not retained, so "
+                    "which SKUs each rule reached cannot be shown without re-running.",
+        }
+
+    @app.get("/policy/macro")
+    def macro() -> Dict[str, Any]:
+        """
+        The scalars, each with the file it came from.
+
+        Only what the engine actually reads. A settings page that lists a switch nothing
+        honours is worse than no page, because a switch reads as a guarantee — which is
+        why there is no working-day/calendar-day control here: the distinction does not
+        exist anywhere in the pipeline yet.
+        """
+        import json as _json
+        from ..policy.parameters import PlanningParameters
+
+        root = service.config_dir or Path(__file__).parents[2] / "config"
+        out: Dict[str, Any] = {"config_dir": str(root), "settings": []}
+
+        def add(name, value, source, note=""):
+            out["settings"].append({"name": name, "value": value,
+                                    "source": source, "note": note})
+
+        try:
+            node = _json.loads((root / "node_config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            node = {}
+        for key in ("location_id", "location_name", "currency", "planning_cycle"):
+            if key in node:
+                add(key, node[key], "node_config.json")
+
+        try:
+            params = PlanningParameters(root / "planning_parameters.md")
+            for key, value in params.conventions.items():
+                add(key, value, "planning_parameters.md", "convention — changes every figure")
+        except (FileNotFoundError, ValueError):
+            pass
+
+        # Through `FxTable`, not by parsing the file here. Reading it directly reported
+        # its top-level keys — `rates`, `reporting_currency` — as if they were currency
+        # codes, which is the shape of every mistake this interface is supposed to make
+        # impossible: a second implementation of a read the package already does.
+        from ..fx import FxTable
+
+        table = FxTable.load(root)
+        add("reporting_currency", table.reporting_currency,
+            "fx_rates.json" if table.source_path else "default",
+            "every figure is restated into this")
+        add("fx_currencies", table.currencies,
+            str(table.source_path.name) if table.source_path else "no rate file",
+            "money in any of these is converted on read"
+            if table.currencies else "no rates configured — money is not converted")
+
+        return out
+
     @app.get("/runs")
-    def runs():
-        raise HTTPException(501, _NOT_YET)
+    def runs(limit: int = Query(50, ge=1, le=500)) -> Dict[str, Any]:
+        registry = RunRegistry(service.output_dir)
+        entries = registry.index()
+        return {"output_dir": str(service.output_dir),
+                "runs": list(reversed(entries))[:limit]}
+
+    @app.get("/runs/{run_id}")
+    def run(run_id: str) -> Dict[str, Any]:
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+        return manifest
+
+    @app.get("/runs/{run_a}/diff/{run_b}")
+    def diff(run_a: str, run_b: str) -> Dict[str, Any]:
+        """
+        Why two runs differ, which is what decides how their outputs may be read.
+
+        The point of a policy screen. A parameter change is not a state to inspect: it
+        is the difference between two runs, and whether that difference is attributable
+        to the change depends on whether anything else moved at the same time.
+        """
+        comparison = RunRegistry(service.output_dir).compare(run_a, run_b)
+        if comparison is None:
+            raise HTTPException(404, f"one of {run_a!r}, {run_b!r} is not in the registry")
+        return {
+            "a": run_a, "b": run_b,
+            "basis": comparison.basis,
+            "describe": comparison.describe(),
+            "same_inputs": comparison.same_inputs,
+            "same_config": comparison.same_config,
+            "same_code": comparison.same_code,
+            "moved": [name for name, same in (("facts", comparison.same_inputs),
+                                              ("parameters", comparison.same_config),
+                                              ("code", comparison.same_code))
+                      if not same],
+        }
 
     # Mounted last, and it matters: routes match in registration order and a mount at
     # "/" swallows everything after it. The screen is a client of this API and nothing

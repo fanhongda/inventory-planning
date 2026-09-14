@@ -659,6 +659,8 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
               known_at: Optional[str] = Query(None),
               sku: Optional[str] = Query(None),
               location_id: Optional[str] = Query(None),
+              layer: Optional[str] = Query(
+                  None, pattern="^(canonical|prepared|unknown)$"),
               limit: int = Query(200, ge=1, le=5000)) -> Dict[str, Any]:
         """
         Facts as of a moment. `mode` names the reading, because there is more than one.
@@ -670,11 +672,11 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         comes back with `current`, sizing the disagreement instead of hiding it.
         """
         query = FactQuery(service.store_root, contracts=service.contracts)
-        selection = query.select(doc_type, as_of=as_of, known_at=known_at)
+        selection = query.select(doc_type, as_of=as_of, known_at=known_at, layer=layer)
         where = {k: v for k, v in (("sku", sku), ("location_id", location_id)) if v}
         try:
             frame = getattr(query, mode)(doc_type, as_of=as_of, known_at=known_at,
-                                         where=where or None, limit=limit)
+                                         where=where or None, limit=limit, layer=layer)
         except (KeyIncomplete, MixedLayers, NoSuchColumn) as exc:
             raise HTTPException(422, str(exc)) from exc
         except QueryUnavailable as exc:
@@ -682,7 +684,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
 
         body: Dict[str, Any] = {
             "doc_type": doc_type, "mode": mode,
-            "as_of": as_of, "known_at": known_at,
+            "as_of": as_of, "known_at": known_at, "layer": layer,
             "layers": selection.layers,
             "batches": [{"batch_id": b["batch_id"], "valid_time": b["valid_time"],
                          "transaction_time": b["transaction_time"], "rows": b["rows"],
@@ -694,7 +696,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         }
         if mode == "current" and selection:
             body["carried_forward"] = query.carried_forward(
-                doc_type, as_of=as_of, known_at=known_at)
+                doc_type, as_of=as_of, known_at=known_at, layer=layer)
         return body
 
     @app.get("/policy")

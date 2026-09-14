@@ -123,49 +123,57 @@ class Selection:
     def mixed(self) -> bool:
         return len(self.layers) > 1
 
-    def layer_spans(self) -> Dict[str, Any]:
-        """Each layer's first and last `valid_time`, so overlap can be reasoned about."""
+    # The two time axes, and the parameter that filters on each. Both are upper bounds,
+    # so either can isolate the *earliest* layer and neither can isolate a later one.
+    AXES = (("as_of", "valid_time"), ("known_at", "transaction_time"))
+
+    def layer_spans(self, field: str = "valid_time") -> Dict[str, Any]:
+        """Each layer's first and last value on one time axis."""
         spans: Dict[str, Any] = {}
         for batch in self.batches:
             layer = str(batch.get("frame_layer") or LAYER_UNKNOWN)
-            when = str(batch.get("valid_time") or "")
+            when = str(batch.get(field) or "")
             first, last = spans.get(layer, (when, when))
             spans[layer] = (min(first, when), max(last, when))
         return spans
 
     def isolating_cutoff(self) -> Optional[tuple]:
         """
-        An `as_of` that selects exactly one layer, and the layer it selects — or None.
+        A cutoff that selects exactly one layer: `(parameter, value, layer)` or None.
 
-        `as_of` is an upper bound, so it can only isolate the *earliest* layer, and only
-        where that layer finishes before every other one starts. Where the layers
-        interleave — which is what a store looks like when the writer changed while old
-        batches were still being re-loaded — no cutoff exists, and offering one anyway
-        sends the reader round a loop that ends in this same refusal.
+        Both parameters are upper bounds, so either can isolate only the layer that
+        *finishes first on that axis*, and only where it finishes before every other one
+        starts. Checking one axis is not enough, and assuming so is how this came to
+        tell a reader no cutoff existed when one did: layers created by a change of
+        writer separate cleanly in load time while their `valid_time` ranges interleave
+        freely, because old extracts go on being re-loaded after the change.
         """
-        spans = self.layer_spans()
-        if len(spans) < 2:
+        if len(self.layers) < 2:
             return None
-        earliest = min(spans, key=lambda layer: spans[layer][1])
-        finishes = spans[earliest][1]
-        if all(start > finishes for layer, (start, _) in spans.items()
-               if layer != earliest):
-            return finishes, earliest
+        for parameter, field in self.AXES:
+            spans = self.layer_spans(field)
+            if len(spans) < 2:
+                continue
+            earliest = min(spans, key=lambda layer: spans[layer][1])
+            finishes = spans[earliest][1]
+            if finishes and all(start > finishes
+                                for layer, (start, _) in spans.items()
+                                if layer != earliest):
+                return parameter, finishes, earliest
         return None
 
     def how_to_narrow(self) -> str:
         """What a caller can actually do about a mixed selection, in this store."""
+        choices = " or ".join(f"`layer={name}`" for name in self.layers)
+        lines = [f"Name the one you want: {choices}."]
         cutoff = self.isolating_cutoff()
         if cutoff:
-            when, layer = cutoff
-            return (f"Read `as_of={when}` for the {layer} batches alone, or void the "
-                    f"batches of the layer you are not using.")
-        spans = ", ".join(f"{layer} {first}\u2026{last}"
-                          for layer, (first, last) in sorted(self.layer_spans().items()))
-        return (f"The layers overlap in time ({spans}), so no `as_of` isolates either "
-                f"one \u2014 it is an upper bound and the older layer runs past the start "
-                f"of the newer. Void the batches of the layer you are not using, or "
-                f"re-store them through one path.")
+            parameter, when, layer = cutoff
+            lines.append(f"(`{parameter}={when}` reaches the {layer} batches too, but "
+                         f"only until something older is loaded.)")
+        lines.append("Where a layer should not be there at all, restate or void it: "
+                     "`python -m inventory_planning.store`.")
+        return " ".join(lines)
 
     def describe(self) -> str:
         if not self.batches:
@@ -197,8 +205,8 @@ class FactQuery:
     def doc_types(self) -> List[str]:
         return sorted({b["doc_type"] for b in self.ledger.batches()})
 
-    def select(self, doc_type: str, as_of: Any = None,
-               known_at: Any = None) -> Selection:
+    def select(self, doc_type: str, as_of: Any = None, known_at: Any = None,
+               layer: str = None) -> Selection:
         """
         The batches a bitemporal question selects, oldest first.
 
@@ -206,6 +214,13 @@ class FactQuery:
         filters on `transaction_time` — the moment it was loaded. They are routinely
         different, and only the second can reconstruct what was believed last week
         after a correction has been loaded since.
+
+        `layer` asks for one layer of the pipeline by name. Both time parameters are
+        upper bounds, so between them they can isolate only the layer that finished
+        first — and a store whose writer changed keeps producing the *newer* layer,
+        which is the one a reader usually wants and the one no cutoff reaches. Naming
+        the layer says what is meant, instead of encoding it as a date that stops being
+        true with the next load.
         """
         as_of = _as_text(as_of)
         known_at = _as_text(known_at)
@@ -214,6 +229,8 @@ class FactQuery:
             if as_of and str(batch.get("valid_time") or "") > as_of:
                 continue
             if known_at and str(batch.get("transaction_time") or "") > known_at:
+                continue
+            if layer and str(batch.get("frame_layer") or LAYER_UNKNOWN) != layer:
                 continue
             if not (self.root / str(batch.get("path") or "")).exists():
                 continue
@@ -228,7 +245,7 @@ class FactQuery:
 
     def history(self, doc_type: str, as_of: Any = None, known_at: Any = None,
                 where: Dict[str, Any] = None, columns: Sequence[str] = None,
-                limit: int = None) -> pd.DataFrame:
+                limit: int = None, layer: str = None) -> pd.DataFrame:
         """
         Every observation the selected batches hold, each row carrying its batch.
 
@@ -237,12 +254,12 @@ class FactQuery:
         imported — which does not raise and merely looks high. Use `current` for
         anything that gets added up.
         """
-        return self._read(doc_type, self.select(doc_type, as_of, known_at),
+        return self._read(doc_type, self.select(doc_type, as_of, known_at, layer),
                           where=where, columns=columns, limit=limit, dedupe=False)
 
     def current(self, doc_type: str, as_of: Any = None, known_at: Any = None,
                 where: Dict[str, Any] = None, columns: Sequence[str] = None,
-                limit: int = None) -> pd.DataFrame:
+                limit: int = None, layer: str = None) -> pd.DataFrame:
         """
         One row per natural key: the newest observation of each, as of the cutoffs.
 
@@ -250,13 +267,13 @@ class FactQuery:
         the moment loaded, because a correction to last week's file describes last week
         and must not outrank this week's data merely by having been loaded later.
         """
-        selection = self.select(doc_type, as_of, known_at)
+        selection = self.select(doc_type, as_of, known_at, layer)
         return self._read(doc_type, selection, where=where, columns=columns,
                           limit=limit, dedupe=True)
 
     def latest(self, doc_type: str, as_of: Any = None, known_at: Any = None,
                where: Dict[str, Any] = None, columns: Sequence[str] = None,
-               limit: int = None) -> pd.DataFrame:
+               limit: int = None, layer: str = None) -> pd.DataFrame:
         """
         The newest selected batch and only it — the reading for a whole-population
         export, where a key missing from the newest file is a key that went to zero.
@@ -266,7 +283,7 @@ class FactQuery:
         discards everything the newest file does not cover, which is why it is a
         separate method and not a mode of `current`.
         """
-        selection = self.select(doc_type, as_of, known_at)
+        selection = self.select(doc_type, as_of, known_at, layer)
         if selection:
             selection = Selection(doc_type=doc_type, batches=selection.batches[-1:],
                                   as_of=selection.as_of, known_at=selection.known_at)
@@ -274,18 +291,19 @@ class FactQuery:
                           limit=limit, dedupe=False)
 
     def carried_forward(self, doc_type: str, as_of: Any = None,
-                        known_at: Any = None) -> Dict[str, Any]:
+                        known_at: Any = None, layer: str = None) -> Dict[str, Any]:
         """
         How much of `current` did not come from the newest batch.
 
         The size of the disagreement between the two readings above, as a number rather
         than as a caveat. Zero means they agree and the question does not arise.
         """
-        selection = self.select(doc_type, as_of, known_at)
+        selection = self.select(doc_type, as_of, known_at, layer)
         if not selection:
-            return {"newest_valid_time": None, "rows": 0, "carried": 0}
+            return {"newest_valid_time": None, "rows": 0, "carried": 0,
+                    "carried_share": 0.0}
         newest = str(selection.batches[-1].get("valid_time") or "")
-        frame = self.current(doc_type, as_of=as_of, known_at=known_at)
+        frame = self.current(doc_type, as_of=as_of, known_at=known_at, layer=layer)
         older = frame[frame[VALID_COLUMN] < newest] if len(frame) else frame
         return {"newest_valid_time": newest, "rows": len(frame),
                 "carried": len(older),

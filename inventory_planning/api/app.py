@@ -45,7 +45,9 @@ from ..store.declarations import (
     Declarations, DeclarationError, Override, SCOPE_MAPPING, SCOPE_VALUE,
 )
 from ..store.landing import LandingStore
-from ..store.query import FactQuery, KeyIncomplete, MixedLayers, QueryUnavailable
+from ..store.query import (
+    FactQuery, KeyIncomplete, MixedLayers, NoSuchColumn, QueryUnavailable,
+)
 from ..store.ledger import BatchLedger
 
 def _require_fastapi():
@@ -194,13 +196,21 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
     @app.get("/contracts/{doc_type}/template")
     def template(doc_type: str):
         """The blank workbook for a document with no source system to export it."""
+        from starlette.background import BackgroundTask
+
+        workdir = Path(tempfile.mkdtemp())
         try:
-            path = emit(doc_type, Path(tempfile.mkdtemp()), registry=service.contracts)
+            path = emit(doc_type, workdir, registry=service.contracts)
         except KeyError as exc:
+            shutil.rmtree(workdir, ignore_errors=True)
             raise HTTPException(404, str(exc)) from exc
+        # Deleted after the response has been sent, not in a `finally`: FileResponse
+        # streams the file once this handler has already returned, so removing it here
+        # would truncate the download it was built for.
         return FileResponse(
             path, filename=path.name,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            background=BackgroundTask(shutil.rmtree, workdir, ignore_errors=True),
         )
 
     # ── Getting a file in, and looking at what was made of it ────────────────
@@ -218,7 +228,12 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         from ..ingest.templates import NON_DATA_SHEETS, read_meta
 
         workdir = Path(tempfile.mkdtemp())
-        target = workdir / Path(file.filename or "upload").name
+        # `.name` on its own, so a filename carrying a path cannot write outside the
+        # temp directory — and a name that is empty after that leaves the directory
+        # itself as the target, which `open` reports as a directory rather than
+        # anything useful.
+        name = Path(file.filename or "").name or "upload"
+        target = workdir / name
         with open(target, "wb") as fh:
             shutil.copyfileobj(file.file, fh)
         # The bytes, hashed, carried onto the landing record and from there onto the
@@ -259,6 +274,12 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                 "duplicate_headers": record.get("duplicate_headers", []),
                 "resolution": resolution.to_dict(),
             })
+
+        # The landed parquet is the durable record; this copy was only ever needed for
+        # the length of the request. Leaving it behind accumulated one copy of every
+        # file ever uploaded in the temp directory — un-anonymised extracts among them,
+        # outside both the repository and the store's retention.
+        shutil.rmtree(workdir, ignore_errors=True)
 
         if not landed:
             # A blank template is the likeliest way to arrive here and it deserves its
@@ -654,7 +675,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         try:
             frame = getattr(query, mode)(doc_type, as_of=as_of, known_at=known_at,
                                          where=where or None, limit=limit)
-        except (KeyIncomplete, MixedLayers) as exc:
+        except (KeyIncomplete, MixedLayers, NoSuchColumn) as exc:
             raise HTTPException(422, str(exc)) from exc
         except QueryUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc

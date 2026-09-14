@@ -658,3 +658,63 @@ class TestRunsAndTheirDifferences:
 
     def test_an_unknown_run_is_404(self, runs_client):
         assert runs_client.get("/runs/run-1/diff/nope").status_code == 404
+
+
+class TestFiltersAndTemporaryFiles:
+
+    def test_filtering_on_a_column_the_document_lacks_is_422_not_500(self, client,
+                                                                     tmp_path):
+        """
+        The API offers `location_id` on every doc_type and only some contracts carry
+        it. This reached DuckDB, whose binder error no caller catches, and surfaced as
+        Internal Server Error on ordinary input.
+        """
+        from inventory_planning.store.fact_store import FactStore
+        import pandas as pd
+
+        store = FactStore(client.app.state.service.store_root)
+        store.write_batch(
+            doc_type="sales_history",
+            frame=pd.DataFrame([{"sku": "A", "ship_date": "2024-01-01", "qty": 1,
+                                 "so_number": "S1", "so_line_number": "10"}]),
+            valid_time="2024-07-01", source_name="s.csv", source_sha="x",
+            written_by="tests")
+
+        assert client.get("/facts/sales_history").status_code == 200
+        response = client.get("/facts/sales_history", params={"location_id": "DC-01"})
+        assert response.status_code == 422
+        assert "location_id" in response.json()["detail"]
+
+    def test_an_upload_leaves_no_copy_of_the_file_behind(self, client, tmp_path,
+                                                         monkeypatch):
+        """
+        Every upload wrote the file into a fresh mkdtemp and never removed it, so a
+        copy of every file ever uploaded accumulated — un-anonymised extracts among
+        them, outside both the repository and the store's retention.
+        """
+        holding = tmp_path / "temp"
+        holding.mkdir()
+        monkeypatch.setenv("TMPDIR", str(holding))
+
+        assert _upload(client).status_code == 200
+        leftover = [p for p in holding.rglob("*") if p.is_file()]
+        assert leftover == [], f"left behind: {leftover}"
+
+    def test_a_template_download_cleans_up_after_itself(self, client, tmp_path,
+                                                        monkeypatch):
+        """
+        Deleted after the response is sent rather than in a `finally`: FileResponse
+        streams the file once the handler has returned.
+        """
+        holding = tmp_path / "temp"
+        holding.mkdir()
+        monkeypatch.setenv("TMPDIR", str(holding))
+
+        response = client.get("/contracts/substitution/template")
+        assert response.status_code == 200 and response.content[:2] == b"PK"
+        assert [p for p in holding.rglob("*") if p.is_file()] == []
+
+    def test_an_unnamed_upload_does_not_write_over_its_own_directory(self, client):
+        response = client.post("/uploads",
+                               files={"file": ("", b"a,b\n1,2\n", "text/csv")})
+        assert response.status_code in (400, 422)

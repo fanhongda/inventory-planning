@@ -86,6 +86,10 @@ class MixedLayers(ValueError):
     """A reading would have blended batches holding different layers of the pipeline."""
 
 
+class NoSuchColumn(ValueError):
+    """A filter named a column the stored batches do not carry."""
+
+
 def _connect():
     try:
         import duckdb
@@ -118,6 +122,50 @@ class Selection:
     @property
     def mixed(self) -> bool:
         return len(self.layers) > 1
+
+    def layer_spans(self) -> Dict[str, Any]:
+        """Each layer's first and last `valid_time`, so overlap can be reasoned about."""
+        spans: Dict[str, Any] = {}
+        for batch in self.batches:
+            layer = str(batch.get("frame_layer") or LAYER_UNKNOWN)
+            when = str(batch.get("valid_time") or "")
+            first, last = spans.get(layer, (when, when))
+            spans[layer] = (min(first, when), max(last, when))
+        return spans
+
+    def isolating_cutoff(self) -> Optional[tuple]:
+        """
+        An `as_of` that selects exactly one layer, and the layer it selects — or None.
+
+        `as_of` is an upper bound, so it can only isolate the *earliest* layer, and only
+        where that layer finishes before every other one starts. Where the layers
+        interleave — which is what a store looks like when the writer changed while old
+        batches were still being re-loaded — no cutoff exists, and offering one anyway
+        sends the reader round a loop that ends in this same refusal.
+        """
+        spans = self.layer_spans()
+        if len(spans) < 2:
+            return None
+        earliest = min(spans, key=lambda layer: spans[layer][1])
+        finishes = spans[earliest][1]
+        if all(start > finishes for layer, (start, _) in spans.items()
+               if layer != earliest):
+            return finishes, earliest
+        return None
+
+    def how_to_narrow(self) -> str:
+        """What a caller can actually do about a mixed selection, in this store."""
+        cutoff = self.isolating_cutoff()
+        if cutoff:
+            when, layer = cutoff
+            return (f"Read `as_of={when}` for the {layer} batches alone, or void the "
+                    f"batches of the layer you are not using.")
+        spans = ", ".join(f"{layer} {first}\u2026{last}"
+                          for layer, (first, last) in sorted(self.layer_spans().items()))
+        return (f"The layers overlap in time ({spans}), so no `as_of` isolates either "
+                f"one \u2014 it is an upper bound and the older layer runs past the start "
+                f"of the newer. Void the batches of the layer you are not using, or "
+                f"re-store them through one path.")
 
     def describe(self) -> str:
         if not self.batches:
@@ -276,17 +324,12 @@ class FactQuery:
         # stays inside one layer, which is a one-time answer rather than a caveat
         # carried forever.
         if selection.mixed:
-            boundary = min(str(b.get("valid_time") or "") for b in selection.batches
-                           if str(b.get("frame_layer") or LAYER_UNKNOWN)
-                           == selection.layers[0])
             raise MixedLayers(
                 f"{doc_type} has batches from more than one layer of the pipeline "
                 f"({', '.join(selection.layers)}), and their money columns are not the "
                 f"same measure: a `prepared` batch was converted into the reporting "
-                f"currency before it was stored and a `canonical` one was not. Narrow "
-                f"the read to one layer with `as_of` or `known_at` — the earliest "
-                f"{selection.layers[0]} batch describes {boundary} — or void the batches "
-                f"of the layer you are not using.")
+                f"currency before it was stored and a `canonical` one was not. "
+                + selection.how_to_narrow())
 
         paths = [str(self.root / b["path"]) for b in selection.batches]
         # `union_by_name` because an export that gained a column mid-history is the
@@ -301,6 +344,24 @@ class FactQuery:
             params[f"p{i}"] = paths[i]
             params[f"b{i}"] = batch["batch_id"]
             params[f"v{i}"] = str(batch.get("valid_time") or "")
+
+        # The union schema, read once. Needed to check a filter names a real column and
+        # again by the dedupe branch below; both used to be able to reach DuckDB with a
+        # column it has never heard of, and the binder error that follows is not one any
+        # caller catches.
+        available = self._columns(source, {"paths": paths}) if (where or dedupe) else []
+        if where:
+            unknown = [c for c in sorted(where) if c not in available]
+            if unknown:
+                # Refused rather than answered with nothing. An empty result reads as
+                # "no rows match that location", which is a claim about the data; the
+                # truth is that this document does not record a location at all, and
+                # the two lead a reader to opposite conclusions.
+                raise NoSuchColumn(
+                    f"{doc_type} carries no {', '.join(unknown)}. Filtering on it cannot "
+                    f"return rows, and an empty answer would read as 'none match' rather "
+                    f"than 'this document does not record that'. Columns available: "
+                    f"{', '.join(available) or 'none'}.")
 
         predicate, where_params = _where_clause(where)
         params.update(where_params)
@@ -322,7 +383,6 @@ class FactQuery:
 
         if dedupe:
             key = self._key_columns(doc_type)
-            available = self._columns(source, {"paths": paths})
             missing = [k for k in key if k not in available]
             if missing:
                 raise KeyIncomplete(

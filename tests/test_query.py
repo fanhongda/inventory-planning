@@ -8,6 +8,7 @@ times the file was imported, nothing raises, and the number merely looks high.
 """
 
 import json
+import re
 
 import pandas as pd
 import pytest
@@ -17,7 +18,7 @@ from inventory_planning.store.ledger import (
     LAYER_CANONICAL, LAYER_PREPARED, LAYER_UNKNOWN,
 )
 from inventory_planning.store.query import (
-    BATCH_COLUMN, VALID_COLUMN, FactQuery, KeyIncomplete, MixedLayers,
+    BATCH_COLUMN, VALID_COLUMN, FactQuery, KeyIncomplete, MixedLayers, NoSuchColumn,
 )
 
 pytest.importorskip("duckdb", reason="the read path is an optional extra")
@@ -195,21 +196,57 @@ class TestLayersAreNotBlended:
         store.ledger.path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
         assert query.select("inventory").layers == [LAYER_UNKNOWN]
 
-    def test_a_reading_across_two_layers_is_refused_with_the_cutoff(self, store, query):
-        store.write_batch(doc_type="inventory",
-                          frame=pd.DataFrame([{"sku": "A", "location_id": "DC-01",
-                                               "qty_on_hand": 10}]),
-                          valid_time="2024-06-01", source_name="june.csv",
-                          source_sha="june", written_by="tests",
-                          frame_layer=LAYER_PREPARED)
+    def _prepared(self, store, valid_time, rows):
+        return store.write_batch(
+            doc_type="inventory", frame=pd.DataFrame(rows), valid_time=valid_time,
+            source_name=f"old_{valid_time}.csv", source_sha=f"old-{valid_time}",
+            written_by="tests", frame_layer=LAYER_PREPARED)
+
+    def test_a_reading_across_two_layers_is_refused(self, store, query):
+        self._prepared(store, "2024-06-01", [{"sku": "A", "location_id": "DC-01",
+                                              "qty_on_hand": 10}])
         _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
                                       "qty_on_hand": 15}])
+        with pytest.raises(MixedLayers) as raised:
+            query.current("inventory")
+        assert "canonical" in str(raised.value) and "prepared" in str(raised.value)
+
+    def test_the_cutoff_it_offers_actually_isolates_a_layer(self, store, query):
+        """
+        The message is the reader's only way out, so what it names has to work. It used
+        to name the *newest* layer's first date, which selects that layer and every
+        older batch with it — following the advice reproduced the error it answered.
+        """
+        self._prepared(store, "2024-06-01", [{"sku": "A", "location_id": "DC-01",
+                                              "qty_on_hand": 10}])
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 15}])
+        with pytest.raises(MixedLayers) as raised:
+            query.current("inventory")
+        cutoff = re.search(r"as_of=([\d-]+)", str(raised.value)).group(1)
+
+        frame = query.current("inventory", as_of=cutoff)
+        assert query.select("inventory", as_of=cutoff).layers == [LAYER_PREPARED]
+        assert frame["qty_on_hand"].tolist() == [10]
+
+    def test_interleaved_layers_are_told_no_cutoff_exists(self, store, query):
+        """
+        What the live store looks like: old batches still being re-loaded while the
+        writer changed, so the layers overlap in time and `as_of` — an upper bound —
+        cannot isolate either. Offering one anyway sends the reader round a loop.
+        """
+        self._prepared(store, "2024-06-01", [{"sku": "A", "location_id": "DC-01",
+                                              "qty_on_hand": 10}])
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 15}])
+        self._prepared(store, "2024-08-01", [{"sku": "B", "location_id": "DC-01",
+                                              "qty_on_hand": 20}])
 
         with pytest.raises(MixedLayers) as raised:
             query.current("inventory")
         message = str(raised.value)
-        assert "canonical" in message and "prepared" in message
-        assert "2024-07-01" in message          # the cutoff that stays inside one layer
+        assert "as_of=" not in message
+        assert "overlap in time" in message and "Void the batches" in message
 
     def test_narrowing_to_one_layer_reads_normally(self, store, query):
         store.write_batch(doc_type="inventory",
@@ -224,3 +261,32 @@ class TestLayersAreNotBlended:
         older = query.current("inventory", as_of="2024-06-15")
         assert older["qty_on_hand"].tolist() == [10]
         assert query.select("inventory", as_of="2024-06-15").layers == [LAYER_PREPARED]
+
+
+class TestAFilterMustNameARealColumn:
+    """
+    Refused rather than answered with nothing. An empty result reads as "no rows match
+    that location", which is a claim about the data; the truth is that the document does
+    not record a location at all, and the two lead a reader to opposite conclusions.
+    """
+
+    def test_an_unknown_filter_column_is_refused_by_name(self, store, query,
+                                                         two_snapshots):
+        with pytest.raises(NoSuchColumn) as raised:
+            query.current("inventory", where={"warehouse": "DC-01"})
+        assert "warehouse" in str(raised.value)
+
+    def test_it_does_not_reach_the_query_engine(self, store, query, two_snapshots):
+        """
+        It used to, and the binder error that came back is not one any caller catches —
+        it surfaced from the API as a 500 on ordinary input.
+        """
+        try:
+            query.history("inventory", where={"warehouse": "DC-01"})
+        except NoSuchColumn:
+            pass
+        except Exception as exc:                      # pragma: no cover - the defect
+            raise AssertionError(f"raised {type(exc).__name__}, not NoSuchColumn") from exc
+
+    def test_a_column_that_does_exist_still_filters(self, store, query, two_snapshots):
+        assert sorted(query.current("inventory", where={"sku": "A"})["sku"]) == ["A"]

@@ -718,3 +718,42 @@ class TestFiltersAndTemporaryFiles:
         response = client.post("/uploads",
                                files={"file": ("", b"a,b\n1,2\n", "text/csv")})
         assert response.status_code in (400, 422)
+
+
+class TestReadingOneLayerByName:
+
+    def _two_layers(self, client):
+        from inventory_planning.store.fact_store import FactStore
+        from inventory_planning.store.ledger import LAYER_PREPARED
+        import pandas as pd
+
+        store = FactStore(client.app.state.service.store_root)
+        store.write_batch(doc_type="inventory",
+                          frame=pd.DataFrame([{"sku": "A", "location_id": "DC-01",
+                                               "qty_on_hand": 10}]),
+                          valid_time="2024-06-01", source_name="old.csv",
+                          source_sha="old", written_by="tests",
+                          frame_layer=LAYER_PREPARED)
+        store.write_batch(doc_type="inventory",
+                          frame=pd.DataFrame([{"sku": "A", "location_id": "DC-01",
+                                               "qty_on_hand": 15}]),
+                          valid_time="2024-07-01", source_name="new.csv",
+                          source_sha="new", written_by="tests")
+
+    def test_a_mixed_read_is_refused_and_names_the_layers(self, client):
+        self._two_layers(client)
+        response = client.get("/facts/inventory")
+        assert response.status_code == 422
+        assert "`layer=canonical`" in response.json()["detail"]
+
+    def test_naming_a_layer_reads_it(self, client):
+        self._two_layers(client)
+        for layer, qty in (("prepared", 10), ("canonical", 15)):
+            body = client.get("/facts/inventory", params={"layer": layer}).json()
+            assert body["layer"] == layer
+            assert body["layers"] == [layer]
+            assert body["rows"][0]["qty_on_hand"] == qty
+
+    def test_an_unknown_layer_name_is_rejected_by_the_signature(self, client):
+        assert client.get("/facts/inventory",
+                          params={"layer": "whatever"}).status_code == 422

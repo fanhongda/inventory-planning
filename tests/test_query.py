@@ -252,11 +252,12 @@ class TestLayersAreNotBlended:
         assert query.select("inventory", known_at=cutoff).layers == [LAYER_PREPARED]
         assert len(query.current("inventory", known_at=cutoff)) == 2
 
-    def test_interleaved_layers_are_told_no_cutoff_exists(self, store, query):
+    def test_the_refusal_names_the_layers_rather_than_a_date(self, store, query):
         """
-        What the live store looks like: old batches still being re-loaded while the
-        writer changed, so the layers overlap in time and `as_of` — an upper bound —
-        cannot isolate either. Offering one anyway sends the reader round a loop.
+        A date stops being the right answer with the next load; a layer name does not.
+        Both time parameters are upper bounds, so between them they reach only the
+        layer that finished first — and a store whose writer changed keeps producing
+        the newer one, which is the layer a reader usually wants.
         """
         self._prepared(store, "2024-06-01", [{"sku": "A", "location_id": "DC-01",
                                               "qty_on_hand": 10}])
@@ -268,8 +269,23 @@ class TestLayersAreNotBlended:
         with pytest.raises(MixedLayers) as raised:
             query.current("inventory")
         message = str(raised.value)
-        assert "as_of=" not in message and "known_at=" not in message
-        assert "overlap on both time axes" in message and "Void the batches" in message
+        assert "`layer=canonical`" in message and "`layer=prepared`" in message
+        assert "inventory_planning.store" in message
+
+    def test_either_layer_can_be_read_by_name(self, store, query):
+        """Including the newer one, which no upper bound reaches."""
+        self._prepared(store, "2024-06-01", [{"sku": "A", "location_id": "DC-01",
+                                              "qty_on_hand": 10}])
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 15}])
+        self._prepared(store, "2024-08-01", [{"sku": "B", "location_id": "DC-01",
+                                              "qty_on_hand": 20}])
+
+        canonical = query.current("inventory", layer=LAYER_CANONICAL)
+        assert canonical["qty_on_hand"].tolist() == [15]
+        prepared = query.current("inventory", layer=LAYER_PREPARED)
+        assert sorted(prepared["sku"]) == ["A", "B"]
+        assert query.select("inventory", layer=LAYER_CANONICAL).mixed is False
 
     def test_narrowing_to_one_layer_reads_normally(self, store, query):
         store.write_batch(doc_type="inventory",

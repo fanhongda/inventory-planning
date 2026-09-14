@@ -113,6 +113,12 @@ DAYS_PER_MONTH = 30.0
 
 class PurchaseRecommender:
 
+    # Set by the orchestrator from the `quantity_rounding` convention, alongside the
+    # per-SKU unit. A buyer cannot order 33.4 of a countable thing, and every figure in
+    # this module is one they act on directly.
+    rounding = None
+    uom = None
+
     def __init__(self, demand_basis: str = DEMAND_BASIS_CONSUMPTION,
                  horizon_days: int = 30, order_cost: float = 350.0,
                  holding_rate: float = 0.22):
@@ -237,6 +243,18 @@ class PurchaseRecommender:
         # that matters, and for the rest they are the comparison against what is set.
         df["suggested_min_qty"] = df["reorder_point"]
         df["suggested_max_qty"] = df["order_up_to"]
+
+        # Rounded before `order_quantity` is derived from them, so the quantity a buyer
+        # is handed is consistent with the min and max printed beside it rather than
+        # being rounded independently of its own inputs.
+        if self.rounding is not None and self.rounding.active and len(df):
+            per_row = (df["sku"].astype(str).map(self.uom)
+                       if self.uom is not None and len(self.uom) else None)
+            for column in ("forecast_horizon_qty", "period_demand", "gross_requirement",
+                           "reorder_point", "net_requirement", "order_lot",
+                           "order_up_to", "suggested_min_qty", "suggested_max_qty"):
+                if column in df.columns:
+                    df[column] = self.rounding.apply(df[column], per_row)
 
         df["order_quantity"] = self._order_quantity(df)
 

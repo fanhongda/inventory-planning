@@ -184,7 +184,8 @@ class ShouldBeCalculator:
     # ── Public API ───────────────────────────────────────────────────────────
 
     def calculate(self, params: ParameterSet, actual: pd.DataFrame = None,
-                  committed: pd.DataFrame = None) -> ShouldBeResult:
+                  committed: pd.DataFrame = None, rounding=None,
+                  uom=None) -> ShouldBeResult:
         """
         `params.frame` must carry demand_mean, demand_sigma, lead_time_days and the
         resolved policy parameters. `actual` supplies on-hand and in-transit so the gap
@@ -213,6 +214,27 @@ class ShouldBeCalculator:
         df["safety_qty"] = self._safety(df, conventions)
         df["pipeline_qty"] = self._pipeline(df, conventions)
 
+        # The same `quantity_rounding` convention the forecast and the safety stock
+        # calculator apply. Applied to the three parts before they are summed, so the
+        # target equals the components printed beside it — and applied here at all
+        # because this is the safety stock the workbook shows. There are two: the
+        # calculator's feeds the recommender, and this one feeds the target and the gap.
+        # Rounding one and not the other would leave a report contradicting itself.
+        from ..analytics.rounding import Rounding
+
+        rounding = rounding or Rounding.from_conventions(conventions)
+        if rounding.active:
+            units = uom if uom is not None and len(uom) else None
+            if units is not None:
+                units = df["sku"].astype(str).map(units)
+            elif "uom" in df.columns:
+                units = df["uom"]
+            elif "uom_raw" in df.columns:
+                units = df["uom_raw"]
+            for column in ("cycle_qty", "safety_qty", "pipeline_qty", "committed_qty"):
+                if column in df.columns:
+                    df[column] = rounding.apply(df[column], units)
+
         # A SKU classified non-stocking is ordered on demand — the business has already
         # decided to hold none of it. Computing a policy stock for it anyway inflates
         # should-be by the whole long tail and turns a healthy position into a spurious
@@ -223,6 +245,8 @@ class ShouldBeCalculator:
             df.loc[non_stocking, ["cycle_qty", "safety_qty"]] = 0.0
 
         df["committed_qty"] = self._committed(df, committed)
+        if rounding.active:
+            df["committed_qty"] = rounding.apply(df["committed_qty"], units)
         df["should_be_qty"] = df["cycle_qty"] + df["safety_qty"] + df["pipeline_qty"]
 
         # An order-on-demand item holds no *speculative* stock. It does hold what it

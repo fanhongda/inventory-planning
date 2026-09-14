@@ -479,9 +479,87 @@ needs P4.**
    `POST /batches/{id}/promote`, `GET /facts/{doc_type}`, and the stored-facts screen.
    Not the second half of P4: the pipeline still reads its files, and swapping
    `ingest_bridge` over to the store is its own review.
-6. **M2 — done, read-only.** `/policy`, `/policy/macro`, `/runs`,
-   `/runs/{a}/diff/{b}`, and the policy screen. The editing half stays unbuilt on
-   purpose; what is missing before it is worth revisiting is retained rule hits.
+6. **M2 — read-only.** `/policy`, `/policy/macro`, `/runs`, `/runs/{a}/diff/{b}`, and
+   the policy screen. The editing half is taken up in §7, which revises the reasoning
+   that left it out.
+
+## 7. Re-scoped, 2026-09-14: finish one node before adding a second
+
+P0 topology is parked. The target changes from breadth — more nodes, more documents — to
+depth: one node, every surface complete, and the seams a client/server split will need cut
+now while they are still cheap. What that asks for, against what is there:
+
+| Asked for | Today | Missing |
+|---|---|---|
+| enter macro and policy | read-only | writing back, with a diff |
+| query the data | three named readings, by layer, as-of | — |
+| see the results | the workbook only | a screen over it |
+| the store holds a record | facts, landing, declarations, batch ledger | decisions |
+| C/S: permissions, schema versions | none; a version and a refusal | three seams |
+
+### Two positions of mine this revises, and what they were protecting
+
+**Read-only policy.** I argued that was the design rather than a stage of it: a rule wants
+review, a diff, a rationale and an owner, and markdown in git gives all four for nothing.
+That argument was about *storage*, and I let it decide *who may operate it*, which it does
+not. The form can edit the file — produce a proposed change, show the diff it would make,
+require the rationale and the owner, write the markdown. All four properties survive
+because the storage does not move. What changes is that editing no longer requires an
+editor and a git client.
+
+The horizon matters here in a way it does not elsewhere. A server has no working tree and
+many tenants, so on the far side of C/S the rules become a versioned table with the same
+four properties rebuilt — review, diff, rationale, owner — and that is a real cost. The
+way to keep it a storage change rather than a rewrite is to **fix the API contract now**:
+`GET /policy` returns the rules, `PUT /policy` takes `{change, reason, by}` and returns
+the diff it would make, and approval applies it. Whether that lands as a commit or a row
+is behind the contract.
+
+**No screen for results.** I argued a screen showing the same numbers becomes a second
+place they are formatted, rounded and subtly disagreed about. That holds only if the
+screen *re-derives* them. It does not if the screen renders the run's own workbook,
+located from the manifest that already records every output the run wrote. One artefact,
+two renderings. The objection returns in full the moment the screen computes anything —
+so it reads the file and does not recompute, and that is the constraint to hold rather
+than the conclusion.
+
+### Three seams to cut now
+
+Each is cheap while there is one user and expensive once there are many.
+
+**A workspace, not three arguments.** `store_root`, `config_dir` and `output_dir` are
+resolved separately today and passed around independently; `Intake` and the adapters
+already carry a `tenant`, and nothing else does. Collapsing the three into one object
+resolved from a tenant id makes multi-tenancy "resolve a different workspace" rather than
+a refactor of every call site. It also makes the isolation testable, which the store path
+already is and the other two are not.
+
+**`by` comes from a session, not a form field.** Every declaration, override, void and
+restatement already requires it — the audit trail predates the login, which is the right
+order. What is missing is only that nothing checks it. When an identity layer arrives it
+fills `by` from the token and the form field becomes the single-user fallback.
+
+**A migration path.** TODO.md noted there was a schema version, a refusal, and nothing
+between them, and that the first bump had to bring one. The first migration has now
+happened — 1,188 batches restated by hand, from a reviewed plan — so the shape is known:
+versioned, planned before applied, recorded in the ledger, idempotent. Writing it down as
+a mechanism is cheaper now, with one instance to generalise from, than after the second.
+
+### Order
+
+1. **Retain per-rule hits** on the run manifest. Smallest, and everything else on the
+   policy screen is weaker without it: editing a rule without seeing what it reached is a
+   form with no feedback.
+2. **Macro editing**, then **rule editing**. Scalars first because they are a form over
+   JSON with a diff; rules second because they need the proposal-and-approve contract
+   above.
+3. **The results screen**, over the workbook, located from the manifest.
+4. **The workspace seam**, then **the identity seam**, then **the migration mechanism**.
+5. **Decisions in the store (P6)** — and not before. The results screen does not need it;
+   feedback learning does, and that is the thing to build it for.
+
+Still out: multi-node planning, editable facts, and moving the rule engine into a database
+before C/S actually requires it.
 
 ## Not in scope
 

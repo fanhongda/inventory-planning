@@ -94,6 +94,8 @@ class InventoryPlanner:
         # ways honours the same declared file.
         self.declarations = Declarations.load(self.config_dir)
         self._gate_reports: list = []
+        self._rounding = None          # the quantity convention, built once per run
+        self._uom = None               # unit of measure per SKU, resolved once per run
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
         self._fx = None                # set by load_all(); which money was restated, and what could not be
@@ -251,7 +253,10 @@ class InventoryPlanner:
             )
 
         calculator = ShouldBeCalculator(self.config_dir)
-        should_be = calculator.calculate(resolved, actual=inventory_df,
+        should_be = calculator.calculate(
+            resolved, rounding=self.rounding,
+            uom=self.uom_for(item_master_df, planning_master_df, inventory_df),
+            actual=inventory_df,
                                          committed=results.get("mto_schedule"))
         print()
         print(should_be.summary())
@@ -278,9 +283,18 @@ class InventoryPlanner:
         # out, never applied — a parameter that changed because a script decided it
         # should is one nobody can defend in a review.
         suggestions = SuggestionBuilder(self.config_dir).build(
-            resolved, recommendations=results.get("recommendations"))
+            resolved, recommendations=results.get("recommendations"),
+            rounding=self.rounding,
+            uom=self.uom_for(item_master_df, planning_master_df, inventory_df))
         print()
         print(suggestions.summary())
+        # Printed here rather than beside the safety stock: this is the last stage that
+        # produces a quantity, so it is the first point at which the count is the run's
+        # and not one stage's.
+        rounding_note = self.rounding.summary()
+        if rounding_note:
+            print()
+            print(rounding_note)
         stamp = self.run.run_id
         md_path = self.output_dir / f"suggested_rules_{stamp}.md"
         suggestions.to_rules_markdown(md_path)
@@ -529,6 +543,43 @@ class InventoryPlanner:
         if self._intake is not None:
             self.run.record_intake(self._intake)
         return loaded
+
+    def uom_for(self, *frames):
+        """
+        Unit of measure per SKU, resolved once and reused.
+
+        Cached because the stages that need it run in two different methods and the
+        answer must not differ between them: a SKU whose unit is known in the forecast
+        and unknown in the target would be counted twice by the rounding report, once
+        as measured and once as assumed, and the assumption is the number that matters.
+        """
+        if self._uom is None or not len(self._uom):
+            from .analytics.rounding import uom_by_sku
+            resolved = uom_by_sku(*frames)
+            if len(resolved) or self._uom is None:
+                self._uom = resolved
+        return self._uom
+
+    @property
+    def rounding(self):
+        """
+        The `quantity_rounding` convention, built once for the whole run.
+
+        One object rather than one per stage, because every stage that produces a
+        quantity reports into the same counters — and a run that printed the figures
+        rounded by three of its five producers would be stating a number that is simply
+        wrong, in the report whose whole purpose is figures a reader can trust.
+        """
+        if self._rounding is None:
+            from .analytics.rounding import Rounding
+            from .policy.parameters import PlanningParameters
+            try:
+                self._rounding = Rounding.from_conventions(
+                    PlanningParameters(self.parameters_file).conventions)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"  Note: quantity rounding not applied ({exc})")
+                self._rounding = Rounding(mode="none")
+        return self._rounding
 
     def _resting_on(self):
         """
@@ -941,6 +992,19 @@ class InventoryPlanner:
             print(f"      Demand patterns: {pattern_counts}")
         self._report_policy_suggestion(classified, planning_master_df)
 
+        # The rounding convention and the per-SKU unit, resolved once and shared by
+        # the forecast and the safety stock so the two cannot round differently. Read
+        # from the parameter file rather than from `resolved`, which is not built until
+        # after the forecast has run.
+        rounding = self.rounding
+        # Master first: a master's unit is the item's, where a stock row's is whatever
+        # that warehouse happened to record.
+        uom = self.uom_for(item_master_df, planning_master_df, inventory_df)
+        # One convention object shared by every producer of a quantity, so the counts it
+        # reports cover the whole run and no two stages can round differently.
+        self.recommender.rounding = rounding
+        self.recommender.uom = uom
+
         # Step 4: Forecast — must run before safety stock to supply forecast RMSE
         print("\n[4/7] Forecasting demand (6 months)...")
         # MTS competes its models; MTO goes straight to Croston. The policy is the
@@ -949,7 +1013,8 @@ class InventoryPlanner:
                   if planning_master_df is not None
                   and "stocking_policy" in planning_master_df.columns else None)
         forecast_detail = self.forecaster.forecast_all(ts, classified=classified,
-                                                       policy=policy)
+                                                       policy=policy,
+                                                       rounding=rounding, uom=uom)
         # Sales have the last word on the quantity, and no word at all on the error.
         # Applied here, before `summary()` builds the frame that safety stock and the
         # recommender read, so there is exactly one forecast downstream rather than a
@@ -1022,7 +1087,9 @@ class InventoryPlanner:
             review_period_days=resolved.frame[["sku", "review_period_days"]]
             if "review_period_days" in resolved.frame.columns else None,
             exposure=str(resolved.convention("safety_stock_exposure", "review_plus_lt")),
+            rounding=rounding, uom=uom,
         )
+
         sigma_sources = ss_df["sigma_source"].value_counts().to_dict() if "sigma_source" in ss_df.columns else {}
         if sigma_sources:
             print(f"      σ source: {sigma_sources}")

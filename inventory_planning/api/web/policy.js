@@ -1,11 +1,16 @@
 // Policy and runs.
 //
-// There is no Save button on this screen and that is the design, not a stage of it.
-// What a rule needs is review, a diff, a rationale and an owner, and markdown in git
-// gives all four for nothing; a form writing rules into a database would have to rebuild
-// every one of them. So the parameters are shown as they stand, with the file to edit
-// named, and the screen spends its effort on the two things a text editor cannot show:
-// which rule reached which SKUs, and what a change to one did to a run.
+// There is no Save button on this screen yet. What a rule needs is review, a diff, a
+// rationale and an owner, and markdown in git gives all four for nothing — which argued
+// for storing rules in the file, and was then allowed to decide who may operate them,
+// which it does not (INTERFACE.md §7). Editing is the next piece; it will edit the file
+// and keep all four. For now the parameters are shown as they stand, with the file to
+// edit named, and the screen spends its effort on the two things a text editor cannot
+// show: which rule reached which SKUs, and what a change to one did to a run.
+//
+// The first of those comes from a run and is labelled with the run it came from. It is
+// not a property of the rule — the same rule reaches a different number of SKUs next
+// week — so a count with no run behind it would be a number pretending to be a fact.
 //
 // The second of those is the whole point. A parameter change is not a state to inspect.
 // It is the difference between two runs — and whether that difference is attributable to
@@ -51,7 +56,49 @@ function macroCard(body) {
         el("td", { class: "k" }, s.note || "")))))));
 }
 
+// What one rule reached, as a cell. The three silences are kept apart on purpose:
+// a rule nobody has run, a rule whose scope names a column the run did not have, and a
+// rule that ran and matched nothing are three different problems, and only the last one
+// is an invitation to go and rewrite the scope.
+function reachCell(hit) {
+  if (!hit) return el("td", { class: "k" }, "—");
+  if ((hit.unavailable_columns || []).length) {
+    return el("td", { class: "k" },
+      el("span", { class: "tag default" }, "skipped"),
+      el("div", { class: "k" }, `scope needs ${hit.unavailable_columns.join(", ")}`));
+  }
+  if (!hit.matched) {
+    return el("td", { class: "k" },
+      el("span", { class: "tag default" }, "0 SKUs"),
+      el("div", { class: "k" }, "scope may be wrong"));
+  }
+  const standing = hit.effective;
+  const taken = standing !== null && standing !== undefined && standing < hit.matched;
+  return el("td", {},
+    `${hit.matched} SKUs`,
+    (hit.sample_skus || []).length
+      ? el("div", { class: "k" }, hit.sample_skus.slice(0, 3).join(", ")
+          + (hit.matched > 3 ? ` +${hit.matched - hit.sample_skus.slice(0, 3).length}` : ""))
+      : null,
+    taken
+      ? el("div", { class: "k" }, standing
+          ? `${standing} still standing — later rules took the rest`
+          : "every value later overridden — this rule decides nothing")
+      : null);
+}
+
+// A rule that ran and changed nothing: either its scope selected no SKU, or every
+// value it set was taken back by a later rule. Both are worth finding without reading
+// down the table; a rule skipped for a missing column is not, since the file is fine
+// and the run was short of a column.
+function needsAttention(hit) {
+  return Boolean(hit) && !(hit.unavailable_columns || []).length
+    && (!hit.matched || hit.effective === 0);
+}
+
 function rulesCard(body) {
+  const hits = body.hits;
+  const reach = (hits && hits.rules) || null;
   return el("section", { class: "card" },
     el("h2", {}, "Rules in force",
        el("span", { class: "badge" }, `${body.rules.length}`)),
@@ -61,13 +108,16 @@ function rulesCard(body) {
     body.rules.length
       ? el("div", { class: "scroll" }, el("table", {},
           el("thead", {}, el("tr", {},
-            ["rule", "applies to", "sets", "why", "owner"].map((h) => el("th", {}, h)))),
-          el("tbody", {}, body.rules.map((r) => el("tr", {},
+            ["rule", "applies to", "sets", "reached", "why", "owner"]
+              .map((h) => el("th", {}, h)))),
+          el("tbody", {}, body.rules.map((r) => el("tr",
+            { class: needsAttention(reach && reach[r.rule_id]) ? "attention" : null },
             el("td", {}, el("code", {}, r.rule_id),
                el("div", { class: "k" }, r.name)),
             el("td", {}, el("code", {}, r.scope)),
             el("td", {}, Object.entries(r.sets || {})
               .map(([k, v]) => `${k} = ${v}`).join("; ")),
+            reach ? reachCell(reach[r.rule_id]) : el("td", { class: "k" }, "—"),
             el("td", { class: "k" }, r.rationale),
             el("td", { class: "k" }, [r.owner, r.date].filter(Boolean).join(" · ")))))))
       : el("p", { class: "note" }, "No rules — every SKU takes the defaults below."),

@@ -163,12 +163,20 @@ Output files are stamped with the `run_id` rather than the minute. Four independ
 planner trying a rule change, which is the whole point — overwrote each other's CSVs.
 
 A UI now exists over this — see [INTERFACE.md](INTERFACE.md) — and the run diff it
-serves answers only *whether* a difference is attributable, not what moved. What it still
-needs, in order: **per-rule hits retained on the manifest** (`policy/parameters.py`
-counts them and throws them away, so the policy screen has to say it cannot show them),
-and then a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the
-safety-stock total moved by, which recommendations flipped. Neither needs new identity
-work.
+serves answers only *whether* a difference is attributable, not what moved.
+
+**Per-rule hits are retained. Done 2026-09-15.** The manifest carries, per rule, what it
+matched, what was still standing once the later rules had run, the columns a skipped rule
+wanted, and sample SKUs. `GET /policy` finds the newest run under the same rule *bytes* —
+not the same `policy_fingerprint`, which folds in the path, so a scenario copy of the
+rules still matches — and serves the counts keyed by rule id; edit the file and they
+disappear rather than going stale. The standing count is the part worth keeping: `R-001`
+on the sample data matches 4 A-class SKUs and keeps 2, and on the test frame keeps none,
+so `matched` alone reports a dead rule as the busiest on the page.
+
+What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed
+class, what the safety-stock total moved by, which recommendations flipped. It needs no
+new identity work.
 
 **Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the
 root (`--store` / `$INVENTORY_PLANNING_STORE` / `$XDG_DATA_HOME` / `~/.local/share`),

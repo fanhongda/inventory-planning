@@ -571,14 +571,15 @@ class TestPolicyIsShownAndNotEdited:
         assert "safety_stock_exposure" in body["conventions"]
         assert "days_per_year" in body["conventions"]
 
-    def test_it_says_hit_counts_are_not_retained_rather_than_showing_none(self, client):
+    def test_with_no_run_behind_them_it_says_so_rather_than_showing_zeros(self, client):
         """
-        A rule's reach is computed during a run and printed, never stored. Showing an
-        empty count would read as "this rule matched nothing", which is a finding.
+        A rule's reach is a question about a frame of SKUs and there is no frame here,
+        so it takes a run to answer. An empty count would read as "this rule matched
+        nothing", which is a finding rather than a silence.
         """
         body = client.get("/policy").json()
         assert body["hits"] is None
-        assert "not retained" in body["note"]
+        assert "takes a run" in body["note"]
 
     def test_no_endpoint_writes_policy(self, client):
         for method in ("post", "put", "patch", "delete"):
@@ -601,6 +602,159 @@ class TestPolicyIsShownAndNotEdited:
         names = {s["name"] for s in client.get("/policy/macro").json()["settings"]}
         assert "days_per_year" in names
         assert not {n for n in names if "working" in n or "growth" in n}
+
+
+class TestWhatEachRuleReached:
+    """
+    The counts come from a run, are labelled with the run they came from, and are shown
+    only against the rules that produced them. A count carried over from a different
+    rule set would be attached to rules that never produced it, which is worse than the
+    blank it replaced.
+    """
+
+    @pytest.fixture
+    def rules_file(self, workspace):
+        import shutil
+
+        config, _ = workspace
+        for name in ("planning_parameters.md", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return config / "planning_parameters.md"
+
+    def _run_under(self, output_dir, rules_file, hits):
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        manifest = RunManifest.begin(output_dir=output_dir, policy_file=rules_file)
+        manifest.record_rules([h["rule_id"] for h in hits])
+        manifest.record_rule_hits([_FakeHit(h) for h in hits])
+        RunRegistry(output_dir).save(manifest)
+        return manifest
+
+    def _client(self, workspace, output_dir):
+        config, store = workspace
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=output_dir))
+
+    def test_the_counts_come_back_keyed_by_rule_and_named_with_their_run(
+            self, workspace, rules_file, tmp_path):
+        out = tmp_path / "out"
+        run = self._run_under(out, rules_file, [
+            {"rule_id": "R-001", "matched": 12, "effective": 9},
+            {"rule_id": "R-002", "matched": 3, "effective": 3},
+        ])
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"]["run_id"] == run.run_id
+        assert body["hits"]["rules"]["R-001"]["matched"] == 12
+        assert body["hits"]["rules"]["R-001"]["effective"] == 9
+        assert run.run_id in body["note"]
+
+    def test_a_rule_edited_since_the_last_run_shows_no_counts_at_all(
+            self, workspace, rules_file, tmp_path):
+        """
+        Not stale ones, and not zeros. The digest of the file is what the run is found
+        by, so an edit of any kind — including one that leaves every rule id in place —
+        detaches the counts from the rules on screen.
+        """
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        rules_file.write_text(rules_file.read_text(encoding="utf-8")
+                              + "\n<!-- a comment -->\n", encoding="utf-8")
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"] is None
+        assert "edited since the last one" in body["note"]
+
+    def test_a_rule_the_run_never_reported_is_absent_rather_than_zero(
+            self, workspace, rules_file, tmp_path):
+        """
+        The join is by rule id and the caller holds the rules, so a rule with nothing
+        recorded against it is visibly blank instead of a row that quietly reports
+        somebody else's number.
+        """
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        body = self._client(workspace, out).get("/policy").json()
+
+        ids = {r["rule_id"] for r in body["rules"]}
+        assert "R-002" in ids and "R-002" not in body["hits"]["rules"]
+
+    def test_a_run_that_kept_no_reach_is_not_reported_as_an_edit(
+            self, workspace, rules_file, tmp_path):
+        """
+        Every run from before the reach was retained lands here — on the first look at
+        an existing output directory, all of them. Saying the file has been edited
+        would send someone hunting for a change to a file nobody has touched.
+        """
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        out = tmp_path / "out"
+        manifest = RunManifest.begin(output_dir=out, policy_file=rules_file)
+        manifest.record_rules(["R-001"])
+        RunRegistry(out).save(manifest)
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"] is None
+        assert manifest.run_id in body["note"]
+        assert "recorded no per-rule reach" in body["note"]
+        assert "edited" not in body["note"]
+
+    def test_a_miss_inside_a_bounded_scan_does_not_claim_the_file_changed(
+            self, workspace, rules_file, tmp_path, monkeypatch):
+        """
+        The search reads back a bounded number of manifests. A matching run older than
+        that bound is not found, and "not found" is not "does not exist" — the claim
+        the message may make is only the one the search established.
+        """
+        from inventory_planning.api import app as app_module
+
+        monkeypatch.setattr(app_module, "_REACH_SCAN", 2)
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        other = tmp_path / "other_rules.md"
+        other.write_text(rules_file.read_text(encoding="utf-8") + "\n<!-- x -->\n",
+                         encoding="utf-8")
+        for _ in range(3):
+            self._run_under(out, other, [{"rule_id": "R-001", "matched": 1,
+                                          "effective": 1}])
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"] is None
+        assert "2 most recent runs" in body["note"]
+        assert "edited" not in body["note"]
+
+    def test_with_every_run_searched_and_none_matching_it_does_say_edited(
+            self, workspace, rules_file, tmp_path):
+        """The one case where the claim about history is one the search can make."""
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        rules_file.write_text(rules_file.read_text(encoding="utf-8")
+                              + "\n<!-- a comment -->\n", encoding="utf-8")
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert "Every recorded run was searched" in body["note"]
+        assert "edited since the last one" in body["note"]
+
+
+class _FakeHit:
+    """`policy.parameters.RuleHit` as `record_rule_hits` reads it — duck-typed."""
+
+    class _Rule:
+        def __init__(self, rule_id):
+            self.rule_id, self.name, self.scope = rule_id, "", "x == 1"
+            self.overrides = {"review_period_days": 7}
+
+    def __init__(self, spec):
+        self.rule = self._Rule(spec["rule_id"])
+        self.matched = spec["matched"]
+        self.effective = spec["effective"]
+        self.sample_skus = ["A-1"]
+        self.unavailable_columns = []
+        self.overrides_earlier = {}
 
 
 class TestRunsAndTheirDifferences:

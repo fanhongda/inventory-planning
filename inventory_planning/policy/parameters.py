@@ -93,6 +93,11 @@ class RuleHit:
     unavailable_columns: List[str] = dc_field(default_factory=list)
     # param -> the earlier rule whose value this rule replaced
     overrides_earlier: Dict[str, str] = dc_field(default_factory=dict)
+    # SKUs on which at least one of this rule's values was still standing when the file
+    # ran out. `matched` is what the scope selected; a later rule can take all of it
+    # back, and a count that cannot tell those apart reports a dead rule as a live one —
+    # which is precisely the misreading a screen showing hit counts would invite.
+    effective: Optional[int] = None
 
     def __str__(self) -> str:
         if self.unavailable_columns:
@@ -107,6 +112,12 @@ class RuleHit:
         if self.overrides_earlier:
             supers = ", ".join(f"{p} (was {r}'s)" for p, r in self.overrides_earlier.items())
             line += f"\n{'':<14}⚠ overrides {supers}"
+        if self.effective == 0:
+            line += (f"\n{'':<14}⚠ every value later overridden — the rule is matching "
+                     f"but deciding nothing")
+        elif self.effective is not None and self.effective < self.matched:
+            line += (f"\n{'':<14}⚠ standing on {self.effective} of {self.matched} — "
+                     f"later rules took the rest")
         return line
 
 
@@ -345,6 +356,14 @@ class PlanningParameters:
                 overrides_earlier=overridden,
             ))
 
+        # After every rule, not during: whether a rule's value survived is only known
+        # once the file has run out, and the winner-side record (`overrides_earlier`)
+        # tells the rule that took a value, never the one that lost it.
+        standing = self._standing_counts(params.index, claimed)
+        for hit in hits:
+            if not hit.unavailable_columns:
+                hit.effective = standing.get(hit.rule.rule_id, 0)
+
         params["applied_rules"] = self._rule_trace(params.index, claimed)
         return ParameterSet(
             frame=params,
@@ -353,6 +372,24 @@ class PlanningParameters:
             defaults=dict(self.defaults),
             segmentation=dict(self.segmentation),
         )
+
+    @staticmethod
+    def _standing_counts(index: pd.Index,
+                         claimed: Dict[str, pd.Series]) -> Dict[str, int]:
+        """
+        Per rule, the SKUs where at least one of its values was still in force.
+
+        Rows, not rows × parameters: a rule that sets three parameters on one SKU has
+        reached one SKU, and counting it three times would make the number
+        incomparable with `matched`, which is the only number it is ever read beside.
+        """
+        if not claimed:
+            return {}
+        frame = pd.DataFrame(claimed, index=index)
+        rule_ids = {value for series in claimed.values()
+                    for value in series.dropna().unique()}
+        return {str(rule_id): int((frame == rule_id).any(axis=1).sum())
+                for rule_id in rule_ids}
 
     @staticmethod
     def _rule_trace(index: pd.Index, claimed: Dict[str, pd.Series]) -> pd.Series:

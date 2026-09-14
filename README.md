@@ -744,7 +744,10 @@ change) neither collide nor need to be told apart by hand.
 knowledge of *which SKU gets which policy* is business judgment that changes far more
 often than the arithmetic does. Every rule must carry a rationale — three months on, the
 reason is the only thing that lets anyone judge whether the rule still applies. Every run
-prints which rules hit which SKUs, and flags where two rules fight over one parameter.
+prints which rules hit which SKUs, flags where two rules fight over one parameter, and
+says how many SKUs each rule was still deciding once the later rules had run — a rule can
+match hundreds and be taken back on every one of them. The same record is kept on the run
+manifest, which is what lets the policy screen show a rule's reach without a re-run.
 
 ---
 

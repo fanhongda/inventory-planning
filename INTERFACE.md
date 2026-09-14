@@ -243,12 +243,30 @@ between comes back `mixed`, and refuses to attribute.
 Read-only is the design rather than a stage of it, and the page says so. Editing is still
 the file.
 
-One thing the page cannot yet show, and says instead of implying: a rule's hit count.
-`policy/parameters.py` computes which SKUs each rule reached and which it skipped, prints
-it, and throws it away — so there is nothing to display without re-running, and an empty
-count would read as "this rule matched nothing", which is a finding rather than an
-absence. Retaining `ParameterSet.hits` on the run manifest is the next piece of this
-screen and the one worth doing.
+**Per-rule hits, since 2026-09-15.** `policy/parameters.py` computed which SKUs each
+rule reached and which it skipped, printed it, and threw it away; the manifest now keeps
+it, and the page shows it against each rule. Three points decided the shape:
+
+- **The reach comes from a run and is labelled with it.** It is not a property of the
+  rule — the same rule reaches a different number of SKUs next week — so the screen names
+  the run and the facts behind the counts.
+- **Matched on the rules file's digest, not on `policy_fingerprint`**, which folds in the
+  path a run was given. A scenario copy of the same rules is the same rules. Identical
+  bytes also cannot declare a different set of rule ids, which is what makes the counts
+  safe to line up rule by rule. Edit the file and the counts disappear rather than
+  becoming stale: they belonged to the rules as they were.
+- **Three silences are kept apart.** No run under these rules, a scope naming a column
+  the run did not have, and a scope that matched nothing are different problems, and only
+  the last is a reason to go and rewrite a rule. And when the page is blank, the line
+  saying why claims only what the search established: a run under these rules that kept
+  no reach says so, a miss inside a bounded scan says the scan was bounded, and "the file
+  has been edited" is said only when every recorded run was read and none matched.
+
+A rule is also recorded with what was *still standing* at the end of the file, beside
+what it matched. The sample data makes the case: `R-001` gives every A-class SKU a weekly
+review, matches 4, and keeps 2 — the actuator and long-lead rules take the rest. On the
+five-SKU test frame it keeps none at all. `matched` alone would have reported a rule that
+decides nothing as the busiest one on the page.
 
 > **Checked before building this page, and the answer stood.** Two of the settings
 > originally named — calendar versus working days, and a growth target — **do not exist
@@ -547,9 +565,12 @@ a mechanism is cheaper now, with one instance to generalise from, than after the
 
 ### Order
 
-1. **Retain per-rule hits** on the run manifest. Smallest, and everything else on the
-   policy screen is weaker without it: editing a rule without seeing what it reached is a
-   form with no feedback.
+1. **Retain per-rule hits** on the run manifest. **Done, 2026-09-15** — the manifest
+   carries what each rule matched, what was still standing after the later rules, the
+   columns a skipped rule wanted and the sample SKUs; `GET /policy` serves them from the
+   newest run under the same rule bytes and the screen shows them per rule. Details
+   under §2. Smallest, and everything else on the policy screen is weaker without it:
+   editing a rule without seeing what it reached is a form with no feedback.
 2. **Macro editing**, then **rule editing**. Scalars first because they are a form over
    JSON with a diff; rules second because they need the proposal-and-approve contract
    above.

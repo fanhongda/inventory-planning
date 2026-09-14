@@ -1273,6 +1273,11 @@ class InventoryPlanner:
             print(crosscheck.summary())
 
         resolved = planning_params.resolve(attributes)
+        # What the rules reached, beside which rules were in force. Recorded here and
+        # not at parse time because it does not exist until there is a frame to match
+        # against; the console printed it and the manifest kept nothing, which is why
+        # the policy screen could only say it had no counts to show.
+        self.run.record_rule_hits(resolved.hits)
         print()
         print(resolved.summary())
 

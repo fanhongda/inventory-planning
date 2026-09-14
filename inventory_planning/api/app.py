@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional
 
 from ..ingest.contract import default_registry
 from ..ingest.exposure import Assumption, BASIS_ASSUMED, BASIS_DECLARED, measure
-from ..provenance import RunRegistry
+from ..provenance import RunRegistry, sha256_file
 from ..store.fact_store import FactStore, StoreUnavailable
 from ..ingest.templates import contract_fingerprint, emit
 from ..resolution import resolve_frame
@@ -49,6 +49,13 @@ from ..store.query import (
     FactQuery, KeyIncomplete, MixedLayers, NoSuchColumn, QueryUnavailable,
 )
 from ..store.ledger import BatchLedger
+
+# How far back /policy looks for a run under the rules on disk. Bounded because each
+# candidate costs a manifest read, and named because the number appears in the sentence
+# the screen shows when the search comes up empty — a bound the reader is not told about
+# turns "not found" into "does not exist".
+_REACH_SCAN = 50
+
 
 def _require_fastapi():
     try:
@@ -699,16 +706,77 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                 doc_type, as_of=as_of, known_at=known_at, layer=layer)
         return body
 
+    def _reach_of(rules_path: Path) -> Dict[str, Any]:
+        """
+        What these rules last reached, keyed by rule id, or an explanation of why not.
+
+        Keyed rather than ordered: the caller holds the rules and does the join, which
+        means a rule with no entry is visibly a rule with no entry instead of a row
+        that silently slipped one position.
+
+        The explanation is worth as much care as the counts. There are four reasons the
+        page can be blank and they send someone to four different places, so the line
+        says only what the search actually established. "The file has been edited" in
+        particular is a claim about history, and it is only true when every recorded
+        run was examined and none of them was under these bytes.
+        """
+        registry = RunRegistry(service.output_dir)
+        digest = sha256_file(rules_path)
+        run = registry.latest_under_rules(digest, with_hits=True, limit=_REACH_SCAN)
+        if run is not None:
+            return {
+                "hits": {
+                    "run_id": run.get("run_id"),
+                    "run_at": run.get("run_at"),
+                    "input_fingerprint": run.get("input_fingerprint"),
+                    "rules": {h.get("rule_id"): h for h in run.get("rule_hits") or []},
+                },
+                "note": f"Counts are from run {run.get('run_id')} — the newest run "
+                        f"under these exact rules. They move with the facts: a rule "
+                        f"reaches whatever the SKUs of that run made it reach.",
+            }
+        recorded = registry.index()
+        # These rules have run, and that run kept no reach: every run from before the
+        # reach was retained lands here, which on the first look at any existing output
+        # directory is all of them. Reporting that as an edit would send someone to
+        # hunt for a change to a file nobody has touched.
+        ran_without_reach = registry.latest_under_rules(digest, limit=_REACH_SCAN)
+        if ran_without_reach is not None:
+            why = (f"Run {ran_without_reach.get('run_id')} planned under these exact "
+                   f"rules but recorded no per-rule reach — it ran before the reach "
+                   f"was kept, or it stopped before resolving.")
+        elif not recorded:
+            why = f"No runs are recorded under {service.output_dir}."
+        elif len(recorded) > _REACH_SCAN:
+            # The scan is bounded, so a miss inside it is not a miss over the history.
+            why = (f"None of the {_REACH_SCAN} most recent runs planned under these "
+                   f"exact rules. Older runs were not searched, so this does not say "
+                   f"the file has changed.")
+        else:
+            why = ("No run under these exact rules. Every recorded run was searched, "
+                   "so the file has been edited since the last one — and counts from "
+                   "before an edit belong to the rules as they were.")
+        return {
+            "hits": None,
+            "note": why + " Which SKUs a rule reaches is decided against a frame of "
+                          "SKUs, so it takes a run to answer; the next one fills this in.",
+        }
+
     @app.get("/policy")
     def policy() -> Dict[str, Any]:
         """
         The parameter set in force, read-only.
 
-        Read-only is the design, not a stage of it. What a rule needs is review, a diff,
-        a rationale and an owner, and markdown in git gives all four; a form that wrote
-        them into a database would have to rebuild every one. The value an interface adds
-        here is not editing — it is showing which rule reached which SKUs, and what a
-        change to one did to a run, neither of which a text editor can show.
+        Read-only for now, and the value an interface adds here is not the editing
+        anyway — it is showing which rule reached which SKUs, and what a change to one
+        did to a run, neither of which a text editor can show.
+
+        The reach comes from a run, because it has to: a rule's scope is a question
+        about a frame of SKUs, and there is no frame here. So the newest run that
+        planned under *these exact rule bytes* is found in the registry and its counts
+        are shown against the rules they belong to. A run under a different rule set is
+        not a near miss to fall back on — its counts would be attached to rules that
+        never produced them — so when there is none the answer is that there is none.
         """
         from ..policy.parameters import PlanningParameters
 
@@ -730,12 +798,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                  "owner": r.owner, "date": r.date}
                 for r in params.rules
             ],
-            # Deliberately absent, and worth saying rather than leaving to be noticed:
-            # a rule's hit count is computed during a run and printed, never stored, so
-            # there is nothing to show here without re-running.
-            "hits": None,
-            "note": "Rule hit counts are computed during a run and not retained, so "
-                    "which SKUs each rule reached cannot be shown without re-running.",
+            **_reach_of(params.path),
         }
 
     @app.get("/policy/macro")

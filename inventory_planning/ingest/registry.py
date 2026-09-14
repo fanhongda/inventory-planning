@@ -19,7 +19,7 @@ into a DataFrame.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +49,71 @@ _MIN_MARGIN = 0.30
 _ITEM_KEY_FIELDS = frozenset({"sku"})
 
 
+# How far below the best a contract can score and still be a contender. Two documents
+# genuinely share most of their vocabulary — a PO line and a receipt line differ by one
+# date, not by their column list — so scores bunch up and a narrow band is the signal.
+CLOSE_CALL_MARGIN = 0.08
+
+# What `RouteResult.confidence` is a measurement *of*. Three different things have been
+# reported through that one number, and a reader cannot tell them apart:
+#
+#   fingerprint     the file's headers matched a frozen adapter's fingerprint
+#   classification  its headers covered a contract's aliases better than any other's
+#   hint            the caller said so
+#
+# The last is not evidence at all — it is 1.0 because somebody asserted it, and a screen
+# drawing a full green bar for it would be reporting an assertion as a measurement. Which
+# is the distinction the rest of this pipeline spends its time preserving.
+BASIS_FINGERPRINT = "fingerprint"
+BASIS_CLASSIFICATION = "classification"
+BASIS_HINT = "hint"
+
+
+@dataclass
+class Classification:
+    """
+    How the contracts ranked against one file, not just which one won.
+
+    The ranking was always computed and then flattened into the reason string, where the
+    only way to read it back was to search the prose — which `route_uncertain` did, for
+    the substring "close call". A property that decides whether a human is asked to
+    confirm a document, and whether item numbers may be rewritten, rested on the wording
+    of a sentence.
+    """
+
+    doc_type: str
+    score: float
+    reason: str
+    scores: Dict[str, float] = dc_field(default_factory=dict)
+    details: Dict[str, str] = dc_field(default_factory=dict)
+    contenders: List[str] = dc_field(default_factory=list)
+    # Set where the reason used to gain the words "close call", so the structured
+    # reading and the printed one cannot disagree about what happened.
+    close_call: bool = False
+    decided_by_content: bool = False
+
+    @property
+    def ranked(self) -> List[Tuple[str, float]]:
+        return sorted(self.scores.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    @property
+    def runner_up(self) -> Optional[Tuple[str, float]]:
+        rivals = [(t, s) for t, s in self.ranked if t != self.doc_type]
+        return rivals[0] if rivals else None
+
+    @property
+    def margin(self) -> float:
+        """
+        How far clear the winner was. 1.0 when nothing else scored at all.
+
+        A margin is what a reviewer needs and a confidence is not: 83% against a field
+        of 79% is a coin toss, and 83% against 4% is not, and the two are the same
+        number on screen.
+        """
+        rival = self.runner_up
+        return 1.0 if rival is None else self.score - rival[1]
+
+
 @dataclass
 class RouteResult:
     """Outcome of routing one file."""
@@ -59,10 +124,36 @@ class RouteResult:
     confidence: float
     reason: str
     is_draft: bool
+    confidence_basis: str = BASIS_CLASSIFICATION
+    # Present only where classification actually ran. A file matched by a frozen
+    # adapter's fingerprint was never scored against the other contracts, so it has no
+    # ranking — and reporting an empty one is the honest answer rather than a gap.
+    classification: Optional[Classification] = None
 
     @property
     def doc_type(self) -> str:
         return self.contract.doc_type
+
+    @property
+    def scores(self) -> Dict[str, float]:
+        return dict(self.classification.scores) if self.classification else {}
+
+    @property
+    def runner_up(self) -> Optional[Tuple[str, float]]:
+        return self.classification.runner_up if self.classification else None
+
+    @property
+    def margin(self) -> float:
+        return self.classification.margin if self.classification else 1.0
+
+    @property
+    def close_call(self) -> bool:
+        return bool(self.classification and self.classification.close_call)
+
+    @property
+    def stated(self) -> bool:
+        """Routed because the caller said so, not because anything was measured."""
+        return self.confidence_basis == BASIS_HINT
 
     def summary(self) -> str:
         badge = "DRAFT" if self.is_draft else self.adapter.status.upper()
@@ -158,13 +249,18 @@ class AdapterRegistry:
                 confidence=confidence,
                 reason=reason,
                 is_draft=adapter.status == "draft",
+                confidence_basis=BASIS_FINGERPRINT,
             )
 
-        doc_type, doc_confidence, doc_reason = (
-            (doc_type_hint, 1.0, "caller-supplied hint")
-            if doc_type_hint
-            else self.classify(profile, df)
-        )
+        classification = None if doc_type_hint else self.classify(profile, df)
+        if classification is None:
+            doc_type, doc_confidence, doc_reason = doc_type_hint, 1.0, "caller-supplied hint"
+            basis = BASIS_HINT
+        else:
+            doc_type = classification.doc_type
+            doc_confidence = classification.score
+            doc_reason = classification.reason
+            basis = BASIS_CLASSIFICATION
         contract = self.contracts.get(doc_type)
         adapter = self.draft(profile, contract, tenant=tenant, raw=df)
         return RouteResult(
@@ -174,13 +270,15 @@ class AdapterRegistry:
             confidence=doc_confidence,
             reason=f"no adapter matched; drafted from profile ({doc_reason})",
             is_draft=True,
+            confidence_basis=basis,
+            classification=classification,
         )
 
     # ── Document classification ──────────────────────────────────────────────
 
     def classify(
         self, profile: TableProfile, df: pd.DataFrame = None
-    ) -> Tuple[str, float, str]:
+    ) -> Classification:
         """
         Decide which contract a file satisfies, by scoring how well its headers cover
         each contract's aliases — weighted toward required fields, since those are
@@ -191,10 +289,12 @@ class AdapterRegistry:
         time series case that used to need a separate, explicitly-called loader.
         """
         if profile.shape == "wide_periods":
-            return (
-                "demand_timeseries",
-                0.95,
-                f"wide layout with {len(profile.period_columns)} period columns",
+            # Decided by layout, so nothing was scored and there is no runner-up. An
+            # empty ranking is the truthful report of that, not a missing one.
+            return Classification(
+                doc_type="demand_timeseries",
+                score=0.95,
+                reason=f"wide layout with {len(profile.period_columns)} period columns",
             )
 
         scores: Dict[str, float] = {}
@@ -253,30 +353,43 @@ class AdapterRegistry:
         # these documents genuinely share most of their vocabulary — a PO line and a
         # receipt line differ by one date, not by their column list — so the runner-up
         # alone is the wrong shortlist.
-        contenders = [t for t, s in ranked if best_score - s < 0.08]
-        if len(contenders) > 1:
+        band = [t for t, s in ranked if best_score - s < CLOSE_CALL_MARGIN]
+        verdict = Classification(doc_type=best_type, score=best_score, reason=reason,
+                                 scores=scores, details=details, contenders=band)
+        if len(band) > 1:
             # Once the headers are known to be ambiguous, put every document with a
             # content test on the shortlist — not just the ones that happened to score
             # inside the band. The header score is exactly the signal we have already
             # judged unreliable here, so using it to gate the shortlist reintroduces
             # the problem the content test exists to solve.
-            contenders = list(dict.fromkeys(
-                contenders + [t for t, _ in ranked
-                              if (self.contracts.all().get(t) or _NO_CONTRACT).discriminator]
+            shortlist = list(dict.fromkeys(
+                band + [t for t, _ in ranked
+                        if (self.contracts.all().get(t) or _NO_CONTRACT).discriminator]
             ))
-            decided = self._discriminate(df, profile, contenders) if df is not None else None
+            decided = self._discriminate(df, profile, shortlist) if df is not None else None
             if decided:
                 winner, share, runner_up, runner_share = decided
                 versus = (f"vs {runner_share:.0%} for {runner_up}" if runner_up
                           else "and no rival document's test even applied")
-                return winner, best_score, (
+                verdict.doc_type = winner
+                verdict.decided_by_content = True
+                verdict.reason = (
                     f"{details[winner]}; headers could not separate "
-                    f"{len(contenders)} candidates, so the content decided — "
+                    f"{len(shortlist)} candidates, so the content decided — "
                     f"its discriminator holds for {share:.0%} of rows {versus}"
                 )
-            others = ", ".join(f"{t} ({scores[t]:.0%})" for t in contenders[1:])
-            reason += f"  ⚠ close call vs {others}"
-        return best_type, best_score, reason
+                return verdict
+            # Named from the band, not from the shortlist the content test was given.
+            # The shortlist deliberately includes every document with a discriminator,
+            # so listing it here reported "close call vs item_master (0%)" — which is
+            # not a close call, and is read by someone deciding whether to look harder.
+            others = ", ".join(f"{t} ({scores[t]:.0%})" for t in band[1:])
+            # Structured beside the sentence, never derived from it. The two used to be
+            # the same statement in one form, and the reading of it was a substring
+            # search that a reworded message would have silently switched off.
+            verdict.close_call = True
+            verdict.reason = reason + f"  ⚠ close call vs {others}"
+        return verdict
 
     def _discriminate(
         self, df: pd.DataFrame, profile: TableProfile, candidates: List[str]

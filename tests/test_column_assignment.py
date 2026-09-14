@@ -217,3 +217,56 @@ class TestSiblingContractsAgreeOnTheSameParty:
         contract = registry.contracts.get("open_po")
         aliases = contract.fields["supplier"].aliases
         assert "vendor supplying plant" in aliases
+
+
+class TestTheStockExportsOwnVocabulary:
+    """
+    MB52 names the two halves of a stock line `Unrestricted` and `Value Unrestricted`.
+
+    The quantity side was in the aliases and the value side was not, so a stock export
+    mapped its quantity and dropped its money — and `unit_cost` is derived from
+    `inventory_value / qty_on_hand`, so losing one column left every SKU unpriced
+    rather than leaving a visible blank. The value totals then cover a different
+    population from the quantity totals, with nothing marking the boundary.
+    """
+
+    @pytest.mark.parametrize("header", [
+        "Value Unrestricted", "Val. Unrestricted", "Unrestricted Value",
+        "Value_Unrestricted", "Value Unrestricted Use", "Unrestricted Stock Value",
+    ])
+    def test_the_value_column_maps_however_it_is_spelled(self, registry, header):
+        frame = pd.DataFrame({
+            "Material": [f"{5164745 + i}" for i in range(12)],
+            "Plant": ["5051"] * 12,
+            "Unrestricted": [10] * 12,
+            header: [1000.0] * 12,
+        })
+        assigned = _assign(registry, frame, "inventory")
+        assert assigned.get("inventory_value") == header
+
+    def test_the_quantity_side_is_not_stolen_by_the_value_side(self, registry):
+        """Both halves carry the same word; each still has to land on its own field."""
+        frame = pd.DataFrame({
+            "Material": [f"{5164745 + i}" for i in range(12)],
+            "Plant": ["5051"] * 12,
+            "Unrestricted": [10] * 12,
+            "Value Unrestricted": [1000.0] * 12,
+        })
+        assigned = _assign(registry, frame, "inventory")
+        assert assigned.get("qty_on_hand") == "Unrestricted"
+        assert assigned.get("inventory_value") == "Value Unrestricted"
+
+    def test_the_unit_cost_that_falls_out_of_it(self, registry):
+        """The real line: 6,187 on hand against 1,812,172 of value."""
+        from inventory_planning.ingest.intake import Intake
+
+        frame = pd.DataFrame({
+            "Material": ["5164745"] + [f"{9000000 + i}" for i in range(11)],
+            "Plant": ["5051"] * 12,
+            "Unrestricted": [6187] + [10] * 11,
+            "Value Unrestricted": [1812172.0] + [1000.0] * 11,
+        })
+        doc = Intake(verbose=False).load_frame(
+            frame, source_name="stock.xlsx", doc_type_hint="inventory")
+        row = doc.frame[doc.frame["sku"].astype(str) == "5164745"].iloc[0]
+        assert row["unit_cost"] == pytest.approx(292.90, abs=0.01)

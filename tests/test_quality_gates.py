@@ -154,6 +154,67 @@ class TestTheJoinThatMatchesNothing:
         assert finding.why and finding.what
 
 
+class TestAWiderGrainIsNotABrokenJoin:
+    """
+    The one document whose item list is *meant* to be bigger than everyone else's.
+
+    A whole-warehouse stock snapshot holds every material in the DC, most of which
+    have no demand, no PO and no SO. Measured outward — the share of its own items
+    appearing elsewhere — it looks exactly like a stock file numbered in a different
+    system, and the check condemned it on that alone: 9,132 materials against 1,869
+    with demand read as 13% agreement and stopped the run. The planner's answer was
+    `allow_degraded=True`, which then waved through every other blocking finding for
+    the rest of the run.
+
+    A genuinely broken key fails in *both* directions. So which direction is low is
+    the whole distinction, and the fix is in the check rather than in a waiver — a
+    waiver on `sku_agreement`/`inventory` would have silenced the broken case too.
+    """
+
+    def _documents(self, snapshot_size: int, covered: int, demand: int = 1869):
+        sold = [f"{1000000 + i}" for i in range(demand)]
+        stock = ([f"{1000000 + i}" for i in range(covered)]
+                 + [f"{9000000 + i}" for i in range(snapshot_size - covered)])
+        return {
+            "sales_history": _Doc(pd.DataFrame({"sku": sold}), "otd.xlsx"),
+            "inventory": _Doc(pd.DataFrame({"sku": stock}), "stock.xlsx"),
+        }
+
+    def test_a_superset_warns_rather_than_blocks(self):
+        report = quality_checks.gate_intake(
+            _result(self._documents(snapshot_size=9132, covered=1187)),
+            None, GateThresholds.load(None))
+        finding = next(f for f in report.findings if f.check == "sku_agreement")
+        assert finding.severity == WARN
+        assert finding not in report.blocking
+        assert report.passed, "a wider grain must not stop the run"
+
+    def test_it_reports_both_directions(self):
+        report = quality_checks.gate_intake(
+            _result(self._documents(snapshot_size=9132, covered=1187)),
+            None, GateThresholds.load(None))
+        finding = next(f for f in report.findings if f.check == "sku_agreement")
+        assert finding.evidence["superset"] is True
+        assert finding.evidence["agreement"] < 0.2      # outward, low by construction
+        assert finding.evidence["coverage"] > 0.5       # inward, which is what matters
+        assert "of the item numbers the rest of the run uses" in finding.what
+
+    def test_a_snapshot_covering_almost_nothing_still_blocks(self):
+        """Wide and empty is the broken case, not the superset one."""
+        report = quality_checks.gate_intake(
+            _result(self._documents(snapshot_size=9132, covered=100)),
+            None, GateThresholds.load(None))
+        finding = next(f for f in report.blocking if f.check == "sku_agreement")
+        assert finding.severity == BLOCK
+        assert not report.passed
+
+    def test_two_numbering_systems_of_the_same_size_still_block(self):
+        report = quality_checks.gate_intake(
+            _result(self._documents(snapshot_size=1869, covered=40)),
+            None, GateThresholds.load(None))
+        assert [f for f in report.blocking if f.check == "sku_agreement"]
+
+
 class TestDirtDoesNotStopARun:
 
     def _po(self, failure_rate: float):

@@ -26,6 +26,27 @@ the textbook disagree and both are defensible:
                          same rule the inventory projector already applies to actual
                          GIT, reused here so should-be and actual are measured on the
                          same boundary. Comparing them otherwise is meaningless.
+
+## Order-on-demand items are held to a different question
+
+A SKU classed non-stocking holds no cycle and no safety stock: the business has decided
+not to buffer it, and computing a policy stock for it inflates should-be by the whole
+long tail. That much is unchanged.
+
+What it does hold is what it already owes. Goods bought against a confirmed customer
+order, received, and waiting to ship are not speculative and not reducible — and the
+purchase recommender, one stage earlier, is the thing that asked for them. Sizing the
+item at nothing prices that obligation at zero and reports every unit of it as excess
+above policy, so two stages of one pipeline disagree by construction: one raises the
+order, the other calls the result waste. Much of an MTO book is unavoidable for exactly
+this reason.
+
+So an order-on-demand item is sized at `max(policy stock, committed)`, where committed
+is the firm book scoped by lead time — `mto_actionable_qty`, the same number the
+recommender buys against. `max` rather than `+`, mirroring the recommender's
+`max(forecast, backlog)`: the two are estimates of one requirement, and adding them
+counts the same demand twice. A stocking item is untouched, its policy stock already
+covering the demand its backlog is part of.
 """
 
 from __future__ import annotations
@@ -134,8 +155,13 @@ class ShouldBeResult:
                      f"needed across {len(under)} SKUs")
 
         if self.non_stocking_skus:
+            committed = (float(f.loc[f["is_non_stocking"].fillna(False), "committed_value"].sum())
+                         if {"committed_value", "is_non_stocking"} <= set(f.columns) else 0.0)
             lines.append(f"    · {self.non_stocking_skus} SKUs are non-stocking "
                          f"(order on demand) — no cycle or safety stock is planned for them")
+            if committed:
+                lines.append(f"      of which ${committed:,.0f} is firm order book they "
+                             f"still have to cover, not excess")
         if self.unpriced_skus:
             lines.append(f"    ⚠ {self.unpriced_skus} SKUs have no unit cost — "
                          f"counted in units only, excluded from all value totals")
@@ -157,11 +183,17 @@ class ShouldBeCalculator:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    def calculate(self, params: ParameterSet, actual: pd.DataFrame = None) -> ShouldBeResult:
+    def calculate(self, params: ParameterSet, actual: pd.DataFrame = None,
+                  committed: pd.DataFrame = None) -> ShouldBeResult:
         """
         `params.frame` must carry demand_mean, demand_sigma, lead_time_days and the
         resolved policy parameters. `actual` supplies on-hand and in-transit so the gap
         can be measured on the same ownership boundary as should-be.
+
+        `committed` carries `sku` and `mto_actionable_qty` — the firm order book that
+        has to be covered now, from `OpenSOReader.order_by_schedule`. It is what an
+        order-on-demand item is sized against, in place of the policy stock it does not
+        hold.
         """
         df = params.frame.copy()
         conventions = params.conventions
@@ -186,10 +218,31 @@ class ShouldBeCalculator:
         # should-be by the whole long tail and turns a healthy position into a spurious
         # "below policy" gap. Goods already in transit are still owned, so pipeline stays.
         non_stocking = self._non_stocking_mask(df)
+        df["is_non_stocking"] = non_stocking
         if non_stocking.any():
             df.loc[non_stocking, ["cycle_qty", "safety_qty"]] = 0.0
 
+        df["committed_qty"] = self._committed(df, committed)
         df["should_be_qty"] = df["cycle_qty"] + df["safety_qty"] + df["pipeline_qty"]
+
+        # An order-on-demand item holds no *speculative* stock. It does hold what it
+        # already owes: goods bought against a firm order and received, sitting in the
+        # DC until they ship. Zeroing its policy stock and stopping there prices that
+        # obligation at nothing, so every unit of it reads as excess above policy — and
+        # the recommender, one stage earlier, is the thing that told you to buy it.
+        # Two stages of one pipeline then disagree by construction: one raises the
+        # order, the other reports the result as waste.
+        #
+        # `max` rather than `+`, for the same reason the recommender takes
+        # `max(forecast, backlog)`: the policy stock and the order book are two
+        # estimates of one requirement, and adding them buys the same demand twice. A
+        # stocking item is unaffected, because its policy stock already covers the
+        # demand its backlog is part of.
+        if non_stocking.any():
+            df.loc[non_stocking, "should_be_qty"] = np.maximum(
+                df.loc[non_stocking, "should_be_qty"],
+                df.loc[non_stocking, "committed_qty"],
+            )
 
         df, unpriced = self._to_value(df)
         df = self._attach_actual(df, actual)
@@ -228,6 +281,29 @@ class ShouldBeCalculator:
         if "stocking_class" not in df.columns:
             return pd.Series(False, index=df.index)
         return df["stocking_class"].astype(str).str.lower().eq("non-stocking")
+
+    @staticmethod
+    def _committed(df: pd.DataFrame, committed: pd.DataFrame) -> pd.Series:
+        """
+        The firm order book each SKU has to be able to cover now.
+
+        Scoped by lead time rather than by a flat horizon, because that is the scoping
+        that decides whether a commitment is actionable: a line wanted in 45 days on a
+        60-day lead time needed its purchase order two weeks ago. `order_by_schedule`
+        has already done that arithmetic for the recommender; this reads its answer
+        rather than repeating it with a different window.
+        """
+        zero = pd.Series(0.0, index=df.index, dtype=float)
+        if committed is None or not len(committed) or "sku" not in committed.columns:
+            return zero
+        column = next((c for c in ("mto_actionable_qty", "backlog_due_qty", "backlog_qty")
+                       if c in committed.columns), None)
+        if column is None:
+            return zero
+        lookup = (committed.assign(sku=committed["sku"].astype(str))
+                  .groupby("sku")[column].sum())
+        return (df["sku"].astype(str).map(lookup)
+                .astype(float).fillna(0.0).clip(lower=0).round(1))
 
     # ── Components ───────────────────────────────────────────────────────────
 
@@ -347,7 +423,7 @@ class ShouldBeCalculator:
         unpriced = int(cost.isna().sum())
         cost_filled = cost.fillna(0.0)
 
-        for part in ("cycle", "safety", "pipeline", "should_be"):
+        for part in ("cycle", "safety", "pipeline", "committed", "should_be"):
             df[f"{part}_value"] = (df[f"{part}_qty"] * cost_filled).round(2)
         df["unit_cost"] = cost
         df["has_cost"] = cost.notna()

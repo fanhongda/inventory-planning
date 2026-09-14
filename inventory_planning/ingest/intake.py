@@ -26,6 +26,8 @@ from .capabilities import CapabilityResolver, IntakePlan
 from .contract import ContractRegistry, DocContract, default_registry
 from .contract_tests import ContractTester, ContractTestReport
 from .encoding import describe_choice, sniff_encoding
+from .exposure import Assumption, BASIS_DECLARED, GOVERNS_ALL, GOVERNS_BLANKS
+from .templates import NON_DATA_SHEETS, read_meta
 from .profiler import TableProfile
 from .registry import AdapterRegistry, RouteResult
 from .supersede import SupersessionMap, SupersessionReport
@@ -56,6 +58,36 @@ def _same_layout(a: "LoadedDocument", b: "LoadedDocument") -> bool:
         return False
     overlap = len(tokens_a & tokens_b) / min(len(tokens_a), len(tokens_b))
     return overlap >= _PARTITION_HEADER_SIMILARITY
+
+
+def unsupplied_capabilities(frame: pd.DataFrame, contract) -> set:
+    """
+    Capabilities the contract declares but this particular extract cannot back.
+
+    The contract says what a document type *can* provide; only the frame says what
+    arrived. An SAP purchase-record export with no goods-receipt date declares
+    `lead_time_signal` by virtue of being a po_history, and has not one lead time in it.
+    Left unchecked the plan reports the capability satisfied, the analytics find
+    nothing, and the item-master fallback that should have covered for it is never
+    consulted.
+
+    Module level rather than a method, because "what can this document actually supply"
+    is asked by anything showing a person what is still missing, not only by the loader
+    assembling a run.
+    """
+    if not contract.capability_requires:
+        return set()
+
+    missing = set()
+    for capability, needed in contract.capability_requires.items():
+        if capability not in contract.capabilities:
+            continue
+        has_data = any(
+            field in frame.columns and frame[field].notna().any() for field in needed
+        )
+        if not has_data:
+            missing.add(capability)
+    return missing
 
 
 def is_tabular(df: pd.DataFrame) -> Tuple[bool, str]:
@@ -215,8 +247,16 @@ class LoadedDocument:
 
     @property
     def route_uncertain(self) -> bool:
-        return (self.route.confidence < self._CONFIDENT
-                or "close call" in (self.route.reason or ""))
+        """
+        Whether a person should confirm this document before the run is believed.
+
+        This used to search the routing reason for the substring "close call" — a
+        property deciding whether item numbers may be rewritten, resting on the wording
+        of a sentence, switchable off by an edit nobody would think to check. The
+        classifier now records the same fact as a flag, set where the sentence is
+        written, so the two cannot come apart.
+        """
+        return self.route.confidence < self._CONFIDENT or self.route.close_call
 
     def explain(self) -> str:
         """Full provenance for this document — routing, every transform, every test."""
@@ -245,6 +285,11 @@ class IntakeResult:
     # Observations worth stating that are not problems. Kept apart from `failures`
     # so the run does not cry wolf about things the planner already knows.
     notes: List[str] = dc_field(default_factory=list)
+    # Fields this run did not measure — supplied by declaration, or defaulted because
+    # the export never carried them. Carried as data rather than only as a printed note
+    # so a caller can size each one against the money behind it; a list of assumptions
+    # in no particular order is a list nobody finishes reading.
+    assumptions: List[Assumption] = dc_field(default_factory=list)
 
     def frame(self, doc_type: str) -> Optional[pd.DataFrame]:
         doc = self.documents.get(doc_type)
@@ -374,6 +419,7 @@ class Intake:
         tenant: str = "default",
         baseline_path: Union[str, Path] = None,
         verbose: bool = True,
+        declarations=None,
     ):
         self.contracts = contracts or default_registry()
         self.adapters = adapters or AdapterRegistry(contracts=self.contracts)
@@ -382,6 +428,13 @@ class Intake:
         self.tenant = tenant
         self.baseline_path = Path(baseline_path) if baseline_path else None
         self.verbose = verbose
+        # What a person has declared about these documents. Applied over the routed
+        # mapping so one column can be corrected without hand-authoring an adapter —
+        # the setting between "guess" and "freeze" that did not exist, and whose
+        # absence made editing headers in Excel the field remedy.
+        self.declarations = declarations
+        self._declaration_notes: List[str] = []
+        self._assumptions: List[Assumption] = []
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -421,6 +474,28 @@ class Intake:
                     result.notes.append(note)
 
             hint = hints.get(path.name) or hints.get(str(path))
+
+            # A workbook generated from a contract says what it is, so nothing about it
+            # has to be inferred: the headers are the canonical field names and the
+            # `_meta` sheet names the document. A caller's own hint still wins, being
+            # the more specific statement of the two.
+            #
+            # Its companion sheets are skipped by name rather than left to `is_tabular`.
+            # A two-column key/value sheet profiles as a perfectly good table, and a
+            # `_meta` sheet routed as a document would fail somewhere confusing instead
+            # of not happening at all.
+            meta = read_meta(path)
+            if meta is not None:
+                hint = hint or meta.doc_type
+                sheets = [(name, raw) for name, raw in sheets
+                          if name not in NON_DATA_SHEETS]
+                stale = meta.staleness(self.contracts)
+                if stale:
+                    result.notes.append(
+                        f"  ⚠ {path.name} {stale}. It is loaded as it stands — the rows "
+                        f"in it were filled in by a person and are real — but a field "
+                        f"the contract now asks for may have had no column to go in.")
+
             # Only qualify the name when the workbook actually has several sheets;
             # `stock.xlsx[Sheet1]` is noise for the ordinary single-sheet case.
             multi_sheet = len(sheets) > 1
@@ -462,6 +537,16 @@ class Intake:
         suspect = self._check_key_shape(result)
         self._check_sku_agreement(result, suspect)
         self._note_mixed_formats(result)
+        # Declarations last, so what a person asked for and what became of it sit
+        # together at the end of intake rather than scrolling past between files. A
+        # declaration that matched nothing is reported here too — silence there is how
+        # someone comes to believe a mapping is corrected when it is not.
+        result.notes.extend(self._declaration_notes)
+        if self.declarations is not None:
+            result.notes.extend(self.declarations.notes())
+        result.assumptions.extend(self._assumptions)
+        self._declaration_notes = []
+        self._assumptions = []
 
         if self.verbose:
             print(result.summary())
@@ -665,6 +750,10 @@ class Intake:
 
     # Below this share of its SKUs meeting any other document, a file is not joining.
     _SKU_AGREEMENT_FLOOR = 0.20
+    # Held in step with `sku_superset_coverage` in quality/gates.py, which is the
+    # blocking half of the same judgement. The two disagreeing would print a warning
+    # the gate then contradicts.
+    _SKU_SUPERSET_COVERAGE = 0.50
 
     @classmethod
     def _check_sku_agreement(cls, result: IntakeResult, suspect: set = frozenset()) -> None:
@@ -701,9 +790,17 @@ class Intake:
             others = set().union(*(s for dt, s in skus.items() if dt != doc_type))
             if not others:
                 continue
-            share = len(own & others) / len(own)
+            shared = own & others
+            share = len(shared) / len(own)
             if share >= cls._SKU_AGREEMENT_FLOOR:
                 continue
+            # A document whose grain is wider than the rest — a whole-warehouse stock
+            # snapshot against the items that actually sell — has a low outward share
+            # by construction. Saying it "keys on something the other documents do not
+            # use" is then wrong, and it is the wording that sent a planner to
+            # `allow_degraded=True`. The gate makes the same distinction on the same
+            # two directions; see `sku_superset_coverage`.
+            superset = len(shared) / len(others) >= cls._SKU_SUPERSET_COVERAGE
 
             doc = keyed[doc_type]
             mapped = doc.route.adapter.column_map.get("sku", "?")
@@ -713,6 +810,19 @@ class Intake:
                 if len(values) >= _MIN_KEY_DISTINCT
             ]
             best = max(better, default=(0.0, None))
+            if superset:
+                result.notes.append("\n".join([
+                    f"  ⓘ {doc_type} covers more items than the rest of the run.",
+                    f"      {doc.source_name}: sku <- {mapped!r}. Only "
+                    f"{share:.0%} of its {len(own):,} SKUs appear elsewhere, but it "
+                    f"carries {len(shared) / len(others):.0%} of the SKUs the other "
+                    f"documents use — a wider grain, not a different numbering system.",
+                    "      The joins that matter still land. A rollup over its own row "
+                    "count covers a different population from one over the planned "
+                    "items.",
+                ]))
+                continue
+
             lines = [
                 f"  ⚠ {doc_type} keys on something the other documents do not use.",
                 f"      {doc.source_name}: sku <- {mapped!r}, and only "
@@ -811,31 +921,7 @@ class Intake:
         )
 
     def _unsupplied_capabilities(self, doc: LoadedDocument, doc_type: str) -> set:
-        """
-        Capabilities the contract declares but this particular extract cannot back.
-
-        The contract says what a document type *can* provide; only the frame says what
-        arrived. An SAP purchase-record export with no goods-receipt date declares
-        `lead_time_signal` by virtue of being a po_history, and has not one lead time
-        in it. Left unchecked the plan reports the capability satisfied, the analytics
-        find nothing, and the item-master fallback that should have covered for it is
-        never consulted.
-        """
-        contract = self.contracts.get(doc_type)
-        if not contract.capability_requires:
-            return set()
-
-        missing = set()
-        for capability, needed in contract.capability_requires.items():
-            if capability not in contract.capabilities:
-                continue
-            has_data = any(
-                field in doc.frame.columns and doc.frame[field].notna().any()
-                for field in needed
-            )
-            if not has_data:
-                missing.add(capability)
-        return missing
+        return unsupplied_capabilities(doc.frame, self.contracts.get(doc_type))
 
     # ── Reconciling several claims on one document type ──────────────────────
 
@@ -1000,6 +1086,8 @@ class Intake:
         route = self.adapters.route(
             raw, source_name=source_name, doc_type_hint=doc_type_hint, tenant=self.tenant
         )
+        route = self._apply_declared_mapping(route, raw, source_name)
+        route = self._apply_declared_values(route, source_name)
 
         if route.contract.doc_type == "demand_timeseries" and route.profile.shape == "wide_periods":
             frame, log = self._melt_wide(raw, route)
@@ -1036,6 +1124,106 @@ class Intake:
             sheet_name=sheet_name,
             key_candidates=_key_candidates(raw, route.profile),
         )
+
+    def _apply_declared_mapping(self, route, raw: pd.DataFrame, source_name: str):
+        """
+        Merge any declared column mapping over the one routing produced.
+
+        A copy, never a mutation: adapters are cached by the registry and shared across
+        every document of their type, so editing one in place would carry a
+        declaration written for the purchase history into the open PO report — a
+        correction becoming a corruption, in the one place nobody would look.
+
+        A declaration naming a column that is not in the file is reported rather than
+        applied. Applying it would blank the field, which reads downstream as an
+        absent measure rather than as a mistake, and the person who wrote it would
+        have no way to learn it never matched.
+        """
+        if self.declarations is None:
+            return route
+        from dataclasses import replace as dc_replace
+
+        doc_type = route.contract.doc_type
+        headers = [str(c) for c in raw.columns]
+        declared = self.declarations.column_map_for(doc_type, headers, source_name)
+        if not declared:
+            return route
+
+        present = {c: col for c, col in declared.items() if col in raw.columns}
+        for field in sorted(set(declared) - set(present)):
+            column = declared[field]
+            self._declaration_notes.append(
+                f"  ⚠ The declared mapping {field} <- {column!r} names a column "
+                f"{source_name} does not have. Left unapplied — the routed mapping "
+                f"stands, and nothing was corrected.")
+        if not present:
+            return route
+
+        for field, column in sorted(present.items()):
+            was = route.adapter.column_map.get(field)
+            self._declaration_notes.append(
+                f"  ⓘ {doc_type}: {field} <- {column!r} by declaration"
+                + (f" (routing had chosen {was!r})" if was and was != column else ""))
+        adapter = dc_replace(
+            route.adapter, column_map={**route.adapter.column_map, **present})
+        return dc_replace(route, adapter=adapter)
+
+    def _apply_declared_values(self, route, source_name: str):
+        """
+        Supply a field the export never carried, from what a person has declared.
+
+        The case this exists for is currency. A document with no currency column is
+        taken to be in the reporting currency already — the ordinary single-entity
+        export, and a silent 7x error when it is not. The warning names the remedy as
+        `defaults: {currency: XXX}` in the adapter, which on these extracts means
+        hand-authoring a draft adapter that the next run regenerates: the exact
+        practice the declaration layer was built to replace, still being prescribed
+        because nothing was reading a `value` declaration.
+
+        Applied as an adapter default, so it fills only where the field is genuinely
+        absent or empty and never overwrites a value the export did carry. A document
+        that has a currency column keeps it, one line at a time.
+        """
+        if self.declarations is None:
+            return route
+        from dataclasses import replace as dc_replace
+
+        doc_type = route.contract.doc_type
+        overrides = self.declarations.overrides_for("value", doc_type=doc_type)
+        if not overrides:
+            return route
+
+        known = set(route.contract.fields)
+        applied = {o.field: o for o in overrides if o.field in known}
+        for override in overrides:
+            if override.field in applied:
+                continue
+            self._declaration_notes.append(
+                f"  ⚠ The declared value {override.field}={override.value!r} names a "
+                f"field the {doc_type} contract does not have. Left unapplied.")
+        if not applied:
+            return route
+
+        mapped = set(route.adapter.column_map)
+        for field, override in sorted(applied.items()):
+            self._declaration_notes.append(
+                f"  ⓘ {doc_type}: {field} = {override.value!r} by declaration "
+                f"(supplied for {source_name}, which does not carry it)")
+            # A default fills only what the export left empty. Where the field was
+            # never mapped it therefore governs every row and the exposure behind it is
+            # exact; where the export does supply the column, the declaration reaches
+            # only the blanks and the rows it reached cannot be recovered afterwards.
+            self._assumptions.append(Assumption(
+                doc_type=doc_type, field=field, value=override.value,
+                basis=BASIS_DECLARED,
+                governs=GOVERNS_BLANKS if field in mapped else GOVERNS_ALL,
+                reason=override.reason, by=override.by,
+            ))
+        adapter = dc_replace(route.adapter, defaults={
+            **route.adapter.defaults,
+            **{field: o.value for field, o in applied.items()},
+        })
+        return dc_replace(route, adapter=adapter)
 
     # ── Wide-format handling ─────────────────────────────────────────────────
 

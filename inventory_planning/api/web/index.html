@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Import review — inventory planning</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Inventory planning &middot; intake</h1>
+</header>
+
+<nav id="tabs"></nav>
+
+<main>
+<div id="screen-review">
+  <p class="lede">
+    Upload an export and see what it was read as. <strong>Nothing here enters a
+    planning run</strong> — not until you say so.
+  </p>
+  <section id="drop" class="drop">
+    <input type="file" id="file" hidden>
+    <button id="pick" class="primary">Choose a file</button>
+    <span class="hint">or drop one here &middot; CSV / Excel</span>
+    <p id="status" class="status" hidden></p>
+  </section>
+
+  <div id="requirements"></div>
+  <div id="results"></div>
+</div>
+
+<div id="screen-policy" hidden>
+  <p class="lede">
+    The parameters in force, and what a change to one did to a run. Read-only on
+    purpose — a rule wants review, a diff, a rationale and an owner, and version
+    control gives all four.
+  </p>
+  <div id="policy-body"></div>
+</div>
+
+<div id="screen-browse" hidden>
+  <p class="lede">
+    What has been promoted into the store. Facts are appended and never edited: a
+    correction is a new batch or an override, and a withdrawal voids a whole batch.
+  </p>
+  <div id="browse-top"></div>
+  <div id="browse-body"></div>
+  <div id="batch-detail"></div>
+</div>
+</main>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

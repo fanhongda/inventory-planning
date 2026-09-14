@@ -34,6 +34,7 @@ from .ingest.encoding import write_csv
 from .quality import DataQualityError, GateReport, GateThresholds
 from .quality import assess as assess_run_health
 from .quality import checks as quality_checks
+from .store.declarations import Declarations
 
 
 def _price_lookup(sop):
@@ -88,6 +89,10 @@ class InventoryPlanner:
         # travels into the manifest, so an output produced under one says so.
         self.allow_degraded = bool(allow_degraded)
         self.gate_thresholds = GateThresholds.load(self.config_dir)
+        # Per-check, per-document waivers, and the mapping corrections that reach
+        # intake. Loaded here rather than passed in so a planner built any of the four
+        # ways honours the same declared file.
+        self.declarations = Declarations.load(self.config_dir)
         self._gate_reports: list = []
         self._intake = None            # set by load_all(); carries adapter provenance
         self._intake_plan = None       # set by load_all(); what this run can answer
@@ -246,7 +251,8 @@ class InventoryPlanner:
             )
 
         calculator = ShouldBeCalculator(self.config_dir)
-        should_be = calculator.calculate(resolved, actual=inventory_df)
+        should_be = calculator.calculate(resolved, actual=inventory_df,
+                                         committed=results.get("mto_schedule"))
         print()
         print(should_be.summary())
 
@@ -276,18 +282,9 @@ class InventoryPlanner:
         print()
         print(suggestions.summary())
         stamp = self.run.run_id
-        csv_path = suggestions.to_csv(self.output_dir / f"parameter_suggestions_{stamp}.csv")
         md_path = self.output_dir / f"suggested_rules_{stamp}.md"
         suggestions.to_rules_markdown(md_path)
-        print(f"\n    Per-SKU suggestions : {csv_path}")
-        print(f"    Paste-able rules    : {md_path}")
-
-        if len(health.by_family):
-            write_csv(health.by_family, self.output_dir / f"dioh_by_family_{stamp}.csv")
-        if len(health.slow_moving):
-            write_csv(health.slow_moving, self.output_dir / f"slow_moving_{stamp}.csv")
-        if len(health.long_aging):
-            write_csv(health.long_aging, self.output_dir / f"long_aging_{stamp}.csv")
+        print(f"\n    Paste-able rules    : {md_path}")
 
         if len(crosscheck.all_disagreements):
             xc_path = self.output_dir / f"source_crosscheck_{stamp}.csv"
@@ -323,6 +320,12 @@ class InventoryPlanner:
             print()
             print(frontier.summary())
             out["frontier"] = frontier
+
+        # Rewritten now that the policy stage has produced the half of the workbook the
+        # planning stage could not: should-be, the suggestions, the S&IOP projection.
+        workbook = self._save_workbook(results, out)
+        if workbook is not None:
+            print(f"\n    Planning workbook   : {workbook}")
 
         self._quality_log.append({
             "doc_type": "policy",
@@ -507,6 +510,52 @@ class InventoryPlanner:
             self._store = False
         return self._store or None
 
+    def absorb_intake(self, loaded: dict) -> dict:
+        """
+        Take what an intake pass found, so this run can report it later.
+
+        `load_all` did this inline, which quietly made the two entry points behave
+        differently: the per-flag CLI path calls the bridge itself for the masters and
+        discarded the intake result, so a run started that way had no adapter
+        provenance to record and no assumptions to size — the same files, read the same
+        way, reporting less because of which function the caller happened to use.
+
+        Mutates and returns `loaded`, with the three private keys removed, so the rest
+        can be passed straight on as planning arguments.
+        """
+        self._intake = loaded.pop("_intake", None) or self._intake
+        self._intake_plan = loaded.pop("_intake_plan", None) or self._intake_plan
+        self._fx = loaded.pop("_fx", None) or self._fx
+        if self._intake is not None:
+            self.run.record_intake(self._intake)
+        return loaded
+
+    def _resting_on(self):
+        """
+        Every figure this run could not measure, sized against the money behind it.
+
+        Reads the intake result's own frames rather than the ones assembled above: those
+        are the canonical frames the contracts describe, and the contract is what says
+        which column is money and which is a count. The consolidated inventory frame has
+        already summed its storage locations by this point, and sizing an assumption
+        against a frame whose grain has moved is how a plausible wrong number gets made.
+        """
+        if self._intake is None:
+            return None
+        from .ingest.exposure import assemble, measure
+
+        reporting = str(getattr(self._fx, "reporting_currency", "") or "")
+        assumptions = assemble(
+            declared=self._intake.assumptions,
+            assumed_doc_types=list(getattr(self._fx, "assumed_documents", []) or []),
+            reporting_currency=reporting,
+        )
+        if not assumptions:
+            return None
+        frames = {dt: doc.frame for dt, doc in self._intake.documents.items()}
+        contracts = {dt: doc.route.contract for dt, doc in self._intake.documents.items()}
+        return measure(assumptions, frames, contracts, reporting_currency=reporting)
+
     def _shadow_write(self, frames: dict, valid_time) -> None:
         """
         Write this run's facts to the store, which nothing reads yet.
@@ -523,6 +572,22 @@ class InventoryPlanner:
         whatever it described. Per-document valid times — an inventory snapshot date
         that differs from the sales anchor — belong with the merge interface, which
         needs a reviewed plan in front of a human anyway.
+
+        **What is stored is the canonical frame, not the prepared one.** The frames this
+        method is handed have been through `ingest_bridge._prepare`: money converted into
+        the reporting currency at whatever `config/fx_rates.json` said today, a location
+        stamped on from `node_config.json`. Storing those makes the stored number depend
+        on two config files — correct a rate and yesterday's fact changes meaning, with
+        no record that it did. A fact whose value moves when a config file is edited is
+        not a fact. Both are recoverable from the canonical frame by replaying the
+        conversion, which is the same argument the landing layer rests on: keep what was
+        read, replay what was decided.
+
+        So the canonical frame is preferred wherever intake produced one. The per-flag
+        CLI path loads the five core documents through the legacy readers instead, and
+        there is no canonical frame to prefer — those are still written, marked
+        `prepared`, because history not collected cannot be recovered later. The mark is
+        what stops the two being added together afterwards.
         """
         store = self.store
         if store is None:
@@ -532,10 +597,19 @@ class InventoryPlanner:
                   "batch with a guessed valid_time is worse than no batch")
             return
 
+        from .store.ledger import LAYER_CANONICAL, LAYER_PREPARED
+
         by_source = {i.doc_type: i for i in self.run.inputs}
+        canonical = {dt: doc.frame for dt, doc in self._intake.documents.items()} \
+            if self._intake is not None else {}
         seen_notes = len(store.notes)
         written = 0
-        for doc_type, frame in frames.items():
+        prepared_only = []
+        for doc_type, prepared in frames.items():
+            frame = canonical.get(doc_type, prepared)
+            layer = LAYER_CANONICAL if doc_type in canonical else LAYER_PREPARED
+            if layer == LAYER_PREPARED:
+                prepared_only.append(doc_type)
             if frame is None or not len(frame):
                 continue
             record = by_source.get(doc_type)
@@ -543,6 +617,7 @@ class InventoryPlanner:
                 batch = store.write_batch(
                     doc_type=doc_type,
                     frame=frame,
+                    frame_layer=layer,
                     valid_time=valid_time,
                     source_name=record.name if record else "",
                     source_sha=record.sha256 if record else None,
@@ -559,6 +634,11 @@ class InventoryPlanner:
                 written += 1
         if written:
             print(f"  Retained: {written} batch(es) as of {valid_time} -> {store.root}")
+        if prepared_only:
+            print(f"  Note: {', '.join(sorted(prepared_only))} came from the legacy "
+                  f"readers, so what was retained is the prepared frame — money already "
+                  f"converted, location already stamped. Marked as such; a reading will "
+                  f"not mix it with a canonical batch of the same document.")
         # A run that retained nothing is the normal case for a re-run of the same
         # extract, and saying so is the difference between "already have this" and a
         # store that has quietly stopped working.
@@ -595,12 +675,8 @@ class InventoryPlanner:
             baseline_path=self.output_dir.parent / "ingest_baselines.json",
         )
 
-        plan = inputs["_intake_plan"]
-        self._intake = inputs.pop("_intake", None)
-        self._intake_plan = inputs.pop("_intake_plan", None)
-        self._fx = inputs.pop("_fx", None)
-        if self._intake is not None:
-            self.run.record_intake(self._intake)
+        self.absorb_intake(inputs)
+        plan = self._intake_plan
 
         self._write_supersession_record()
 
@@ -630,8 +706,12 @@ class InventoryPlanner:
                 "no alias and could not be derived:\n"
                 f"{detail}\n\n"
                 "    Run `python -m inventory_planning.explain <file>` to see which "
-                "source columns went unmatched, then add the right one as an alias to "
-                "the contract."
+                "source columns went unmatched.\n\n"
+                "    Check config/declarations.yaml first: a `scope: mapping` override "
+                "there is reviewed and attributable, and it outranks a frozen adapter "
+                "without you having to hand-edit one — see the worked examples already "
+                "in that file. Add an alias to the contract only when the right column "
+                "will never be ambiguous for anyone else's export of this document."
             )
         # Everything above is about a document being absent or unreadable. This is
         # about the documents being present, readable, and not describing the same
@@ -807,6 +887,16 @@ class InventoryPlanner:
         }, anchor=as_of)
         print()
         print(intake.summary())
+
+        # Beside the totals, and for the same reason: what the totals rest on. An
+        # assumption governing every line of the stock snapshot and one governing four
+        # rows of a sample used to print identically, so the list was read in file order
+        # rather than in the order that matters. Sorted by the money behind each one, the
+        # 12m assumption is the first line instead of the fourth.
+        resting = self._resting_on()
+        if resting is not None and resting.items:
+            print()
+            print(resting.summary())
 
         self._shadow_write({
             "sales_history": sales_df, "po_history": po_history_df,
@@ -1047,6 +1137,12 @@ class InventoryPlanner:
             "crosscheck": crosscheck,
             "policy_profile": profile,
             "backlog_realization": realization,
+            # Carried so the policy layer sizes an order-on-demand item against the same
+            # commitment the recommender buys for. Rebuilding it there would give the
+            # two stages their own copy of one number, and the first time they drifted
+            # the report would call excess the stock the recommendation had just asked
+            # for.
+            "mto_schedule": mto_schedule,
             "sop": sop,
             "siop": siop,
             "forecast_accuracy": accuracy,
@@ -1202,39 +1298,45 @@ class InventoryPlanner:
             as_of=as_of,
         )
 
+    def _save_workbook(self, results: dict, policy: dict = None):
+        """
+        The run as one file. Never allowed to fail the run it reports on.
+
+        Called twice — once with what planning produced, once with the policy stage's
+        additions on top — because a run that stops at the gate in between should still
+        leave something readable rather than a folder of nothing.
+        """
+        from .reporting.workbook import build_workbook
+
+        path = self.output_dir / f"planning_{self.run.run_id}.xlsx"
+        try:
+            written = build_workbook(
+                path, results, policy,
+                currency=str(getattr(self._fx, "reporting_currency", "USD") or "USD"))
+        except Exception as e:                     # pragma: no cover - reported, not raised
+            print(f"  Warning: workbook not written ({e})")
+            return None
+        if written is not None:
+            self.run.record_output(written)
+        return written
+
     def _save_outputs(self, results: dict) -> None:
         ts_str = self.run.run_id
         out = self.output_dir
 
-        # ── CSV outputs ───────────────────────────────────────────────────────
-        write_csv(results["supplier_lt"], out / "supplier_params.csv")
-        write_csv(results["classified_demand"], out / "sku_planning_params.csv")
-        write_csv(results["projection"], out / f"inventory_projection_{ts_str}.csv")
-        write_csv(results["forecast_detail"], out / f"forecast_detail_{ts_str}.csv")
-        sheet = self.forecaster.history_and_forecast(
+        # ── The workbook ──────────────────────────────────────────────────────
+        #
+        # Sixteen CSVs named for the stage that produced them, where the question a
+        # planner arrives with is answered by joining four of them. Written here with
+        # whatever the planning stage has, and again by the policy stage with the rest —
+        # same path, so a run that stops early still leaves a readable file.
+        results["forecast_sheet"] = self.forecaster.history_and_forecast(
             results["time_series"], results["forecast_detail"])
-        if len(sheet):
-            write_csv(sheet, out / f"forecast_{ts_str}.csv")
+        self._save_workbook(results)
 
-        # The review sheet, in the format the reviewer opens it in. CSV as well as
-        # xlsx: the xlsx is what goes to sales, and the CSV is what survives being
-        # read back by anything else.
-        accuracy = results.get("forecast_accuracy")
-        if accuracy is not None:
-            if len(accuracy.by_sku):
-                write_csv(accuracy.by_sku, out / f"forecast_bias_by_sku_{ts_str}.csv")
-            if len(accuracy.by_family):
-                write_csv(accuracy.by_family,
-                          out / f"forecast_bias_by_family_{ts_str}.csv")
-            if len(accuracy.adjustments):
-                write_csv(accuracy.adjustments,
-                          out / f"sales_review_adjustments_{ts_str}.csv")
-
-        siop = results.get("siop")
-        if siop is not None and len(siop.by_period):
-            write_csv(siop.by_period, out / f"siop_by_period_{ts_str}.csv")
-            if len(siop.by_family):
-                write_csv(siop.by_family, out / f"siop_by_family_{ts_str}.csv")
+        # Kept as its own CSV: SKU x supplier, which no per-SKU sheet can hold without
+        # either dropping a supplier or repeating an item.
+        write_csv(results["supplier_lt"], out / "supplier_params.csv")
 
         sop = results.get("sop")
         if sop is not None and len(sop.sheet):
@@ -1245,15 +1347,6 @@ class InventoryPlanner:
                 self.run.record_output(xlsx, rows=len(sop.sheet))
             except Exception as e:
                 print(f"  Warning: S&OP workbook not written ({e})")
-        write_csv(results["recommendations"], out / f"purchase_recommendations_{ts_str}.csv")
-
-        profile = results.get("policy_profile")
-        if profile is not None and len(profile.frame):
-            write_csv(profile.frame, out / f"policy_profile_{ts_str}.csv")
-
-        realization = results.get("backlog_realization")
-        if realization is not None and len(realization.per_sku):
-            write_csv(realization.per_sku, out / f"backlog_realization_{ts_str}.csv")
 
         # What each checkpoint found, including the ones that passed. Written every run
         # rather than only on failure: "the gates found nothing" is a statement about
@@ -1425,7 +1518,7 @@ class InventoryPlanner:
                 print(f"    {str(r['sku']):<14} {r['on_hand_cover_days']:>6.1f}d on the shelf, "
                       f"bare for {r['supply_gap_days']:>5.1f}d — {nxt}{late}")
             if len(gap) > 10:
-                print(f"    … and {len(gap) - 10} more, in the recommendations CSV")
+                print(f"    … and {len(gap) - 10} more, on the Purchase sheet")
 
         purchase_skus = recommendations[recommendations["recommended_action"] == "PURCHASE-REQUEST"]
         if len(purchase_skus):
@@ -1484,6 +1577,16 @@ class InventoryPlanner:
         a trace, and the first time a threshold turned out to be wrong on somebody's
         data the answer would be to delete the check.
         """
+        # Declared waivers first. A waiver is narrower than `allow_degraded` by
+        # construction — one check on one document — so waiving the SKU-agreement
+        # finding on a whole-warehouse stock snapshot does not also wave through an
+        # open PO quantity that was mapped to a money column. The finding is not
+        # hidden: it is downgraded, still printed, and still travels into the manifest
+        # carrying who waived it and until when.
+        declarations = getattr(self, "declarations", None)
+        if declarations is not None:
+            report = declarations.waive(report)
+
         self._gate_reports.append(report)
         if report.findings:
             print()

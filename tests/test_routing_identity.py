@@ -95,7 +95,10 @@ class TestIdentifyingAny:
         po_history = pd.read_csv(SAMPLE_DIR / "po_history.csv", dtype=str)
         from inventory_planning.ingest.profiler import Profiler
         profile = Profiler().profile(po_history, source_name="po_history.csv")
-        _, _, _ = registry.classify(profile, po_history)
+        # The ranking is now returned rather than flattened into the reason string, so
+        # the claim this test makes can be asserted directly instead of implied.
+        verdict = registry.classify(profile, po_history)
+        assert verdict.scores["item_master"] == 0.0
 
         contract = registry.contracts.get("item_master")
         hit = set(registry._assign_columns(profile, contract))

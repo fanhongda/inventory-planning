@@ -176,9 +176,13 @@ class DataQualityError(ValueError):
         )
         body = "\n".join(f.summary(indent="  ") for f in blocking)
         tail = (
-            "\n\n  Fix the cause and re-run. To proceed anyway — every figure then rests "
-            "on data that did not pass, and the run records that it was overridden — "
-            "construct the planner with allow_degraded=True."
+            "\n\n  Fix the cause and re-run. If this finding is a false positive for "
+            "this document — not a real defect — add a `gate_waivers` entry in "
+            "config/declarations.yaml scoped to this one check, with an expiry: it is "
+            "recorded, attributable, and narrower than the alternative below.\n\n"
+            "  To proceed anyway regardless of cause — every figure then rests on data "
+            "that did not pass, and the run records that it was overridden — construct "
+            "the planner with allow_degraded=True."
         )
         super().__init__(head + body + tail)
 
@@ -192,6 +196,20 @@ _DEFAULTS: Dict[str, float] = {
     # already computes this agreement and warns; the gate is where it stops being
     # advice.
     "sku_agreement_floor": 0.20,
+    # The other direction, and what separates a superset from a broken join.
+    #
+    # A whole-warehouse stock snapshot holds every material in the DC, most of which
+    # have no demand, no PO and no SO — so the share of *its* items appearing elsewhere
+    # is low by construction, and measuring only that direction condemns the one
+    # document whose grain is meant to be wider than the rest. The run it fired on had
+    # 9,132 materials against 1,869 with demand, and the planner's answer was
+    # `allow_degraded=True`, which then waved through every other blocking finding too.
+    #
+    # A genuinely broken key fails both directions: stock numbered `Z-*` against sales
+    # numbered `P-*` covers nothing of what the rest of the run references. So low
+    # outward agreement is a warning where inward coverage is high, and blocks only
+    # where it is not.
+    "sku_superset_coverage": 0.50,
     # Product family coverage across the SKUs actually being planned. Partial coverage
     # is the dangerous case: `assemble._infer_family` fills the rest from the part
     # number, so a family rollup is part master data and part numbering scheme with

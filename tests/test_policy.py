@@ -194,6 +194,90 @@ class TestShouldBe:
         assert result.excess_value != pytest.approx(max(result.gap_value, 0))
         assert "EXCESS" in result.summary() and "SHORTFALL" in result.summary()
 
+    def test_an_order_on_demand_item_holds_no_speculative_stock(self, params, skus, actual):
+        """The existing behaviour, unchanged: no cycle, no safety, pipeline only."""
+        skus["abc_class"] = params.assign_abc(skus)
+        skus["stocking_class"] = ["non-stocking"] + ["stocking-med"] * 4
+
+        row = (ShouldBeCalculator(CONFIG_DIR)
+               .calculate(params.resolve(skus), actual)
+               .frame.set_index("sku").loc["ACT-1"])
+
+        assert row["cycle_qty"] == 0.0
+        assert row["safety_qty"] == 0.0
+
+    def test_a_firm_order_book_is_not_excess(self, params, skus, actual):
+        """
+        Stock an order-on-demand item bought against a confirmed order, received and
+        waiting to ship, used to read as excess above policy in full — while the
+        recommender one stage earlier was the thing that asked for it. The two stages
+        of one pipeline disagreed by construction.
+        """
+        skus["abc_class"] = params.assign_abc(skus)
+        skus["stocking_class"] = ["non-stocking"] + ["stocking-med"] * 4
+        # Nothing in transit: the goods have landed, which is exactly the moment the
+        # old arithmetic priced the obligation at nothing.
+        landed = actual.copy()
+        landed["qty_on_hand"] = [800.0, 700.0, 9000.0, 1200.0, 500.0]
+        landed["qty_in_transit"] = 0.0
+        committed = pd.DataFrame({"sku": ["ACT-1"], "mto_actionable_qty": [800.0]})
+
+        calc = ShouldBeCalculator(CONFIG_DIR)
+        without = calc.calculate(params.resolve(skus), landed).frame.set_index("sku")
+        with_book = calc.calculate(params.resolve(skus), landed,
+                                   committed=committed).frame.set_index("sku")
+
+        # Without the book, everything above the (demand-driven) pipeline reads as
+        # excess; with it, the obligation is covered and the gap closes.
+        assert without.loc["ACT-1", "gap_qty"] > 700.0           # nearly all called excess
+        assert with_book.loc["ACT-1", "should_be_qty"] == 800.0
+        assert with_book.loc["ACT-1", "gap_qty"] == 0.0          # owed, not excess
+
+    def test_uncommitted_stock_on_the_same_item_is_still_excess(self, params, skus, actual):
+        """The obligation is covered; the leftover above it is not spared."""
+        skus["abc_class"] = params.assign_abc(skus)
+        skus["stocking_class"] = ["non-stocking"] + ["stocking-med"] * 4
+        landed = actual.copy()
+        landed["qty_on_hand"] = [1000.0, 700.0, 9000.0, 1200.0, 500.0]
+        landed["qty_in_transit"] = 0.0
+        committed = pd.DataFrame({"sku": ["ACT-1"], "mto_actionable_qty": [600.0]})
+
+        row = (ShouldBeCalculator(CONFIG_DIR)
+               .calculate(params.resolve(skus), landed, committed=committed)
+               .frame.set_index("sku").loc["ACT-1"])
+
+        assert row["should_be_qty"] == 600.0
+        assert row["gap_qty"] == 400.0
+
+    def test_a_stocking_item_does_not_count_its_backlog_twice(self, params, skus, actual):
+        """
+        Its policy stock already covers the demand the backlog is part of, so adding
+        the order book on top would buy the same demand twice — the error the
+        recommender's `max(forecast, backlog)` exists to avoid, on the other side of
+        the same pipeline.
+        """
+        skus["abc_class"] = params.assign_abc(skus)
+        skus["stocking_class"] = ["stocking-med"] * 5
+        committed = pd.DataFrame({"sku": ["ACT-1"], "mto_actionable_qty": [50.0]})
+
+        calc = ShouldBeCalculator(CONFIG_DIR)
+        without = calc.calculate(params.resolve(skus), actual).frame.set_index("sku")
+        with_book = calc.calculate(params.resolve(skus), actual,
+                                   committed=committed).frame.set_index("sku")
+
+        assert (with_book.loc["ACT-1", "should_be_qty"]
+                == without.loc["ACT-1", "should_be_qty"])
+
+    def test_the_order_book_it_covers_is_named_in_the_summary(self, params, skus, actual):
+        skus["abc_class"] = params.assign_abc(skus)
+        skus["stocking_class"] = ["non-stocking"] + ["stocking-med"] * 4
+        committed = pd.DataFrame({"sku": ["ACT-1"], "mto_actionable_qty": [800.0]})
+
+        text = (ShouldBeCalculator(CONFIG_DIR)
+                .calculate(params.resolve(skus), actual, committed=committed).summary())
+
+        assert "firm order book" in text
+
     def test_unpriced_skus_are_reported_not_imputed(self, params, skus, actual):
         skus.loc[0, "unit_cost"] = np.nan
         skus["abc_class"] = params.assign_abc(skus)

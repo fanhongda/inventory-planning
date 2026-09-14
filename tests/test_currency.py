@@ -218,6 +218,26 @@ class TestConversion:
         assert report.skipped
         assert "fx_rate_applied" not in out.columns
 
+    def test_an_assumed_currency_is_loud_enough_to_be_printed(self, table):
+        """
+        The assumption has to reach the run log.
+
+        A single-currency run that assumed the wrong currency produces no converted
+        rows and no unrated rows, so it used to satisfy neither of the conditions the
+        caller printed on — and the warning written for exactly this case was never
+        shown. The whole failure is that it looks identical to a correct run.
+        """
+        from inventory_planning.fx import FxSummary
+
+        df = _po_history([{"sku": "A", "po_date": "2025-03-01", "po_amount": 1000.0}])
+        _, report = convert_money(df, "po_history", table)
+
+        summary = FxSummary(reporting_currency="USD", reports={"po_history": report})
+        assert not summary.multi_currency          # the reason it used to stay silent
+        assert summary.needs_attention             # and why it no longer does
+        assert summary.assumed_documents == ["po_history"]
+        assert "no currency column" in summary.summary()
+
     def test_case_and_whitespace_in_the_code_do_not_break_the_lookup(self, table):
         df = _po_history([
             {"sku": "A", "po_date": "2025-03-01", "currency": " gbp ", "po_amount": 1000.0},

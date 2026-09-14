@@ -346,3 +346,112 @@ class TestAPolicyIsSuggestedWhereverThereIsASeries:
                .classify(summary, ts).set_index("sku"))
         assert out.loc["A", "suggested_stocking_policy"] == "MTS"
         assert pd.isna(out.loc["NO-SERIES", "suggested_stocking_policy"])
+
+
+class TestIntermittentDemandIsScoredHonestly:
+    """
+    The metric that ranks the models has to be defined on the months with no demand,
+    because on an intermittent item those are most of the months.
+
+    MAPE is not: it divides by the actual, so it can only score the months that carried
+    demand and drops the rest. The drop has a direction. A model forecasting the order
+    size every month is never charged for the months it invented, while one forecasting
+    near zero is charged in full on the few it missed — so the highest line wins, and an
+    item ordering once a quarter is forecast as if it ordered monthly.
+
+    RMSE over every period tilts the other way on the same series: mostly-zero actuals
+    are best fitted by predicting zero, so a genuinely recurring lumpy item is forecast
+    flat at nothing and its should-be goes with it.
+    """
+
+    # Demand in two months of every three: enough non-zero actuals for MAPE to have
+    # been chosen under the old rule, and eight zero months for it to have discarded.
+    ERRATIC = [80, 0, 120, 90, 0, 110, 70, 0, 95, 105, 0, 85,
+               90, 0, 100, 115, 0, 75, 95, 0, 105, 88]
+
+    def test_a_series_with_zero_months_is_not_ranked_on_a_percentage(self):
+        _, row = _run(self.ERRATIC)
+        assert row["selected_by"] == "backtest:mase"
+
+    def test_a_series_without_zero_months_still_reads_as_a_percentage(self):
+        """MAPE is what a planner reads, and it is honest where nothing was dropped."""
+        _, row = _run(list(np.linspace(100, 130, 22)))
+        assert row["selected_by"] == "backtest:mape"
+
+    def test_the_level_is_not_inflated_towards_the_months_that_had_demand(self):
+        _, row = _run(self.ERRATIC)
+        true_rate = float(np.mean(self.ERRATIC))
+        assert row["forecast_qty"] == pytest.approx(true_rate, rel=0.35)
+
+    def test_a_lumpy_item_is_not_forecast_at_nothing(self):
+        """
+        Two orders a year, and a backtest window that lands between them.
+
+        Every actual the window holds is zero, so forecasting zero scores perfectly and
+        the ranking is decided by which model happened to sit lowest — not by which one
+        describes the item. The window has measured nothing, and the run has to say so
+        rather than take the answer.
+        """
+        bursty = [0, 0, 200, 180, 0, 0, 0, 0, 0, 0, 0,
+                  0, 0, 190, 210, 0, 0, 0, 0, 0, 0, 0]
+        _, row = _run(bursty)
+        assert row["forecast_qty"] > 0
+        assert "deferred to TSB" in row["selected_by"]
+
+
+class TestAnItemThatStoppedIsAllowedToDecay:
+    """
+    Croston updates its interval only when an order arrives, and measures the gaps
+    *between* orders — never the gap between the last order and today. So the one run of
+    zeros that means "this has stopped" is the one run it cannot read, and an item that
+    ordered monthly for six months and nothing in the eighteen since keeps its old rate
+    for ever. TSB updates the probability every period, zeros included.
+    """
+
+    DORMANT = [100] * 6 + [0] * 16
+
+    def test_croston_cannot_see_the_run_of_zeros_it_ends_on(self):
+        f = Forecaster(horizon=6)
+        s = pd.Series([float(v) for v in self.DORMANT], index=PERIODS)
+        _, croston, _ = f._croston(s)
+        _, tsb, _ = f._tsb(s)
+        assert croston[0] == pytest.approx(100.0, rel=0.2)   # unchanged by 16 quiet months
+        assert tsb[0] < croston[0] / 10
+
+    def test_the_forecast_for_a_dormant_item_falls_away(self):
+        _, row = _run(self.DORMANT)
+        assert row["forecast_qty"] < 5.0
+
+    def test_demand_returning_brings_the_probability_back(self):
+        f = Forecaster(horizon=6)
+        quiet = pd.Series([float(v) for v in self.DORMANT], index=PERIODS)
+        resumed = pd.Series([float(v) for v in ([100] * 6 + [0] * 12 + [100] * 4)],
+                            index=PERIODS)
+        assert f._tsb(resumed)[1][0] > f._tsb(quiet)[1][0] * 5
+
+
+class TestTheLumpTravelsBesideTheRate:
+    """
+    Every model answers with a per-period rate, which is what safety stock integrates
+    and what a planner misreads. 33 a month on an item that orders 100 once a quarter is
+    the right rate and a false plan: it claims demand in two months out of three that
+    are known to be empty, and a projection built on it draws a ramp where the real
+    position is a sawtooth — hiding the month the stock runs out.
+    """
+
+    def test_a_quarterly_item_reports_its_order_size_and_interval(self):
+        quarterly = [100.0 if i % 3 == 2 else 0.0 for i in range(22)]
+        _, row = _run(quarterly)
+        assert row["expected_order_size"] == pytest.approx(100.0, rel=0.05)
+        assert row["expected_interval"] == pytest.approx(3.0, rel=0.2)
+
+    def test_a_smooth_item_has_an_interval_of_one(self):
+        """Where demand arrives every period the two descriptions are the same one."""
+        _, row = _run([100.0] * 22)
+        assert row["expected_interval"] == pytest.approx(1.0)
+
+    def test_the_quiet_run_since_the_last_order_counts_towards_the_interval(self):
+        """A gap still open is evidence about the rhythm, and the only evidence of a stop."""
+        f = Forecaster(horizon=6)
+        s = pd.Series([0.0, 100.0, 0.0, 100.0] + [0.0] * 18, index=PERIODS)
+        assert f._demand_shape(s)["expected_interval"] > 2.0

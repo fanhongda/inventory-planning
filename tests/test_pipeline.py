@@ -190,7 +190,7 @@ class TestEndToEnd:
 
         # Output files created
         assert (OUTPUT_DIR / "supplier_params.csv").exists()
-        assert (OUTPUT_DIR / "sku_planning_params.csv").exists()
+        assert (OUTPUT_DIR / f"planning_{planner.run.run_id}.xlsx").exists()
 
         # The run recorded what produced those files
         from inventory_planning.provenance import RunRegistry
@@ -288,12 +288,12 @@ class TestScenarioComparison:
         self._run(out, tmp_path / "store")
         self._run(out, tmp_path / "store", parameters_file=alt)
 
-        recommendations = sorted(out.glob("purchase_recommendations_*.csv"))
-        assert len(recommendations) == 2
+        workbooks = sorted(out.glob("planning_*.xlsx"))
+        assert len(workbooks) == 2
         # And one run's outputs all agree on which run they came from.
-        stamps = {f.stem.split("purchase_recommendations_")[1] for f in recommendations}
+        stamps = {f.stem.split("planning_")[1] for f in workbooks}
         for stamp in stamps:
-            assert (out / f"inventory_projection_{stamp}.csv").exists()
+            assert (out / f"quality_gates_{stamp}.json").exists()
 
     def test_two_runs_of_the_same_rule_set_are_identical(self, tmp_path):
         from inventory_planning.provenance import RunRegistry

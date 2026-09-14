@@ -7,6 +7,13 @@ Binds to localhost by default and stays there. This is one planner's machine unt
 authentication layer exists in front of it, and every declaration it writes is
 attributed to whatever `by` the caller supplied — an audit field with nobody checking
 it. Binding to 0.0.0.0 without that check would make the attribution decorative.
+
+That got more serious when the macro scalars became editable. A caller who reaches this
+port can change `cycle_stock_basis` or `safety_stock_exposure`, which restate every
+figure the next run produces, and sign the change with any name. The change is refused
+unless it loads, and it is recorded with a reason — but recorded against a name nobody
+verified. The identity seam in INTERFACE.md §7 is what closes this; until it does, the
+bind address is the whole of the access control.
 """
 
 import argparse

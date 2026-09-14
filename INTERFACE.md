@@ -240,8 +240,30 @@ attributable to the change depends on whether anything else moved. Two runs of t
 under different parameter files come back `scenario`; the same pair with a commit in
 between comes back `mixed`, and refuses to attribute.
 
-Read-only is the design rather than a stage of it, and the page says so. Editing is still
-the file.
+**Macro editing, since 2026-09-15.** The scalars are editable on the page; the rules are
+not yet. Editing is still the file — `policy/macro.py` replaces one value where it sits
+and leaves every other byte alone, so what a person approves is a one-line diff rather
+than a reformatted file. Five things decided the shape:
+
+- **Two requests, not a stored proposal.** `PUT /policy/macro` without `apply` returns
+  the diff and writes nothing; with `apply` it writes. A proposal held on the server
+  would be interface-only state, which this page rules out everywhere else.
+- **What is approved is a diff against specific bytes.** The proposal returns the digest
+  of the file it read and the apply has to quote it back. A file that moved in between is
+  a refusal, not a surprise — otherwise someone approves one diff and a different edit
+  lands.
+- **Only the settings the engine reads are editable.** `echelon_level` and `parent_node`
+  belong to multi-node planning, which is not built; a form offering them would be the
+  switch that reads as a guarantee and honours nothing. A derived reading — the FX
+  currency list — has no Edit because there is nothing in a file to write back.
+- **Validation is a load, not a second opinion.** The edited text is parsed by the same
+  loader the pipeline uses before anything is written. `quantity_rounding` is checked by
+  `analytics.rounding`, which on a real run is an hour of work past the point the value
+  is set, so the check is moved forward by calling that reader — not by restating what
+  it accepts.
+- **The reason and the owner go to `config/macro_changes.jsonl`**, append-only, beside
+  the files it describes. The diff is not stored: it is recoverable from the file's own
+  history, and the reason is the part that is nowhere else.
 
 **Per-rule hits, since 2026-09-15.** `policy/parameters.py` computed which SKUs each
 rule reached and which it skipped, printed it, and threw it away; the manifest now keeps
@@ -509,7 +531,7 @@ now while they are still cheap. What that asks for, against what is there:
 
 | Asked for | Today | Missing |
 |---|---|---|
-| enter macro and policy | read-only | writing back, with a diff |
+| enter macro and policy | macro written back with a diff | the same for rules |
 | query the data | three named readings, by layer, as-of | — |
 | see the results | the workbook only | a screen over it |
 | the store holds a record | facts, landing, declarations, batch ledger | decisions |
@@ -571,9 +593,14 @@ a mechanism is cheaper now, with one instance to generalise from, than after the
    newest run under the same rule bytes and the screen shows them per rule. Details
    under §2. Smallest, and everything else on the policy screen is weaker without it:
    editing a rule without seeing what it reached is a form with no feedback.
-2. **Macro editing**, then **rule editing**. Scalars first because they are a form over
-   JSON with a diff; rules second because they need the proposal-and-approve contract
-   above.
+2. **Macro editing** — **done, 2026-09-15**; then **rule editing**. Scalars first
+   because they are a form over JSON with a diff, and that is what landed: a registry of
+   the settings the engine reads, a surgical one-line edit, validation by loading, and
+   the rationale in an append-only log beside the files. Details under §2. The
+   propose-and-approve contract the rules need is built and proven here — the digest of
+   the file is what ties an approval to the diff it was shown — so rule editing inherits
+   a mechanism rather than inventing one. What it still has to add is that a rule's
+   change needs review by someone other than its author, which a scalar's does not.
 3. **The results screen**, over the workbook, located from the manifest.
 4. **The workspace seam**, then **the identity seam**, then **the migration mechanism**.
 5. **Decisions in the store (P6)** — and not before. The results screen does not need it;

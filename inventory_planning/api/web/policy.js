@@ -40,7 +40,113 @@ function kvTable(title, entries, { note = "" } = {}) {
             ? JSON.stringify(value) : String(value))))))));
 }
 
-function macroCard(body) {
+// The field for one setting. A `choice` gets a dropdown rather than a text box
+// because these are the branches the engine takes and a typo in one of them parses
+// cleanly, loads cleanly, and quietly sends every SKU down the other path.
+function valueField(s) {
+  if (s.kind === "choice") {
+    const select = el("select", {},
+      s.choices.map((c) => el("option", { value: c }, c)));
+    select.value = String(s.value);
+    return select;
+  }
+  return el("input", { type: s.kind === "number" ? "number" : "text",
+                       step: "any", value: String(s.value) });
+}
+
+// Edit in two steps, never one: propose, read the diff, then apply. The Apply button
+// does not exist until a diff has been produced, and it carries that diff's `basis` —
+// the digest of the file it was made against — so what gets approved is the change
+// that was shown and not merely the setting it was shown for.
+function editor(s, done) {
+  const value = valueField(s);
+  const reason = el("input", { type: "text",
+                               placeholder: "why — recorded with the change" });
+  const by = el("input", { type: "text", placeholder: "who is making it" });
+  // Two panels, not one. The diff and the complaint about the form are different
+  // things, and an earlier version wrote both to the same element — so "you forgot to
+  // say who you are" wiped out the diff the person was about to approve and made them
+  // produce it again.
+  const panel = el("div", {});
+  const problem = el("div", {});
+  const out = el("div", {}, panel, problem);
+  let shown = null;
+
+  const say = (cls, text) => mount(problem, el("p", { class: cls }, text));
+
+  const applyIt = async () => {
+    if (!shown) { say("status bad", "Show the diff first."); return; }
+    if (!reason.value.trim() || !by.value.trim()) {
+      say("status bad", "A reason and a name are required — they are the whole record "
+                        + "of why a setting that restates the run was moved.");
+      return;
+    }
+    try {
+      const body = await put({ name: s.name, value: value.value, apply: true,
+                               reason: reason.value, by: by.value, basis: shown.basis });
+      done(`${body.name}: ${body.from} → ${body.to}. Recorded in ${body.recorded_in}.`);
+    } catch (err) { say("status bad", err.message); }
+  };
+
+  const put = (payload) => api("/policy/macro", {
+    method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const preview = async () => {
+    // The Apply button belongs to one diff. Clearing it before asking for the next one
+    // means there is never a button on screen that would apply something other than
+    // what is displayed above it.
+    shown = null;
+    mount(panel);
+    mount(problem);
+    try {
+      const body = await put({ name: s.name, value: value.value });
+      if (body.unchanged) {
+        mount(panel);
+        say("note", `${s.name} is already ${JSON.stringify(body.from)} — nothing to change.`);
+        return;
+      }
+      shown = body;
+      mount(problem);
+      mount(panel,
+        body.impact ? el("p", { class: "note" }, `What this moves: ${body.impact}`) : null,
+        el("pre", { class: "diff" }, body.diff),
+        // `type: button` and not the default. A button inside a form submits it, so
+        // Apply was also re-running the preview — which cleared the very message it
+        // had just written about the missing reason.
+        el("button", { class: "primary", type: "button", onclick: applyIt },
+           "Apply this change"));
+    } catch (err) { say("status bad", err.message); }
+  };
+
+  return el("form", { class: "declare",
+                      onsubmit: (e) => { e.preventDefault(); preview(); } },
+    el("label", {}, `New value for ${s.name}`), value,
+    el("div", { class: "row2" }, reason, by),
+    el("div", {}, el("button", { type: "submit" }, "Show the diff")),
+    out);
+}
+
+function macroCard(body, reload) {
+  const rows = body.settings.map((s) => {
+    const row = el("tr", {},
+      el("td", {}, el("code", {}, s.name)),
+      el("td", {}, Array.isArray(s.value) ? s.value.join(", ") : String(s.value)),
+      el("td", {}, s.source),
+      el("td", { class: "k" }, s.note || ""),
+      el("td", {}));
+    if (!s.editable) return [row];
+    const host = el("td", { colspan: "5" });
+    const drawer = el("tr", { hidden: true }, host);
+    row.lastChild.append(el("button", { class: "link",
+      onclick: () => {
+        drawer.hidden = !drawer.hidden;
+        mount(host, drawer.hidden ? [] : editor(s, reload));
+      } }, "Edit"));
+    return [row, drawer];
+  });
+
   return el("section", { class: "card" },
     el("h2", {}, "Settings the engine reads"),
     el("p", { class: "sub" },
@@ -48,12 +154,30 @@ function macroCard(body) {
        + `nothing honours reads as a guarantee, which is worse than no switch.`),
     el("div", { class: "scroll" }, el("table", {},
       el("thead", {}, el("tr", {},
-        ["setting", "value", "from", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, body.settings.map((s) => el("tr", {},
-        el("td", {}, el("code", {}, s.name)),
-        el("td", {}, Array.isArray(s.value) ? s.value.join(", ") : String(s.value)),
-        el("td", {}, s.source),
-        el("td", { class: "k" }, s.note || "")))))));
+        ["setting", "value", "from", "", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, rows.flat()))),
+    el("p", { class: "note" },
+       "Editing writes the file, which stays the store — the form is a validator with "
+       + "a nicer keyboard. A derived reading has no Edit because it is not a setting."),
+    changesCard(body.changes));
+}
+
+// Who moved what, and why. The diff is not kept here: it is in the file's own history,
+// and the reason is the part that is nowhere else.
+function changesCard(changes) {
+  if (!(changes || []).length) return null;
+  return el("details", { class: "scroll" },
+    el("summary", {}, `Changes made here (${changes.length})`),
+    el("table", {},
+      el("thead", {}, el("tr", {},
+        ["when", "setting", "from", "to", "who", "why"].map((h) => el("th", {}, h)))),
+      el("tbody", {}, changes.map((c) => el("tr", {},
+        el("td", {}, String(c.at || "").replace("T", " ")),
+        el("td", {}, el("code", {}, c.setting)),
+        el("td", {}, JSON.stringify(c.from)),
+        el("td", {}, JSON.stringify(c.to)),
+        el("td", {}, c.by),
+        el("td", { class: "k" }, c.reason))))));
 }
 
 // What one rule reached, as a cell. The three silences are kept apart on purpose:
@@ -179,13 +303,18 @@ function diffCard(body) {
 
 // ── Assembly ────────────────────────────────────────────────────────────────
 
-export async function mountPolicy() {
+export async function mountPolicy(applied = "") {
   const host = $("#policy-body");
   mount(host, el("p", { class: "note" }, "Loading…"));
   try {
     const [policy, macro, runs] = await Promise.all([
       api("/policy"), api("/policy/macro"), api("/runs"),
     ]);
+    // After a change, everything on this page is re-read from the files rather than
+    // patched in place. The screen's whole claim is that it shows what the engine will
+    // read, and a value updated in the DOM would be the interface telling itself what
+    // it just did instead of asking.
+    const reload = (what) => mountPolicy(what);
     const diffHost = el("div", {});
     const onDiff = async (a, b) => {
       try {
@@ -195,7 +324,8 @@ export async function mountPolicy() {
       }
     };
     mount(host,
-      macroCard(macro),
+      applied ? el("p", { class: "changed" }, applied) : null,
+      macroCard(macro, reload),
       kvTable("Conventions", policy.conventions, {
         note: "How the should-be inventory is defined. Changing one of these changes "
               + "every figure the run produces.",

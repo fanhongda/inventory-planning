@@ -79,6 +79,16 @@ textarea { min-height: 54px; resize: vertical; }
 .note { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
 .changed { font-size: 13px; color: var(--ok); margin: 8px 0 0; }
 
+/* The diff a macro change would make. Monospace and scrolled rather than wrapped: a
+   wrapped diff line stops lining up under the one above it, which is the only thing a
+   diff is read for. */
+pre.diff {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #f7f7f5; border: 1px solid var(--line); border-radius: 5px;
+  padding: 8px 10px; margin: 8px 0 0; overflow-x: auto; white-space: pre;
+}
+details > summary { cursor: pointer; font-size: 13px; color: var(--muted); margin-top: 10px; }
+
 .card h2 .badge {
   float: right; font-size: 12px; font-weight: 500; padding: 2px 10px;
   border-radius: 10px; border: 1px solid var(--line); color: var(--muted);

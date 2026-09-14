@@ -604,6 +604,108 @@ class TestPolicyIsShownAndNotEdited:
         assert not {n for n in names if "working" in n or "growth" in n}
 
 
+class TestEditingAScalar:
+    """
+    Two requests, not a stored proposal: the first asks what a change would do, the
+    second approves the diff it was shown. Nothing is kept on the server between them —
+    INTERFACE.md rules out interface-only state — so what ties them together is the
+    digest of the file the diff was made against.
+    """
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("planning_parameters.md", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    def _put(self, client, **body):
+        return client.put("/policy/macro", json=body)
+
+    def test_a_proposal_returns_the_diff_and_writes_nothing(self, client, workspace):
+        before = (workspace[0] / "planning_parameters.md").read_text(encoding="utf-8")
+        body = self._put(client, name="days_per_year", value=250).json()
+
+        assert body["applied"] is False
+        assert body["from"] == 365 and body["to"] == 250
+        assert "-days_per_year: 365" in body["diff"]
+        assert "+days_per_year: 250" in body["diff"]
+        assert (workspace[0] / "planning_parameters.md").read_text(
+            encoding="utf-8") == before
+
+    def test_the_proposal_says_what_the_change_would_move(self, client):
+        """
+        These settings cost wildly different amounts. `location_name` is a label;
+        `cycle_stock_basis` halves or doubles the cycle stock in every figure, and a
+        form that presented them identically would be hiding that.
+        """
+        body = self._put(client, name="cycle_stock_basis", value="average").json()
+        assert "cycle stock" in body["impact"]
+        label = self._put(client, name="location_name", value="DC North").json()
+        assert "no figure moves" in label["impact"]
+
+    def test_approving_the_diff_applies_it(self, client, workspace):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        body = self._put(client, name="days_per_year", value=250, apply=True,
+                         reason="finance counts working days", by="jfanhon",
+                         basis=proposal["basis"]).json()
+
+        assert body["applied"] is True
+        assert "days_per_year: 250" in (
+            workspace[0] / "planning_parameters.md").read_text(encoding="utf-8")
+        assert proposal["basis"] != body["digest"]
+
+    def test_a_file_that_moved_since_the_diff_is_a_refusal(self, client, workspace):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        path = workspace[0] / "planning_parameters.md"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "transit_share_of_lt: 0.45", "transit_share_of_lt: 0.5"), encoding="utf-8")
+
+        response = self._put(client, name="days_per_year", value=250, apply=True,
+                             reason="r", by="jfanhon", basis=proposal["basis"])
+        assert response.status_code == 400
+        assert "has changed since that diff" in response.json()["detail"]
+        assert "days_per_year: 365" in path.read_text(encoding="utf-8")
+
+    def test_an_apply_without_a_reason_or_a_name_is_refused(self, client):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        for missing in ({"by": "jfanhon"}, {"reason": "because"}):
+            response = self._put(client, name="days_per_year", value=250, apply=True,
+                                 basis=proposal["basis"], **missing)
+            assert response.status_code == 400
+
+    def test_a_value_the_engine_would_ignore_is_refused_with_the_alternatives(
+            self, client):
+        response = self._put(client, name="pipeline_basis", value="incoterm_awre")
+        assert response.status_code == 400
+        assert "incoterm_aware" in response.json()["detail"]
+
+    def test_a_setting_the_pipeline_does_not_read_is_not_editable(self, client):
+        assert self._put(client, name="echelon_level", value=2).status_code == 400
+
+    def test_the_listing_says_which_settings_a_form_may_write(self, client):
+        settings = {s["name"]: s for s in client.get("/policy/macro").json()["settings"]}
+        assert settings["days_per_year"]["editable"] is True
+        assert settings["cycle_stock_basis"]["choices"] == ["peak", "average"]
+        # Derived readings are not settings: there is nothing in a file to write back.
+        assert settings["fx_currencies"]["editable"] is False
+
+    def test_the_change_is_listed_afterwards_with_its_reason(self, client):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        self._put(client, name="days_per_year", value=250, apply=True,
+                  reason="finance counts working days", by="jfanhon",
+                  basis=proposal["basis"])
+
+        body = client.get("/policy/macro").json()
+        entry, = body["changes"]
+        assert entry["by"] == "jfanhon" and entry["to"] == 250
+        assert entry["reason"] == "finance counts working days"
+        assert {s["name"]: s["value"] for s in body["settings"]}["days_per_year"] == 250
+
+
 class TestWhatEachRuleReached:
     """
     The counts come from a run, are labelled with the run they came from, and are shown

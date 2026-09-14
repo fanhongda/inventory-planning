@@ -174,9 +174,19 @@ disappear rather than going stale. The standing count is the part worth keeping:
 on the sample data matches 4 A-class SKUs and keeps 2, and on the test frame keeps none,
 so `matched` alone reports a dead rule as the busiest on the page.
 
-What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed
-class, what the safety-stock total moved by, which recommendations flipped. It needs no
-new identity work.
+**Macro scalars are editable. Done 2026-09-15.** `policy/macro.py` proposes a change as
+a one-line diff and applies it once approved: the value is replaced where it sits, so the
+comments explaining a setting and the prose keys `fx_rates.json` carries survive
+untouched. The edit is validated by loading the file with the pipeline's own loader
+before anything is written; the reason and the owner go to `config/macro_changes.jsonl`.
+The two halves are one endpoint called twice, tied together by the digest of the file the
+diff was made against — approving a change approves *those bytes*, and a file that moved
+in between is refused. `PUT /policy/macro`, and an Edit on each row of the settings
+table. The rules are still read-only.
+
+What this still needs: **rule editing** over the same contract, and a **SKU-level diff
+over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
+which recommendations flipped. Neither needs new identity work.
 
 **Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the
 root (`--store` / `$INVENTORY_PLANNING_STORE` / `$XDG_DATA_HOME` / `~/.local/share`),

@@ -817,9 +817,22 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         root = service.config_dir or Path(__file__).parents[2] / "config"
         out: Dict[str, Any] = {"config_dir": str(root), "settings": []}
 
+        from ..policy import macro as macro_edit
+
         def add(name, value, source, note=""):
-            out["settings"].append({"name": name, "value": value,
-                                    "source": source, "note": note})
+            # Editability is attached by name from the one registry that decides it,
+            # rather than inferred from the source file: `fx_rates.json` holds both an
+            # editable scalar and a derived reading, and "it came from a file" is not
+            # the same claim as "a form may write it".
+            setting = macro_edit.BY_NAME.get(name)
+            out["settings"].append({
+                "name": name, "value": value, "source": source, "note": note,
+                "editable": setting is not None,
+                "kind": setting.kind if setting else None,
+                "choices": list(setting.choices) if setting else [],
+                "impact": setting.impact if setting else "",
+                "file": setting.filename if setting else None,
+            })
 
         try:
             node = _json.loads((root / "node_config.json").read_text(encoding="utf-8"))
@@ -851,7 +864,41 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
             "money in any of these is converted on read"
             if table.currencies else "no rates configured — money is not converted")
 
+        out["changes"] = macro_edit.history(root, limit=20)
         return out
+
+    @app.put("/policy/macro")
+    def edit_macro(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Propose a change to one scalar, and apply it once the diff has been seen.
+
+        The two steps are the same request twice, which is deliberate: a stored
+        proposal would be interface-only state, and INTERFACE.md rules that out for
+        every screen here. What connects them instead is `basis` — the digest of the
+        file the diff was produced against, returned by the proposal and required by
+        the apply. Approving a diff therefore approves *those bytes*, and a file that
+        moved in between is a refusal rather than a surprise.
+
+        Writing is opt-in (`apply: true`). A PUT that writes by default would mean a
+        client asking "what would this do" had already done it, and the one thing this
+        endpoint exists to provide is the chance to look first.
+        """
+        from ..policy.macro import MacroError, apply as apply_macro, propose
+
+        root = service.config_dir or Path(__file__).parents[2] / "config"
+        name = str(payload.get("name") or "").strip()
+        if "value" not in payload:
+            raise HTTPException(status_code=400, detail="value is required")
+        try:
+            if not payload.get("apply"):
+                proposal = propose(name, payload["value"], config_dir=root)
+                return {**proposal.to_dict(), "applied": False}
+            return apply_macro(
+                name, payload["value"],
+                reason=payload.get("reason", ""), by=payload.get("by", ""),
+                basis=str(payload.get("basis") or ""), config_dir=root).to_dict()
+        except MacroError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/runs")
     def runs(limit: int = Query(50, ge=1, le=500)) -> Dict[str, Any]:

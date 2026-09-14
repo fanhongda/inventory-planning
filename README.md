@@ -739,6 +739,13 @@ change) neither collide nor need to be told apart by hand.
 | `config/node_config.json` | Location ID, reporting currency — one entry per DC |
 | `config/fx_rates.json` | Exchange rates into the reporting currency, effective-dated. A currency absent here is reported unvalued, never counted at face value |
 | `policy/policy.md` | Company-level hard constraints (human-readable, Claude-interpreted) |
+| `config/macro_changes.jsonl` | Append-only: who changed which scalar, from what to what, and why. Written by the interface, not by a run |
+
+These stay the store, and a text editor stays a first-class way to change them. The
+interface edits the same files: it proposes one value as a one-line diff, refuses it if
+the pipeline's own loader will not read the result, and writes the reason and the owner
+to `macro_changes.jsonl` — the two things a file cannot hold about itself. A setting
+changed by clicking and one changed by typing are indistinguishable to every later run.
 
 `planning_parameters.md` is markdown with fenced YAML, not a config format, because the
 knowledge of *which SKU gets which policy* is business judgment that changes far more

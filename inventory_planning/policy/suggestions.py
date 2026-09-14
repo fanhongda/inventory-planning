@@ -358,7 +358,8 @@ class SuggestionBuilder:
         self._compiled = [r.as_rule() for r in self.rules]
 
     def build(self, params: ParameterSet,
-              recommendations: pd.DataFrame = None) -> SuggestionResult:
+              recommendations: pd.DataFrame = None, rounding=None,
+              uom=None) -> SuggestionResult:
         """
         `params` is the resolved ParameterSet — it carries both the SKU attributes and
         the parameters currently in force, which is what the suggestions are compared
@@ -388,7 +389,7 @@ class SuggestionBuilder:
 
         df = self._economics(df, params, notes)
         df = self._apply_rules(df)
-        df = self._suggest_safety_stock(df, params)
+        df = self._suggest_safety_stock(df, params, rounding, uom)
         df = self._diff_against_current(df, params)
         df = self._compare_to_planner(df, notes)
 
@@ -492,7 +493,8 @@ class SuggestionBuilder:
 
     # ── Safety stock at the suggested parameters ─────────────────────────────
 
-    def _suggest_safety_stock(self, df: pd.DataFrame, params: ParameterSet) -> pd.DataFrame:
+    def _suggest_safety_stock(self, df: pd.DataFrame, params: ParameterSet,
+                              rounding=None, uom=None) -> pd.DataFrame:
         """
         Recompute safety stock under the suggested service level and review period.
 
@@ -524,6 +526,23 @@ class SuggestionBuilder:
         ).round(0)
 
         df["current_safety_stock"] = current_ss
+
+        # `_safety` is the same static method `ShouldBeCalculator.calculate` rounds
+        # after calling, so rounding has to be applied here too or the suggestion sheet
+        # prints a safety stock to one decimal beside the whole number the target sheet
+        # shows for the same SKU.
+        from ..analytics.rounding import Rounding
+
+        rounding = rounding or Rounding.from_conventions(params.conventions)
+        if rounding.active:
+            unit = (df["sku"].astype(str).map(uom)
+                    if uom is not None and len(uom)
+                    else (df["uom"] if "uom" in df.columns else None))
+            df["suggested_safety_stock"] = rounding.apply(
+                df["suggested_safety_stock"], unit)
+            df["current_safety_stock"] = rounding.apply(df["current_safety_stock"], unit)
+            current_ss = df["current_safety_stock"]
+
         df["ss_delta_qty"] = (df["suggested_safety_stock"] - current_ss).round(1)
         df["ss_delta_value"] = (df["ss_delta_qty"] * df["unit_cost"].fillna(0.0)).round(2)
         return df

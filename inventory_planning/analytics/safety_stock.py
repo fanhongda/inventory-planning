@@ -81,7 +81,8 @@ class SafetyStockCalculator:
     def calculate(self, classified_demand: pd.DataFrame, supplier_lt: pd.DataFrame,
                   forecast_summary: pd.DataFrame = None,
                   review_period_days=None,
-                  exposure: str = "review_plus_lt") -> pd.DataFrame:
+                  exposure: str = "review_plus_lt",
+                  rounding=None, uom: pd.Series = None) -> pd.DataFrame:
         """
         classified_demand: output of DemandClassifier.classify()
         supplier_lt:       output of POHistoryReader.compute_supplier_lt()
@@ -181,6 +182,17 @@ class SafetyStockCalculator:
         df["demand_during_exposure"] = (
             df["demand_mean_rolling"] * df["exposure_months"]
         ).round(1)
+
+        # Rounded before the reorder point is assembled, not after, so the figure equals
+        # the two parts printed beside it. Rounding the sum instead leaves a report whose
+        # own arithmetic does not add up, which a reader notices before they notice
+        # anything else on the page.
+        if rounding is not None and len(df):
+            per_row = (df["sku"].astype(str).map(uom)
+                       if uom is not None and len(uom) else None)
+            for column in ("safety_stock", "demand_during_lt", "demand_during_exposure"):
+                df[column] = rounding.apply(df[column], per_row)
+
         df["reorder_point"] = (df["demand_during_exposure"] + df["safety_stock"]).round(1)
 
         daily_demand = df["demand_mean_rolling"] / 30.0

@@ -116,10 +116,17 @@ class Forecaster:
 
     def forecast_all(self, time_series: pd.DataFrame,
                      classified: pd.DataFrame = None,
-                     policy: pd.DataFrame = None) -> pd.DataFrame:
+                     policy: pd.DataFrame = None,
+                     rounding=None, uom: pd.Series = None) -> pd.DataFrame:
         """
         time_series: pivot DataFrame (period index × SKU columns).
         classified: output of DemandClassifier.classify() — provides demand_pattern per SKU.
+        rounding: the `quantity_rounding` convention, from `analytics.rounding`. A
+                forecast of 33.4 of a countable thing is not a forecast, and the decimal
+                travels into the safety stock and the reorder point built on it.
+        uom:    unit of measure per SKU, so a weight or a volume keeps its decimals.
+                Absent for most SKUs in practice, which is why the convention rounds
+                unless a unit says not to rather than the other way round.
         policy: frame carrying `sku` and `stocking_policy` (MTS/MTO) from the ERP.
                 Both are backtested wherever there is enough history; the policy only
                 decides the fallback for series too short to hold anything out, where
@@ -148,7 +155,15 @@ class Forecaster:
                                     policy_map.get(sku))
             results.extend(fc)
 
-        return pd.DataFrame(results) if results else pd.DataFrame()
+        frame = pd.DataFrame(results) if results else pd.DataFrame()
+        if rounding is not None and len(frame):
+            # Rounded here rather than where each value is produced, so there is one
+            # place a reader can check what happened to every forecast quantity, and so
+            # the per-SKU unit can be joined once instead of looked up per period.
+            per_row = (frame["sku"].astype(str).map(uom)
+                       if uom is not None and len(uom) else None)
+            frame["forecast_qty"] = rounding.apply(frame["forecast_qty"], per_row)
+        return frame
 
     def _forecast_sku(self, sku: str, series: pd.Series, pattern: str,
                       policy: str = None) -> list:

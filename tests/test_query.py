@@ -229,6 +229,29 @@ class TestLayersAreNotBlended:
         assert query.select("inventory", as_of=cutoff).layers == [LAYER_PREPARED]
         assert frame["qty_on_hand"].tolist() == [10]
 
+    def test_a_cutoff_on_the_other_time_axis_is_found_too(self, store, query):
+        """
+        Layers created by a change of writer separate cleanly in *load* time while their
+        valid_time ranges interleave freely, because old extracts go on being re-loaded
+        after the change. Checking only valid_time told the live store no cutoff existed
+        when `known_at` had one.
+        """
+        self._prepared(store, "2024-08-01", [{"sku": "B", "location_id": "DC-01",
+                                              "qty_on_hand": 20}])
+        self._prepared(store, "2024-06-01", [{"sku": "A", "location_id": "DC-01",
+                                              "qty_on_hand": 10}])
+        _write(store, "2024-07-01", [{"sku": "A", "location_id": "DC-01",
+                                      "qty_on_hand": 15}])
+
+        # valid_time interleaves: prepared spans 06-01…08-01 around the canonical 07-01.
+        assert query.select("inventory").isolating_cutoff()[0] == "known_at"
+
+        with pytest.raises(MixedLayers) as raised:
+            query.current("inventory")
+        cutoff = re.search(r"known_at=([\d\-T:.]+)", str(raised.value)).group(1)
+        assert query.select("inventory", known_at=cutoff).layers == [LAYER_PREPARED]
+        assert len(query.current("inventory", known_at=cutoff)) == 2
+
     def test_interleaved_layers_are_told_no_cutoff_exists(self, store, query):
         """
         What the live store looks like: old batches still being re-loaded while the
@@ -245,8 +268,8 @@ class TestLayersAreNotBlended:
         with pytest.raises(MixedLayers) as raised:
             query.current("inventory")
         message = str(raised.value)
-        assert "as_of=" not in message
-        assert "overlap in time" in message and "Void the batches" in message
+        assert "as_of=" not in message and "known_at=" not in message
+        assert "overlap on both time axes" in message and "Void the batches" in message
 
     def test_narrowing_to_one_layer_reads_normally(self, store, query):
         store.write_batch(doc_type="inventory",

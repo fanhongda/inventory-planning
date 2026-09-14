@@ -83,6 +83,36 @@ class BatchRecord:
 
 
 @dataclass
+class RestateRecord:
+    """
+    A correction to what a batch says about *itself*, never to what it holds.
+
+    The case it exists for: a writer's meaning changed while the store went on
+    accumulating, so batches written before the change describe a layer they never
+    named. Their frames are right and their marking is wrong, and the marking is what a
+    reader uses to decide whether two batches may be added together.
+
+    Appended like a void rather than applied by editing the original line, for the same
+    reason: the original line is the record of what was believed when it was written,
+    and a restatement is a later assertion about it. Both survive, both are attributable,
+    and the restatement can itself be restated.
+
+    It does not touch the parquet. A batch whose *contents* are wrong is voided and
+    re-loaded; this is only for what the ledger says about them.
+    """
+
+    batch_id: str
+    frame_layer: str
+    restated_at: str
+    restated_by: str = ""
+    reason: str = ""
+    op: str = "restate"
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
+
+
+@dataclass
 class VoidRecord:
     """A batch withdrawn. Appended, never applied by deleting the original line."""
 
@@ -123,21 +153,47 @@ class BatchLedger:
                 continue
         return out
 
+    # Lines that say something *about* a batch rather than being one.
+    _OPERATIONS = ("void", "restate")
+
     def batches(self, doc_type: str = None, include_void: bool = False) -> List[Dict[str, Any]]:
-        """Every batch, with voids applied. Newest last."""
+        """Every batch, with voids and restatements applied. Newest last."""
         voided = {e["batch_id"] for e in self._lines() if e.get("op") == "void"}
+        # Last restatement wins, so a restatement can itself be restated.
+        restated = {e["batch_id"]: e.get("frame_layer")
+                    for e in self._lines() if e.get("op") == "restate"}
         out = []
         for entry in self._lines():
-            if entry.get("op") == "void":
+            if entry.get("op") in self._OPERATIONS:
                 continue
             if doc_type and entry.get("doc_type") != doc_type:
                 continue
+            if entry["batch_id"] in restated:
+                entry = dict(entry, frame_layer=restated[entry["batch_id"]],
+                             frame_layer_restated=True)
             if entry["batch_id"] in voided:
                 entry = dict(entry, status=STATUS_VOID)
                 if not include_void:
                     continue
             out.append(entry)
         return out
+
+    def restate(self, batch_id: str, frame_layer: str, reason: str = "",
+                by: str = "") -> RestateRecord:
+        """Say what layer a batch holds, after the fact. Appended, never applied."""
+        record = RestateRecord(
+            batch_id=batch_id,
+            frame_layer=frame_layer,
+            restated_at=datetime.now().isoformat(timespec="seconds"),
+            restated_by=by,
+            reason=reason,
+        )
+        self.append(record)
+        return record
+
+    def restatements(self) -> Dict[str, Dict[str, Any]]:
+        """Every restatement, by batch id — the latest one for each."""
+        return {e["batch_id"]: e for e in self._lines() if e.get("op") == "restate"}
 
     def voided(self) -> Dict[str, Dict[str, Any]]:
         """

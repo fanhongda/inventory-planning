@@ -123,49 +123,61 @@ class Selection:
     def mixed(self) -> bool:
         return len(self.layers) > 1
 
-    def layer_spans(self) -> Dict[str, Any]:
-        """Each layer's first and last `valid_time`, so overlap can be reasoned about."""
+    # The two time axes, and the parameter that filters on each. Both are upper bounds,
+    # so either can isolate the *earliest* layer and neither can isolate a later one.
+    AXES = (("as_of", "valid_time"), ("known_at", "transaction_time"))
+
+    def layer_spans(self, field: str = "valid_time") -> Dict[str, Any]:
+        """Each layer's first and last value on one time axis."""
         spans: Dict[str, Any] = {}
         for batch in self.batches:
             layer = str(batch.get("frame_layer") or LAYER_UNKNOWN)
-            when = str(batch.get("valid_time") or "")
+            when = str(batch.get(field) or "")
             first, last = spans.get(layer, (when, when))
             spans[layer] = (min(first, when), max(last, when))
         return spans
 
     def isolating_cutoff(self) -> Optional[tuple]:
         """
-        An `as_of` that selects exactly one layer, and the layer it selects — or None.
+        A cutoff that selects exactly one layer: `(parameter, value, layer)` or None.
 
-        `as_of` is an upper bound, so it can only isolate the *earliest* layer, and only
-        where that layer finishes before every other one starts. Where the layers
-        interleave — which is what a store looks like when the writer changed while old
-        batches were still being re-loaded — no cutoff exists, and offering one anyway
-        sends the reader round a loop that ends in this same refusal.
+        Both parameters are upper bounds, so either can isolate only the layer that
+        *finishes first on that axis*, and only where it finishes before every other one
+        starts. Checking one axis is not enough, and assuming so is how this came to
+        tell a reader no cutoff existed when one did: layers created by a change of
+        writer separate cleanly in load time while their `valid_time` ranges interleave
+        freely, because old extracts go on being re-loaded after the change.
         """
-        spans = self.layer_spans()
-        if len(spans) < 2:
+        if len(self.layers) < 2:
             return None
-        earliest = min(spans, key=lambda layer: spans[layer][1])
-        finishes = spans[earliest][1]
-        if all(start > finishes for layer, (start, _) in spans.items()
-               if layer != earliest):
-            return finishes, earliest
+        for parameter, field in self.AXES:
+            spans = self.layer_spans(field)
+            if len(spans) < 2:
+                continue
+            earliest = min(spans, key=lambda layer: spans[layer][1])
+            finishes = spans[earliest][1]
+            if finishes and all(start > finishes
+                                for layer, (start, _) in spans.items()
+                                if layer != earliest):
+                return parameter, finishes, earliest
         return None
 
     def how_to_narrow(self) -> str:
         """What a caller can actually do about a mixed selection, in this store."""
         cutoff = self.isolating_cutoff()
         if cutoff:
-            when, layer = cutoff
-            return (f"Read `as_of={when}` for the {layer} batches alone, or void the "
-                    f"batches of the layer you are not using.")
-        spans = ", ".join(f"{layer} {first}\u2026{last}"
-                          for layer, (first, last) in sorted(self.layer_spans().items()))
-        return (f"The layers overlap in time ({spans}), so no `as_of` isolates either "
-                f"one \u2014 it is an upper bound and the older layer runs past the start "
-                f"of the newer. Void the batches of the layer you are not using, or "
-                f"re-store them through one path.")
+            parameter, when, layer = cutoff
+            return (f"Read `{parameter}={when}` for the {layer} batches alone, or void "
+                    f"the batches of the layer you are not using.")
+        spans = "; ".join(
+            f"by {parameter}, " + ", ".join(
+                f"{layer} {first}\u2026{last}"
+                for layer, (first, last) in sorted(self.layer_spans(field).items()))
+            for parameter, field in self.AXES)
+        return (f"The layers overlap on both time axes ({spans}), so no cutoff isolates "
+                f"either one \u2014 both parameters are upper bounds and the earlier layer "
+                f"runs past the start of the later. Void the batches of the layer you "
+                f"are not using, or restate them under one.")
 
     def describe(self) -> str:
         if not self.batches:

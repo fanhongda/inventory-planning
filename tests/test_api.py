@@ -54,6 +54,79 @@ def _upload(client, path=SAMPLE, name=None):
                            files={"file": (name or path.name, fh.read(), "text/csv")})
 
 
+class TestTheWorkspaceIsSetUpFromTheBrowser:
+    """
+    The target user never opens a terminal, so a workspace nobody has prepared had to be
+    fixable from the page. Before this, a server started on an unprepared tenant
+    answered every endpoint as though the *repository's* config were the tenant's — a
+    wrong answer that looked right, which is worse than the error it replaced.
+    """
+
+    @pytest.fixture
+    def fresh(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INVENTORY_PLANNING_CONFIG", str(tmp_path / "cfg"))
+        monkeypatch.setenv("INVENTORY_PLANNING_OUTPUT", str(tmp_path / "out"))
+        monkeypatch.setenv("INVENTORY_PLANNING_STORE", str(tmp_path / "store"))
+        return TestClient(create_app(tenant="acme"))
+
+    def test_an_unprepared_workspace_says_it_is_not_ready(self, fresh):
+        body = fresh.get("/workspace").json()
+        assert body["tenant"] == "acme"
+        assert body["ready"] is False
+
+    def test_it_does_not_quietly_serve_the_repositorys_rules(self, fresh):
+        """
+        The defect this replaced. `service.config_dir` kept the raw argument and was
+        None when unset, so four endpoints fell back to the package's own config and
+        `--tenant prod` served the wrong rule set while reporting success.
+        """
+        response = fresh.get("/policy")
+        assert response.status_code == 404
+        assert "acme" in response.json()["detail"]
+
+    def test_one_call_prepares_it(self, fresh):
+        body = fresh.post("/workspace/setup", json={"by": "jfanhon"}).json()
+        assert body["ready"] is True
+        assert any("seeded" in line for line in body["did"])
+        assert fresh.get("/workspace").json()["ready"] is True
+        assert fresh.get("/policy").status_code == 200
+
+    def test_it_is_safe_to_click_twice(self, fresh):
+        """
+        A second click must not put a rule set somebody has edited back to the default.
+        """
+        fresh.post("/workspace/setup", json={"by": "jfanhon"})
+        rules = Path(fresh.get("/workspace").json()["config_dir"]) \
+            / "planning_parameters.md"
+        rules.write_text(rules.read_text(encoding="utf-8") + "\n<!-- edited -->\n",
+                         encoding="utf-8")
+
+        again = fresh.post("/workspace/setup", json={"by": "jfanhon"}).json()
+        assert any("left untouched" in line for line in again["did"])
+        assert "<!-- edited -->" in rules.read_text(encoding="utf-8")
+
+    def test_it_must_name_who_is_doing_it(self, fresh):
+        assert fresh.post("/workspace/setup", json={}).status_code == 400
+
+    def test_the_tenant_is_the_servers_and_never_the_requests(self, fresh):
+        """
+        The difference between an action and a hole: a request that could name its own
+        tenant would be a request that writes a directory tree wherever the resolver
+        resolves to.
+        """
+        body = fresh.post("/workspace/setup",
+                          json={"by": "jfanhon", "tenant": "somewhere-else"}).json()
+        assert body["tenant"] == "acme"
+        assert "somewhere-else" not in body["config_dir"]
+
+    def test_a_named_tenant_keeps_nothing_in_the_working_tree(self, fresh):
+        from inventory_planning.store.location import inside_repo
+
+        body = fresh.get("/workspace").json()
+        for key in ("config_dir", "store_root", "output_dir"):
+            assert not inside_repo(Path(body[key]))
+
+
 class TestWhatThePipelineCanRead:
 
     def test_health_names_the_store_it_is_pointed_at(self, client, workspace):

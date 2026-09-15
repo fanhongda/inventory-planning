@@ -151,6 +151,9 @@ ul.degrades { margin: 10px 0 0 18px; padding: 0; color: var(--muted); font-size:
 .group li.req .mark { flex: 0 0 18px; width: 18px; height: 18px; line-height: 17px; }
 
 nav#tabs { max-width: 980px; margin: 0 auto; padding: 4px 28px 0; display: flex; gap: 4px; }
+/* `display: flex` beats the `hidden` attribute, so the tabs stayed visible over the
+   setup panel and led to four screens that cannot answer anything yet. */
+nav#tabs[hidden] { display: none; }
 button.tab {
   border: 1px solid var(--line); border-bottom: 0; background: #f2f0ea;
   border-radius: 7px 7px 0 0; color: var(--muted); padding: 7px 16px;

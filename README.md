@@ -778,6 +778,12 @@ alone, so re-running it by habit cannot put a production policy back to the defa
 the second command before the first and it refuses with the first one, rather than
 failing inside a reader on a missing file.
 
+**Or from the browser.** A server started on a workspace nobody has prepared shows a
+setup panel instead of four screens that cannot answer anything, and one button does the
+same thing `--setup` does. The tenant is the one the server was started with and is never
+taken from the request — a request that could name its own would be a request that writes
+a directory tree wherever the resolver resolves to.
+
 A named tenant's **three** directories sit together outside any working tree:
 
 ```

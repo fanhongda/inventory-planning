@@ -200,15 +200,17 @@ class Service:
                  workspace=None, tenant=None):
         from ..workspace import Workspace
 
-        # Resolved through the one resolver, even when all three were passed in — see
-        # `workspace.py`. What the API keeps from before is that an unset config_dir
-        # stays None: several endpoints read that as "use the package's own config",
-        # and a workspace that helpfully filled it in would change which rules a test
-        # with no config directory plans under.
+        # Resolved through the one resolver — see `workspace.py`.
         self.workspace = workspace or Workspace.resolve(
             tenant, config_dir=config_dir, store_root=store_root,
             output_dir=output_dir)
-        self.config_dir = Path(config_dir) if config_dir else None
+        # The workspace's, always. This used to keep the raw argument and leave it None
+        # when unset, so four endpoints fell back to the package's own config — which
+        # meant `--tenant prod` served the *repository's* rules while reporting success.
+        # A wrong answer that looks right, which is the failure this whole layer exists
+        # to refuse. For the default tenant the workspace resolves to that same
+        # directory, so nothing moved for the case the fallback was written for.
+        self.config_dir = self.workspace.config_dir
         self.store_root = store_root
         # Where the runs are. The registry lives under the output directory the pipeline
         # writes to, so the interface reads the runs the CLI produced rather than
@@ -341,6 +343,51 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             "contracts": len(service.contracts.doc_types),
             "notes": landing.notes,
         }
+
+    @app.get("/workspace")
+    def workspace() -> Dict[str, Any]:
+        """
+        Which workspace this server is serving, and whether it has been set up.
+
+        Every screen asks this first. A server pointed at a tenant nobody has prepared
+        used to answer every other endpoint as though the repository's own config were
+        the tenant's — a wrong answer that looked right, which is the failure this whole
+        layer exists to refuse. Now the screens can say what is missing and offer the
+        one action that fixes it.
+        """
+        return {
+            **service.workspace.to_dict(),
+            "ready": service.workspace.ready,
+            "warnings": list(service.workspace.warnings),
+            "note": "The rules, the facts and the outputs of one tenant. A named tenant "
+                    "keeps all three outside any working tree, so pulling the code "
+                    "cannot reach them.",
+        }
+
+    @app.post("/workspace/setup")
+    def setup_workspace(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+        """
+        Prepare **this server's own** workspace: make the directories, seed the rules.
+
+        The tenant is the one the server was started with and is never taken from the
+        request. That is the whole difference between an action and a hole: a request
+        that could name its own tenant would be a request that can write a directory
+        tree anywhere the resolver will resolve to.
+
+        Idempotent, and seeding never overwrites — a config directory that already holds
+        rules is left exactly alone, so a second click cannot put a production policy
+        back to the package default.
+        """
+        from ..workspace import BadTenant
+
+        actor = _actor(payload, "setting up this workspace")
+        try:
+            done = service.workspace.prepare()
+        except BadTenant as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"tenant": service.workspace.tenant, "ready": service.workspace.ready,
+                "by": actor.name, "did": done,
+                **service.workspace.to_dict()}
 
     @app.get("/contracts")
     def contracts() -> List[Dict[str, Any]]:
@@ -1033,8 +1080,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         """
         from ..policy.parameters import PlanningParameters
 
-        path = ((service.config_dir or Path(__file__).parents[2] / "config")
-                / "planning_parameters.md")
+        path = service.config_dir / "planning_parameters.md"
         try:
             params = PlanningParameters(path)
         except (FileNotFoundError, ValueError) as exc:
@@ -1082,7 +1128,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         """
         from ..policy import rules_edit
 
-        root = service.config_dir or Path(__file__).parents[2] / "config"
+        root = service.config_dir
         action = str(payload.get("action") or "edit").strip()
         rule_id = str(payload.get("rule_id") or "").strip()
 
@@ -1124,7 +1170,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         import json as _json
         from ..policy.parameters import PlanningParameters
 
-        root = service.config_dir or Path(__file__).parents[2] / "config"
+        root = service.config_dir
         out: Dict[str, Any] = {"config_dir": str(root), "settings": []}
 
         from ..policy import macro as macro_edit
@@ -1195,7 +1241,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         """
         from ..policy.macro import MacroError, apply as apply_macro, propose
 
-        root = service.config_dir or Path(__file__).parents[2] / "config"
+        root = service.config_dir
         name = str(payload.get("name") or "").strip()
         if "value" not in payload:
             raise HTTPException(status_code=400, detail="value is required")

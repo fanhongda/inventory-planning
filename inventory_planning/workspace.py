@@ -270,7 +270,12 @@ class Workspace:
         """
         import shutil
 
-        source = Path(seed_from) if seed_from else Workspace.resolve().config_dir
+        # The config that ships beside the package, not whatever the default tenant
+        # resolves to. Those are the same directory on a plain checkout and are not
+        # once `$INVENTORY_PLANNING_CONFIG` is set — in which case seeding from the
+        # default tenant means seeding a new workspace from another workspace, which
+        # is only correct by accident.
+        source = Path(seed_from) if seed_from else Path(__file__).parents[1] / "config"
         done: List[str] = []
         for key, path in self.paths.items():
             if path.exists():
@@ -286,8 +291,9 @@ class Workspace:
         if not (source / "planning_parameters.md").exists():
             raise BadTenant(
                 f"nothing to seed the config from: {source} holds no "
-                f"`planning_parameters.md`. Point --config at a config directory, or "
-                f"copy one in by hand — the directories above are made and waiting.")
+                f"`planning_parameters.md`. That directory ships with a source "
+                f"checkout and not with an installed package, so copy a config in by "
+                f"hand — the directories are made and waiting for it.")
 
         copied = 0
         for path in sorted(source.glob("*")):

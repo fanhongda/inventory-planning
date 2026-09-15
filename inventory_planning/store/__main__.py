@@ -45,6 +45,24 @@ from .location import resolve_store_root
 from .migration import MigrationPlan, OP_RESTATE, OP_VOID, PlanRefused
 
 
+def _add_workspace_flags(parser, suppress: bool = False) -> None:
+    """
+    `--store` / `--tenant` on the parent *and* on each subcommand.
+
+    argparse puts a parent's options before the subcommand only, so
+    `feedback runs --tenant prod` was an error while `feedback --tenant prod runs` was
+    not — a distinction nobody should have to know. Defined in both places so either
+    order works, and the subcommand's copies default to SUPPRESS: an ordinary default
+    would be written over the parent's value, silently sending the command to the
+    default tenant's store.
+    """
+    default = argparse.SUPPRESS if suppress else None
+    parser.add_argument("--store", default=default, help="Store root.")
+    parser.add_argument("--tenant", default=default,
+                        help="Which tenant's workspace. May go before or after the "
+                             "subcommand.")
+
+
 def _select(ledger: BatchLedger, args) -> List[Dict[str, Any]]:
     """
     The batches a command applies to. Empty selectors select nothing, never everything.
@@ -118,21 +136,16 @@ def main(argv: List[str] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m inventory_planning.store",
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--store", default=None,
-                        help="Store root. Defaults to $INVENTORY_PLANNING_STORE or the "
-                             "platform data directory.")
-    parser.add_argument("--tenant", default=None,
-                        help="Which tenant's store. Combines with --store rather than "
-                             "replacing it: a tenant under an explicit root gets its "
-                             "own subtree, so pointing --store at a dev store does not "
-                             "merge every tenant's facts into it.")
+    _add_workspace_flags(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("show", help="What the store holds, by document and layer")
+    _add_workspace_flags(sub.add_parser(
+        "show", help="What the store holds, by document and layer"), suppress=True)
 
     for name, help_text in (("restate", "say what layer the selected batches hold"),
                             ("void", "withdraw the selected batches from every reading")):
         cmd = sub.add_parser(name, help=help_text)
+        _add_workspace_flags(cmd, suppress=True)
         cmd.add_argument("--doc-type", default=None)
         cmd.add_argument("--source", action="append", default=[],
                          help="Substring of the source file name. Repeatable.")
@@ -166,7 +179,8 @@ def main(argv: List[str] = None) -> int:
     from ..workspace import BadTenant, Workspace
 
     try:
-        workspace = Workspace.resolve(args.tenant, store_root=args.store)
+        workspace = Workspace.resolve(getattr(args, "tenant", None),
+                                      store_root=getattr(args, "store", None))
     except BadTenant as exc:
         parser.error(str(exc))
     root, source = workspace.store_root, workspace.origins["store_root"]

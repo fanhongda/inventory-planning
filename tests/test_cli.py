@@ -217,3 +217,52 @@ class TestTheFirstRun:
 
         body = inspect.getsource(cli.main)
         assert body.index("Workspace.resolve") < body.index("InventoryPlanner(")
+
+
+class TestTheSubcommandCLIsAcceptTheFlagsEitherWay:
+    """
+    Found by following the README's own steps: `feedback runs --tenant prod` was an
+    error while `feedback --tenant prod runs` was not, because argparse puts a parent's
+    options before the subcommand only. Nobody should have to know that, and the failure
+    is quiet in the other direction — a command that silently reads the default tenant's
+    store while the reader believes it named one.
+    """
+
+    @pytest.mark.parametrize("argv", [
+        ["--tenant", "acme", "runs"],
+        ["runs", "--tenant", "acme"],
+    ])
+    def test_feedback_takes_it_before_or_after(self, argv, capsys):
+        from inventory_planning.feedback.__main__ import main
+
+        main(argv)
+        assert "tenants/acme" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("argv", [
+        ["--tenant", "acme", "show"],
+        ["show", "--tenant", "acme"],
+    ])
+    def test_the_store_cli_takes_it_before_or_after(self, argv, capsys):
+        from inventory_planning.store.__main__ import main
+
+        main(argv)
+        assert "tenants/acme" in capsys.readouterr().out
+
+    def test_the_subcommand_wins_when_both_are_given(self, capsys):
+        from inventory_planning.store.__main__ import main
+
+        main(["--tenant", "one", "show", "--tenant", "two"])
+        out = capsys.readouterr().out
+        assert "tenants/two" in out and "tenants/one" not in out
+
+    def test_a_parent_flag_alone_is_not_overwritten_by_the_subcommand_default(
+            self, capsys):
+        """
+        The argparse trap this guards: an ordinary default on the subcommand's copy is
+        written over the parent's value, so `--tenant acme show` would quietly read the
+        default tenant's store. SUPPRESS is what stops it.
+        """
+        from inventory_planning.store.__main__ import main
+
+        main(["--tenant", "acme", "show"])
+        assert "tenants/acme" in capsys.readouterr().out

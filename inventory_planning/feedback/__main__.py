@@ -34,6 +34,24 @@ from typing import Any, Dict, List, Optional
 SCORES_DIRNAME = "scores"
 
 
+def _add_workspace_flags(parser, suppress: bool = False) -> None:
+    """
+    `--store` / `--tenant` on the parent *and* on each subcommand.
+
+    argparse puts a parent's options before the subcommand only, so
+    `feedback runs --tenant prod` was an error while `feedback --tenant prod runs` was
+    not — a distinction nobody should have to know. Defined in both places so either
+    order works, and the subcommand's copies default to SUPPRESS: an ordinary default
+    would be written over the parent's value, silently sending the command to the
+    default tenant's store.
+    """
+    default = argparse.SUPPRESS if suppress else None
+    parser.add_argument("--store", default=default, help="Store root.")
+    parser.add_argument("--tenant", default=default,
+                        help="Which tenant's workspace. May go before or after the "
+                             "subcommand.")
+
+
 def _snapshots(history: Path) -> List[Path]:
     return sorted(history.glob("*/snapshot_*.json"))
 
@@ -89,14 +107,15 @@ def main(argv: List[str] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m inventory_planning.feedback",
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--store", default=None, help="Store root.")
-    parser.add_argument("--tenant", default=None, help="Which tenant's store.")
+    _add_workspace_flags(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     listing = sub.add_parser("runs", help="Snapshots, and the extracts to score against")
+    _add_workspace_flags(listing, suppress=True)
     listing.add_argument("--limit", type=int, default=10)
 
     scoring = sub.add_parser("score", help="Score one run against an extract")
+    _add_workspace_flags(scoring, suppress=True)
     scoring.add_argument("--run", required=True, help="Run id of the snapshot to score")
     scoring.add_argument("--sales", default=None,
                          help="sales_history batch supplying actual demand")
@@ -107,12 +126,15 @@ def main(argv: List[str] = None) -> int:
                               "never touched either way.")
 
     args = parser.parse_args(argv)
+    # SUPPRESS means the attribute is absent when the subcommand did not carry one.
+    store_root = getattr(args, "store", None)
+    tenant = getattr(args, "tenant", None)
 
     from ..store.fact_store import FactStore, history_root
     from ..workspace import BadTenant, Workspace
 
     try:
-        workspace = Workspace.resolve(args.tenant, store_root=args.store)
+        workspace = Workspace.resolve(tenant, store_root=store_root)
     except BadTenant as exc:
         parser.error(str(exc))
     store = FactStore(workspace.store_root)

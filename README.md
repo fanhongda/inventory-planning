@@ -766,9 +766,17 @@ change) neither collide nor need to be told apart by hand.
 
 ### Keeping a production run apart from a working tree you pull into
 
+Two commands, once and then every time:
+
 ```bash
-inventory-plan exports/ --tenant prod
+inventory-plan --setup --tenant prod        # once — makes the directories, seeds the rules
+inventory-plan exports/ --tenant prod       # every run after that
 ```
+
+`--setup` is safe to repeat: a config directory that already holds rules is left exactly
+alone, so re-running it by habit cannot put a production policy back to the default. Run
+the second command before the first and it refuses with the first one, rather than
+failing inside a reader on a missing file.
 
 A named tenant's **three** directories sit together outside any working tree:
 

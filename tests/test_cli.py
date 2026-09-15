@@ -176,3 +176,44 @@ class TestTheLegacyPathSaysWhatItCosts:
         ])
         assert args.inputs == []
         assert args.sales == "s.csv"
+
+
+class TestTheFirstRun:
+    """
+    A workspace nobody has set up used to fail four frames inside a reader. It is
+    refused up front now, with the one command that fixes it.
+    """
+
+    def test_setup_is_a_flag_and_needs_no_inputs(self):
+        args = build_parser().parse_args(["--setup", "--tenant", "prod"])
+        assert args.setup is True
+        assert args.inputs == []
+
+    def test_an_unprepared_workspace_is_refused_with_the_command_to_run(
+            self, tmp_path, capsys, monkeypatch):
+        from inventory_planning.cli import main
+
+        monkeypatch.setenv("INVENTORY_PLANNING_CONFIG", str(tmp_path / "cfg"))
+        monkeypatch.setenv("INVENTORY_PLANNING_OUTPUT", str(tmp_path / "out"))
+        monkeypatch.setenv("INVENTORY_PLANNING_STORE", str(tmp_path / "store"))
+        monkeypatch.setattr(sys, "argv",
+                            ["inventory-plan", "somedir", "--tenant", "prod"])
+
+        with pytest.raises(SystemExit):
+            main()
+        message = capsys.readouterr().err
+        assert "no rules to plan under" in message
+        assert "inventory-plan --setup --tenant prod" in message
+
+    def test_the_workspace_is_resolved_before_the_planner_is_built(self):
+        """
+        Building a planner reads the config, so the check has to come first or it never
+        runs — which is how the first version of this still produced the traceback it
+        was written to replace.
+        """
+        import inspect
+
+        from inventory_planning import cli
+
+        body = inspect.getsource(cli.main)
+        assert body.index("Workspace.resolve") < body.index("InventoryPlanner(")

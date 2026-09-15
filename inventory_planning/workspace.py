@@ -247,6 +247,58 @@ class Workspace:
                 continue
         return False
 
+    # ── Setting one up ───────────────────────────────────────────────────────
+
+    @property
+    def ready(self) -> bool:
+        """Whether a run would find rules here. The one thing worth checking early."""
+        return (self.config_dir / "planning_parameters.md").exists()
+
+    def prepare(self, seed_from=None) -> List[str]:
+        """
+        Create the three directories and seed the config, once.
+
+        Written because the alternative was a `FileNotFoundError` on
+        `incoterm_rules.json` from four frames inside a reader — which tells someone
+        setting up their first workspace nothing about what to do.
+
+        **Seeding never overwrites.** A config directory that already has rules is left
+        exactly alone, including when a file is missing from it: copying the package's
+        version of a rule set somebody has edited is how a production policy silently
+        goes back to the default, and it would happen on whichever run someone re-ran
+        this by habit.
+        """
+        import shutil
+
+        source = Path(seed_from) if seed_from else Workspace.resolve().config_dir
+        done: List[str] = []
+        for key, path in self.paths.items():
+            if path.exists():
+                done.append(f"{key} already at {path}")
+            else:
+                path.mkdir(parents=True, exist_ok=True)
+                done.append(f"{key} created at {path}")
+
+        if self.ready:
+            done.append(f"config already holds rules — left untouched, "
+                        f"including anything missing from it")
+            return done
+        if not (source / "planning_parameters.md").exists():
+            raise BadTenant(
+                f"nothing to seed the config from: {source} holds no "
+                f"`planning_parameters.md`. Point --config at a config directory, or "
+                f"copy one in by hand — the directories above are made and waiting.")
+
+        copied = 0
+        for path in sorted(source.glob("*")):
+            if path.is_file():
+                shutil.copy2(path, self.config_dir / path.name)
+                copied += 1
+        done.append(f"seeded {copied} config file(s) from {source}")
+        done.append("edit them — they are this tenant's own, and a `git pull` does not "
+                    "reach them")
+        return done
+
     def summary(self) -> str:
         lines = [f"  Workspace · {self.tenant}"]
         width = max(len(k) for k in self.paths)

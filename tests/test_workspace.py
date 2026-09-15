@@ -306,3 +306,54 @@ class TestNothingQuietlyOutranksTheTenant:
         planner = InventoryPlanner(tenant="acme", output_dir=tmp_path / "chosen",
                                    interactive=False)
         assert planner.output_dir == tmp_path / "chosen"
+
+
+class TestSettingOneUp:
+    """
+    The first-run experience, which was a `FileNotFoundError` on `incoterm_rules.json`
+    four frames inside a reader — nothing a person setting up their first workspace can
+    act on.
+    """
+
+    def test_a_fresh_workspace_is_not_ready(self, tmp_path):
+        assert Workspace.resolve("acme", base=tmp_path,
+                                 store_root=tmp_path / "s").ready is False
+
+    def test_preparing_creates_all_three_and_seeds_the_rules(self, tmp_path):
+        workspace = Workspace.resolve("acme", base=tmp_path, store_root=tmp_path / "s")
+        workspace.prepare(seed_from=REPO / "config")
+
+        assert workspace.ready
+        for path in workspace.paths.values():
+            assert path.is_dir()
+        assert (workspace.config_dir / "planning_parameters.md").exists()
+
+    def test_it_never_overwrites_an_existing_config(self, tmp_path):
+        """
+        The failure this guards: someone re-runs setup by habit and a production rule
+        set silently goes back to the package default. It is left alone even when a
+        file is missing from it, because "top up the missing ones" is the same failure
+        for the file that was deliberately deleted.
+        """
+        workspace = Workspace.resolve("acme", base=tmp_path, store_root=tmp_path / "s")
+        workspace.prepare(seed_from=REPO / "config")
+        rules = workspace.config_dir / "planning_parameters.md"
+        rules.write_text("# edited by a person\n", encoding="utf-8")
+        (workspace.config_dir / "fx_rates.json").unlink()
+
+        done = workspace.prepare(seed_from=REPO / "config")
+        assert rules.read_text(encoding="utf-8") == "# edited by a person\n"
+        assert not (workspace.config_dir / "fx_rates.json").exists()
+        assert any("left untouched" in line for line in done)
+
+    def test_it_is_safe_to_repeat(self, tmp_path):
+        workspace = Workspace.resolve("acme", base=tmp_path, store_root=tmp_path / "s")
+        workspace.prepare(seed_from=REPO / "config")
+        done = workspace.prepare(seed_from=REPO / "config")
+        assert all("created" not in line for line in done)
+
+    def test_nothing_to_seed_from_says_so_and_leaves_the_directories(self, tmp_path):
+        workspace = Workspace.resolve("acme", base=tmp_path, store_root=tmp_path / "s")
+        with pytest.raises(BadTenant, match="nothing to seed the config from"):
+            workspace.prepare(seed_from=tmp_path / "empty")
+        assert workspace.config_dir.is_dir()      # made and waiting, as the message says

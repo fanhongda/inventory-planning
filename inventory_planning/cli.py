@@ -70,6 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "override are recorded in quality_gates_<run>.json — every "
                              "figure then rests on data that did not pass.")
     parser.add_argument("--no-interactive", action="store_true", help="Skip column-mapping confirmation prompts")
+    parser.add_argument("--setup", action="store_true",
+                        help="Create this workspace's three directories and seed its "
+                             "config, then stop. Safe to repeat: an existing config is "
+                             "never overwritten.")
     parser.add_argument("--tenant", default=None,
                         help="Which workspace to plan in. Names a tenant's config, "
                              "store and output together rather than pointing at three "
@@ -124,9 +128,22 @@ def _legacy_warning() -> str:
     return "\n".join(lines)
 
 
+def _setup(workspace) -> int:
+    print()
+    print(workspace.summary())
+    print()
+    for line in workspace.prepare():
+        print(f"    {line}")
+    tenant = ("" if workspace.tenant == "default"
+              else f" --tenant {workspace.tenant}")
+    print(f"\n  Ready. Plan with:\n"
+          f"    inventory-plan <dir-or-files...>{tenant}")
+    return 0
+
+
 def main():
     args = build_parser().parse_args()
-    if not args.inputs and not any(
+    if not args.setup and not args.inputs and not any(
             (args.sales, args.po_history, args.open_so, args.open_po, args.inventory)):
         build_parser().error(
             "name the input files. Either positionally — a directory or the files "
@@ -134,13 +151,35 @@ def main():
             "the one to use; the flags read through a narrower alias table and skip "
             "the intake quality gate.")
 
+    # Resolved before the planner is built, because building one reads the config —
+    # so a workspace nobody has set up used to fail four frames inside a reader on
+    # `incoterm_rules.json`, which tells someone setting up their first one nothing.
+    from .workspace import BadTenant, Workspace
+
+    try:
+        workspace = Workspace.resolve(
+            args.tenant, config_dir=args.config, output_dir=args.output)
+    except BadTenant as exc:
+        build_parser().error(str(exc))
+
+    if args.setup:
+        return _setup(workspace)
+
+    # Not created automatically. A typo in --tenant would quietly make an empty
+    # workspace, seed it, and plan under rules that are not the ones meant — a run
+    # about something else entirely, reported as a success.
+    if not workspace.ready:
+        build_parser().error(
+            f"{workspace.config_dir} holds no `planning_parameters.md`, so there are "
+            f"no rules to plan under. Set this workspace up once:\n"
+            f"    inventory-plan --setup"
+            f"{' --tenant ' + args.tenant if args.tenant else ''}")
+
     planner = InventoryPlanner(
-        config_dir=args.config,
-        output_dir=args.output,
+        workspace=workspace,
         interactive=not args.no_interactive,
         parameters_file=args.parameters,
         allow_degraded=args.allow_degraded,
-        tenant=args.tenant,
     )
     # Printed before anything is read. Which config a run planned under is the first
     # question asked when a run's numbers look wrong, and answering it afterwards means

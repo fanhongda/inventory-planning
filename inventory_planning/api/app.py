@@ -86,6 +86,23 @@ _LATER_GATES = [
 ]
 
 
+def _output_kind(name: str) -> str:
+    """
+    How the screen should offer one output: a workbook to browse, text to read, or a
+    file to download. By extension, because that is all the manifest records — and the
+    alternative, sniffing the bytes, would be a second opinion about a file the run
+    already named.
+    """
+    suffix = Path(name).suffix.lower()
+    if suffix in (".xlsx", ".xlsm"):
+        return "workbook"
+    if suffix in (".md", ".txt"):
+        return "text"
+    if suffix in (".csv", ".json"):
+        return "download"
+    return "download"
+
+
 def _finding_dict(finding) -> Dict[str, Any]:
     """
     One finding as the screen needs it, which is the gate's own dict plus two readings.
@@ -1168,6 +1185,123 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         if manifest is None:
             raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
         return manifest
+
+    def _output_path(run_id: str, name: str) -> Path:
+        """
+        Where one of a run's outputs is, resolved only from what the manifest recorded.
+
+        The name is matched against the manifest's own list rather than joined onto a
+        directory, which is what keeps this from being a file-read endpoint with a path
+        in it. A name the run did not write is a 404 whether or not such a file exists.
+
+        Two candidate directories, in order: the one the registry was found under, and
+        the one the manifest says the run wrote to. The first wins because it is where
+        the files are *now* — a run copied from another machine carries an absolute path
+        that means nothing here — and the second is the fallback for a registry read
+        from somewhere other than the output directory.
+        """
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+        names = {o.get("name") for o in manifest.get("outputs") or []}
+        if name not in names:
+            raise HTTPException(
+                404, f"run {run_id} did not write {name!r}. It wrote: "
+                     f"{', '.join(sorted(n for n in names if n))}.")
+        for base in (service.output_dir, Path(manifest.get("output_dir") or ".")):
+            candidate = Path(base) / name
+            if candidate.exists():
+                return candidate
+        raise HTTPException(
+            410, f"{name} is recorded by run {run_id} but is not on disk any more. The "
+                 f"manifest still says what was written; the file itself is gone.")
+
+    @app.get("/runs/{run_id}/outputs")
+    def outputs(run_id: str) -> Dict[str, Any]:
+        """
+        What this run wrote, from the manifest, with whether each file is still there.
+
+        The manifest is the index rather than a directory listing: it records what *this
+        run* wrote, where a listing would mix in every other run's files and could not
+        tell them apart once a directory holds a month of them.
+        """
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+
+        listed = []
+        for record in manifest.get("outputs") or []:
+            name = record.get("name") or ""
+            path = None
+            for base in (service.output_dir, Path(manifest.get("output_dir") or ".")):
+                candidate = Path(base) / name
+                if candidate.exists():
+                    path = candidate
+                    break
+            listed.append({
+                "name": name,
+                "bytes": record.get("bytes"),
+                "rows": record.get("rows"),
+                "kind": _output_kind(name),
+                "present": path is not None,
+                "path": str(path) if path else None,
+            })
+        return {
+            "run_id": run_id,
+            "run_at": manifest.get("run_at"),
+            "outputs": listed,
+            "note": "This screen renders these files. It does not recompute anything "
+                    "in them — a second place the figures were formatted and rounded "
+                    "would be a second place they could disagree.",
+        }
+
+    @app.get("/runs/{run_id}/outputs/{name}/sheets")
+    def workbook_sheets(run_id: str, name: str) -> Dict[str, Any]:
+        from ..reporting.read_workbook import WorkbookUnreadable, sheets as read_sheets
+
+        path = _output_path(run_id, name)
+        try:
+            return {"run_id": run_id, "name": name, "sheets": read_sheets(path)}
+        except WorkbookUnreadable as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/runs/{run_id}/outputs/{name}/sheets/{sheet}")
+    def workbook_sheet(run_id: str, name: str, sheet: str,
+                       offset: int = Query(0, ge=0),
+                       limit: int = Query(100, ge=1, le=500)) -> Dict[str, Any]:
+        """One window of one sheet, values as the workbook holds and displays them."""
+        from ..reporting.read_workbook import WorkbookUnreadable, read_sheet
+
+        path = _output_path(run_id, name)
+        try:
+            return read_sheet(path, sheet, offset=offset, limit=limit).to_dict()
+        except WorkbookUnreadable as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/runs/{run_id}/outputs/{name}/text")
+    def output_text(run_id: str, name: str,
+                    limit: int = Query(80_000, ge=1, le=400_000)) -> Dict[str, Any]:
+        """
+        A text output as it was written — the run health note, the suggested rules.
+
+        Verbatim and truncated rather than summarised. These files are already the
+        pipeline's own prose about the run, and a summary of them on this screen would
+        be a second account of what the run found.
+        """
+        path = _output_path(run_id, name)
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise HTTPException(400, f"{name} could not be read: {exc}") from exc
+        return {"run_id": run_id, "name": name, "bytes": len(body.encode("utf-8")),
+                "truncated": len(body) > limit, "text": body[:limit]}
+
+    @app.get("/runs/{run_id}/outputs/{name}/download")
+    def output_download(run_id: str, name: str):
+        """The file itself, so the workbook a meeting runs on is one click from here."""
+        from fastapi.responses import FileResponse
+
+        return FileResponse(_output_path(run_id, name), filename=name)
 
     @app.get("/runs/{run_a}/diff/{run_b}")
     def diff(run_a: str, run_b: str) -> Dict[str, Any]:

@@ -386,10 +386,47 @@ canonical frame carries no row number, so the pointer `(batch_id, row_no)` is fo
 only at batch granularity. Adding a row number to the canonical frame crosses into the
 contracts and the adapters, and belongs with P5 rather than here.
 
-**Planning and analysis get no UI.** Excel stays the output, as asked. That is a defence
-as much as a preference: the run's five-sheet workbook is what gets handed round a
-meeting, and a screen that showed the same numbers would immediately become a second
-place they are formatted, rounded and subtly disagreed about.
+### M4 — Results
+
+**Excel stays the output**, as asked, and that is a defence as much as a preference: the
+run's five-sheet workbook is what gets handed round a meeting. What this section used to
+conclude from that — planning and analysis get no UI at all — §7 revised, because the
+objection was to a screen that *re-derives* the figures, and it does not apply to one
+that renders the workbook the run already wrote. One artefact, two renderings.
+
+**Built, 2026-09-15.** `GET /runs/{id}/outputs` lists what the run wrote, from the
+manifest; the workbook's sheets are browsable and its text outputs are shown verbatim.
+The constraint the screen exists under, and the only one that matters:
+
+- **It computes nothing.** No totals, no percentages, no re-sorting, no top-N, no
+  filling of blanks — a blank cell stays blank, because a missing figure and a zero are
+  different findings. The moment something on it is calculated the original objection
+  returns in full and the screen should be deleted rather than argued for.
+- **Numbers are shown under the workbook's own number format.** This is the subtle half
+  of the objection rather than an exception to it: `workbook.py` writes a raw value and
+  a format, and Excel displays the two combined. A screen printing the raw value would
+  disagree with the file on every money column while holding the identical number.
+  Rounding is half away from zero, which is Excel's rule — Python's `round(0.5)` is `0`,
+  and a screen showing `0` where the file shows `1` is the disagreement in its purest
+  form. A format the reader does not understand is shown raw and *named*, never guessed.
+- **The manifest is the index, and the only one.** A file is located by matching the name
+  against what that run recorded writing, not by joining a name onto a directory — so a
+  run's outputs are separable from every other run's in a folder holding a month of
+  them, and the endpoint is not a file read with a path in it. A recorded file that has
+  since been deleted is listed as gone rather than dropped from the list.
+
+What the screen adds over opening the workbook is the two things the file cannot carry
+once it is in someone's downloads folder: which run it came from and what that run was
+resting on, and the rest of that run's outputs beside it — the health note and the gate
+findings a planner opening only the xlsx never sees.
+
+`test_results_screen.py` pins the writer and the reader together: every number format
+`workbook.py` emits must be one the reader renders. Add a fifth there and the test fails,
+which is the only way the two stay in agreement without becoming one file.
+
+**Still out:** resolving a single fact row back to its verbatim row, which needs a row
+number on the canonical frame (P5), and any analysis the workbook does not already
+contain.
 
 ---
 
@@ -595,7 +632,7 @@ now while they are still cheap. What that asks for, against what is there:
 |---|---|---|
 | enter macro and policy | both written back with a diff | — |
 | query the data | three named readings, by layer, as-of | — |
-| see the results | the workbook only | a screen over it |
+| see the results | a screen over the workbook | — |
 | the store holds a record | facts, landing, declarations, batch ledger | decisions |
 | C/S: permissions, schema versions | none; a version and a refusal | three seams |
 
@@ -664,7 +701,10 @@ a mechanism is cheaper now, with one instance to generalise from, than after the
    the change. `policy/edits.py` holds what the two share, so there is one place the
    basis is checked and one log. Details under §2. What I said rule editing would still
    need — review by someone other than the author — it does not, and §2 says why.
-3. **The results screen**, over the workbook, located from the manifest.
+3. **The results screen**, over the workbook, located from the manifest. **Done,
+   2026-09-15** — it renders the run's own files and computes nothing, down to using
+   the workbook's own number formats so the page and the file cannot disagree. Details
+   under §2, M4.
 4. **The workspace seam**, then **the identity seam**, then **the migration mechanism**.
 5. **Decisions in the store (P6)** — and not before. The results screen does not need it;
    feedback learning does, and that is the thing to build it for.
@@ -676,7 +716,8 @@ before C/S actually requires it.
 
 - Editable fact rows. Unchanged from DATA_LAYER.md.
 - Re-keying an ERP export into a template.
-- A planning or analysis UI. Excel is the output.
+- A planning or analysis UI. Excel is the output, and the results screen renders
+  that workbook rather than becoming one — it computes nothing (§2, M4).
 - Settings whose semantics do not exist yet, exposed as switches.
 - UI-only state of any kind — sessions, drafts, saved filters that change a result.
 - A "continue anyway" button. `allow_degraded` exists for a judgement a threshold got

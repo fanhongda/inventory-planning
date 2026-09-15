@@ -57,6 +57,13 @@ th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--lin
 th { color: var(--muted); font-weight: 500; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .scroll { overflow-x: auto; }
+
+/* A rendered sheet. The Parameters sheet is 113 columns wide, and letting cells wrap
+   turns each row into a paragraph — the table grows down instead of across and stops
+   being readable as a table. Scroll sideways instead, which is what the workbook does. */
+table.sheet { width: auto; }
+table.sheet th, table.sheet td { white-space: nowrap; }
+table.sheet tbody tr:hover td { background: #f7f7f5; }
 tr.attention td { background: #fdf6e3; }
 
 .tag {

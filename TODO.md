@@ -209,6 +209,13 @@ proposal reports the rule order the file will have afterwards, because later rul
 and where a rule sits is part of what it does. `rule_id` is not editable: the manifest
 records hits against it.
 
+**The results screen is up. Done 2026-09-15.** A fourth screen renders what a run
+wrote, located from the manifest: the workbook's sheets, its text outputs verbatim, and
+every file it produced with a download. It computes nothing — the numbers are cells,
+shown under the workbook's own number formats with Excel's rounding, so the page and the
+file cannot disagree. A test pins the writer's format constants to the reader's, because
+that is the only way the two files stay in agreement without becoming one.
+
 What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
 which recommendations flipped. Neither needs new identity work.
 

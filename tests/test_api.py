@@ -1174,6 +1174,104 @@ class _FakeHit:
         self.overrides_earlier = {}
 
 
+class TestWhatARunProduced:
+    """
+    The results screen's half of the API. The manifest is the index rather than a
+    directory listing: it records what *this run* wrote, where a listing would mix in
+    every other run's files and could not tell them apart once a directory holds a
+    month of them.
+    """
+
+    @pytest.fixture
+    def run(self, tmp_path):
+        import pandas as pd
+
+        from inventory_planning.provenance import RunManifest, RunRegistry
+        from inventory_planning.reporting import workbook as writer
+
+        out = tmp_path / "out"
+        out.mkdir()
+        frame = pd.DataFrame({"sku": ["A-1", "A-2"],
+                              "actual_value": [52385.8, 17061.03]})
+        book = out / "planning_x.xlsx"
+        with pd.ExcelWriter(book, engine="openpyxl") as excel:
+            frame.to_excel(excel, sheet_name="Inventory", index=False)
+            writer._format_sheet(excel.book["Inventory"], frame, "Inventory")
+        (out / "run_health_x.md").write_text("# what this run rests on\n",
+                                             encoding="utf-8")
+
+        manifest = RunManifest.begin(output_dir=out)
+        manifest.record_output(book)
+        manifest.record_output(out / "run_health_x.md")
+        manifest.record_output(out / "gone.csv")
+        RunRegistry(out).save(manifest)
+        return out, manifest.run_id
+
+    @pytest.fixture
+    def client(self, workspace, run):
+        config, store = workspace
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=run[0]))
+
+    def test_the_outputs_come_from_the_manifest_with_their_kind(self, client, run):
+        body = client.get(f"/runs/{run[1]}/outputs").json()
+        by_name = {o["name"]: o for o in body["outputs"]}
+        assert by_name["planning_x.xlsx"]["kind"] == "workbook"
+        assert by_name["run_health_x.md"]["kind"] == "text"
+        assert "does not recompute" in body["note"]
+
+    def test_a_file_the_run_recorded_but_that_is_gone_says_so(self, client, run):
+        """
+        Not dropped from the list. The manifest still says what was written, and a
+        screen that quietly listed one fewer file would be hiding the disappearance.
+        """
+        by_name = {o["name"]: o for o in
+                   client.get(f"/runs/{run[1]}/outputs").json()["outputs"]}
+        assert by_name["gone.csv"]["present"] is False
+        assert by_name["planning_x.xlsx"]["present"] is True
+        assert client.get(
+            f"/runs/{run[1]}/outputs/gone.csv/text").status_code == 410
+
+    def test_the_sheets_and_one_window_of_one(self, client, run):
+        listed = client.get(f"/runs/{run[1]}/outputs/planning_x.xlsx/sheets").json()
+        assert [s["name"] for s in listed["sheets"]] == ["Inventory"]
+
+        sheet = client.get(
+            f"/runs/{run[1]}/outputs/planning_x.xlsx/sheets/Inventory").json()
+        assert sheet["columns"] == ["sku", "actual_value"]
+        # Under the workbook's own `#,##0`, which is the whole point of the screen.
+        assert sheet["rows"][0] == ["A-1", "52,386"]
+
+    def test_a_text_output_comes_back_verbatim(self, client, run):
+        body = client.get(f"/runs/{run[1]}/outputs/run_health_x.md/text").json()
+        assert body["text"] == "# what this run rests on\n"
+        assert body["truncated"] is False
+
+    def test_a_name_the_run_did_not_write_is_refused(self, client, run, tmp_path):
+        """
+        The name is matched against the manifest's own list rather than joined onto a
+        directory, so this is not a file-read endpoint with a path in it.
+        """
+        secret = tmp_path / "out" / "secret.csv"
+        secret.write_text("not this run's", encoding="utf-8")
+        response = client.get(f"/runs/{run[1]}/outputs/secret.csv/text")
+        assert response.status_code == 404
+        assert "did not write" in response.json()["detail"]
+
+    def test_a_path_that_climbs_out_is_refused(self, client, run):
+        for name in ("../../etc/passwd", "..%2F..%2Fetc%2Fpasswd", "/etc/passwd"):
+            assert client.get(
+                f"/runs/{run[1]}/outputs/{name}/text").status_code in (404, 400)
+
+    def test_an_unknown_run_is_404(self, client):
+        assert client.get("/runs/nope/outputs").status_code == 404
+
+    def test_the_workbook_downloads_as_itself(self, client, run):
+        response = client.get(f"/runs/{run[1]}/outputs/planning_x.xlsx/download")
+        assert response.status_code == 200
+        assert response.content[:2] == b"PK"
+
+
 class TestRunsAndTheirDifferences:
 
     def _registry(self, tmp_path):

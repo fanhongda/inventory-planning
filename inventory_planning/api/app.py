@@ -42,6 +42,8 @@ from ..provenance import RunRegistry, sha256_file
 from ..store.fact_store import FactStore, StoreUnavailable
 from ..ingest.templates import contract_fingerprint, emit
 from ..resolution import resolve_frame
+from ..policy.edits import EditRefused
+from ..policy.rules_edit import history as rule_history
 from ..store.declarations import (
     Declarations, DeclarationError, Override, SCOPE_MAPPING, SCOPE_VALUE,
 )
@@ -994,8 +996,65 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                  "owner": r.owner, "date": r.date}
                 for r in params.rules
             ],
+            "changes": rule_history(service.config_dir, limit=20),
             **_reach_of(params.path),
         }
+
+    @app.put("/policy/rules")
+    def edit_rules(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Propose a change to the rules, and apply it once the diff has been seen.
+
+        One endpoint carrying the change rather than three shaped like HTTP verbs,
+        which is the contract INTERFACE.md §7 fixed: `{change, reason, by}` in, the diff
+        it would make out, approval applies it. The shape is what has to survive the
+        move to a server, so it is worth more than the REST tidiness of a `DELETE`.
+
+        Writing is opt-in (`apply: true`) and pinned to `basis`, exactly as the macro
+        editor is — a client asking "what would this do" must not have already done it,
+        and what gets approved is the diff that was shown rather than the rule it was
+        shown for.
+
+        The three actions differ in what they need and in what they cost:
+
+        - `edit` takes `changes`, a subset of the rule's fields. Only those are
+          rewritten; every other byte of the rule, including the comments beside its
+          parameters, stays as it was.
+        - `add` takes `rule` and appends it last, which is the only position with a
+          statable meaning: it wins over everything above it.
+        - `remove` takes only the id. Its reason goes to the log rather than the file,
+          because afterwards there is no rule left to carry it.
+        """
+        from ..policy import rules_edit
+
+        root = service.config_dir or Path(__file__).parents[2] / "config"
+        action = str(payload.get("action") or "edit").strip()
+        rule_id = str(payload.get("rule_id") or "").strip()
+
+        if action == "edit":
+            def proposal_for():
+                return rules_edit.propose_edit(rule_id, payload.get("changes") or {},
+                                               config_dir=root)
+        elif action == "add":
+            def proposal_for():
+                return rules_edit.propose_add(payload.get("rule") or {},
+                                              config_dir=root)
+        elif action == "remove":
+            def proposal_for():
+                return rules_edit.propose_remove(rule_id, config_dir=root)
+        else:
+            raise HTTPException(400, f"action must be edit, add or remove, "
+                                     f"not {action!r}")
+
+        try:
+            if not payload.get("apply"):
+                return {**proposal_for().to_dict(), "applied": False}
+            return rules_edit.apply(
+                proposal_for, reason=payload.get("reason", ""),
+                by=payload.get("by", ""), basis=str(payload.get("basis") or ""),
+                config_dir=root)
+        except EditRefused as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/policy/macro")
     def macro() -> Dict[str, Any]:

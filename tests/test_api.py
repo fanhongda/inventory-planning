@@ -781,6 +781,144 @@ class TestWaivingOneCheck:
         assert response.status_code == 400
 
 
+class TestEditingARule:
+    """
+    The same propose-then-approve contract as a scalar, over a block instead of a
+    value. One endpoint carrying the change rather than three shaped like HTTP verbs —
+    the shape is what has to survive the move to a server, and it is worth more than
+    the REST tidiness of a `DELETE`.
+    """
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("planning_parameters.md", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    def _put(self, client, **body):
+        return client.put("/policy/rules", json=body)
+
+    def _rules(self, client):
+        return {r["rule_id"]: r for r in client.get("/policy").json()["rules"]}
+
+    def test_a_proposal_returns_the_diff_and_writes_nothing(self, client, workspace):
+        before = (workspace[0] / "planning_parameters.md").read_text(encoding="utf-8")
+        body = self._put(client, action="edit", rule_id="R-001",
+                         changes={"set": {"review_period_days": 14}}).json()
+
+        assert body["applied"] is False
+        assert "-  review_period_days: 7" in body["diff"]
+        assert "+  review_period_days: 14" in body["diff"]
+        assert (workspace[0] / "planning_parameters.md").read_text(
+            encoding="utf-8") == before
+
+    def test_approving_the_diff_applies_it(self, client):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        body = self._put(client, action="edit", rule_id="R-001",
+                         changes={"set": {"review_period_days": 14}}, apply=True,
+                         reason="ordering cost rose", by="jfanhon",
+                         basis=proposal["basis"]).json()
+
+        assert body["applied"] is True
+        assert self._rules(client)["R-001"]["sets"] == {"review_period_days": 14}
+
+    def test_every_proposal_says_where_the_rule_will_sit(self, client):
+        """
+        Half of what a rule does is which rules come after it, and that is not readable
+        off the diff.
+        """
+        body = self._put(client, action="edit", rule_id="R-001",
+                         changes={"set": {"review_period_days": 14}}).json()
+        assert body["order"] == ["R-001", "R-002", "R-003", "R-004"]
+
+    def test_a_new_rule_is_appended_last_and_says_so(self, client):
+        rule = {"rule_id": "R-009", "name": "DDP items", "scope": 'incoterm == "DDP"',
+                "set": {"service_level": 0.92}, "rationale": "risk sits with them",
+                "owner": "FHD"}
+        proposal = self._put(client, action="add", rule=rule).json()
+        assert proposal["order"][-1] == "R-009"
+        assert "wins over every rule above it" in proposal["note"]
+
+        self._put(client, action="add", rule=rule, apply=True, reason="two new DDP "
+                  "suppliers", by="jfanhon", basis=proposal["basis"])
+        assert "R-009" in self._rules(client)
+
+    def test_a_removal_shows_what_falls_back(self, client):
+        proposal = self._put(client, action="remove", rule_id="R-002").json()
+        assert "falls back to the rule above it" in proposal["note"]
+        assert "R-002" not in proposal["order"]
+
+        self._put(client, action="remove", rule_id="R-002", apply=True,
+                  reason="actuators moved to the other DC", by="jfanhon",
+                  basis=proposal["basis"])
+        assert "R-002" not in self._rules(client)
+
+    def test_a_file_that_moved_since_the_diff_is_a_refusal(self, client, workspace):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        path = workspace[0] / "planning_parameters.md"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "date: 2026-08-02", "date: 2026-08-03", 1), encoding="utf-8")
+
+        response = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}, apply=True,
+                             reason="r", by="jfanhon", basis=proposal["basis"])
+        assert response.status_code == 400
+        assert "has changed since that diff" in response.json()["detail"]
+        assert self._rules(client)["R-001"]["sets"] == {"review_period_days": 7}
+
+    def test_an_apply_without_a_reason_or_a_name_is_refused(self, client):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        for missing in ({"by": "jfanhon"}, {"reason": "because"}):
+            response = self._put(client, action="edit", rule_id="R-001",
+                                 changes={"set": {"review_period_days": 14}},
+                                 apply=True, basis=proposal["basis"], **missing)
+            assert response.status_code == 400
+
+    def test_a_scope_the_engine_cannot_parse_is_refused(self, client):
+        response = self._put(client, action="edit", rule_id="R-001",
+                             changes={"scope": 'abc_class === "A"'})
+        assert response.status_code == 400
+        assert "invalid scope" in response.json()["detail"]
+
+    def test_the_rule_id_cannot_be_renamed(self, client):
+        """The manifest records hits against it, so a rename detaches every count."""
+        response = self._put(client, action="edit", rule_id="R-001",
+                             changes={"rule_id": "R-099"})
+        assert response.status_code == 400
+        assert "not editable" in response.json()["detail"]
+
+    def test_an_unknown_action_is_a_400(self, client):
+        assert self._put(client, action="reorder", rule_id="R-001").status_code == 400
+
+    def test_the_change_is_listed_on_the_policy_screen_with_its_reason(self, client):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        self._put(client, action="edit", rule_id="R-001",
+                  changes={"set": {"review_period_days": 14}}, apply=True,
+                  reason="ordering cost rose", by="jfanhon", basis=proposal["basis"])
+
+        entry, = client.get("/policy").json()["changes"]
+        assert entry["rule_id"] == "R-001" and entry["action"] == "edit"
+        assert entry["by"] == "jfanhon" and entry["reason"] == "ordering cost rose"
+
+    def test_a_rule_edit_does_not_show_up_as_a_macro_change(self, client):
+        """One log, two editors, told apart by `kind` rather than by two files."""
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        self._put(client, action="edit", rule_id="R-001",
+                  changes={"set": {"review_period_days": 14}}, apply=True,
+                  reason="r", by="jfanhon", basis=proposal["basis"])
+        assert client.get("/policy/macro").json()["changes"] == []
+        assert len(client.get("/policy").json()["changes"]) == 1
+
+
 class TestEditingAScalar:
     """
     Two requests, not a stored proposal: the first asks what a change would do, the

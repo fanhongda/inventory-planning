@@ -37,8 +37,6 @@ which is the failure the whole propose-then-approve shape exists to prevent.
 
 from __future__ import annotations
 
-import difflib
-import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -46,17 +44,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-CHANGE_LOG_NAME = "macro_changes.jsonl"
+from .edits import (
+    CHANGE_LOG_NAME, EditRefused, check_basis, collapse, config_root as _config_root,
+    digest as _digest, history as _history, record, require_attribution, unified,
+)
+
+# Kept as a name because it is what the endpoints and the tests raise on, and because
+# "the macro edit was refused" is what a caller of this module is catching. It is the
+# shared class, not a subclass, so one `except` covers both editors.
+MacroError = EditRefused
 
 # Syntaxes a setting can live in. Both are edited the same way — find the one line the
 # value is on, replace the value, leave the rest of the file alone — and differ only in
 # how a value is written and how the file is validated afterwards.
 JSON = "json"
 YAML_BLOCK = "yaml_block"       # a `key: value` line inside a fenced block in markdown
-
-
-class MacroError(ValueError):
-    """A proposed change that cannot be made, with the reason a person needs."""
 
 
 @dataclass(frozen=True)
@@ -175,16 +177,6 @@ class MacroChange:
                      "at": self.at, "digest": self.after_digest,
                      "recorded_in": self.log_path})
         return body
-
-
-def _digest(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _config_root(config_dir=None) -> Path:
-    if config_dir is None:
-        return Path(__file__).parents[2] / "config"
-    return Path(config_dir)
 
 
 # ── Finding the one line a setting is on ─────────────────────────────────────
@@ -423,9 +415,7 @@ def propose(name: str, value: Any, config_dir=None) -> MacroProposal:
                              basis=_digest(text), impact=setting.impact, unchanged=True)
 
     _validate(edited, setting, root)
-    diff = "".join(difflib.unified_diff(
-        text.splitlines(keepends=True), edited.splitlines(keepends=True),
-        fromfile=f"a/{setting.filename}", tofile=f"b/{setting.filename}", n=3))
+    diff = unified(text, edited, setting.filename)
     return MacroProposal(name=setting.name, filename=setting.filename, path=str(path),
                          before=before, after=after, diff=diff, basis=_digest(text),
                          impact=setting.impact)
@@ -446,24 +436,14 @@ def apply(name: str, value: Any, *, reason: str, by: str, basis: str,
     asserted it and why, and an unattributed change to a convention that restates every
     figure in the run is exactly what this layer exists to replace.
     """
-    if not str(reason or "").strip():
-        raise MacroError(
-            "a macro change written through an interface must carry a reason — these "
-            "settings restate the whole run and the reason is the only account of why")
-    if not str(by or "").strip():
-        raise MacroError("a macro change written through an interface must name who "
-                         "made it")
+    require_attribution(reason, by, "a change to a macro setting")
 
     proposal = propose(name, value, config_dir=config_dir)
     if proposal.unchanged:
         raise MacroError(
             f"{name} is already {proposal.before!r} — nothing to apply. A change that "
             f"writes nothing should not appear in the log as though something moved.")
-    if not basis or basis != proposal.basis:
-        raise MacroError(
-            f"{proposal.filename} has changed since that diff was produced. The change "
-            f"is not applied: re-read the setting and approve the diff against the "
-            f"file as it stands now.")
+    check_basis(basis, proposal.basis, proposal.filename)
 
     path = Path(proposal.path)
     edited = path.read_text(encoding="utf-8")
@@ -473,50 +453,17 @@ def apply(name: str, value: Any, *, reason: str, by: str, basis: str,
     path.write_text(edited, encoding="utf-8")
 
     at = datetime.now().isoformat(timespec="seconds")
-    log_path = _record(_config_root(config_dir), {
-        "at": at, "by": str(by), "reason": " ".join(str(reason).split()),
+    log_path = record(config_dir, {
+        "kind": "macro",
+        "at": at, "by": str(by), "reason": collapse(reason),
         "setting": proposal.name, "file": proposal.filename,
         "from": proposal.before, "to": proposal.after,
         "basis": proposal.basis, "digest": _digest(edited),
     })
-    return MacroChange(proposal=proposal, by=str(by),
-                       reason=" ".join(str(reason).split()), at=at,
+    return MacroChange(proposal=proposal, by=str(by), reason=collapse(reason), at=at,
                        after_digest=_digest(edited), log_path=str(log_path))
 
 
-def _record(root: Path, entry: Dict[str, Any]) -> Path:
-    """
-    Append the change to `config/macro_changes.jsonl`.
-
-    Beside the files it describes, and in the config directory rather than the output
-    directory, because it belongs to the configuration and travels with it: a config
-    directory copied to another machine carries its own history of who changed what.
-    Append-only, one line per change — the same shape as the batch ledger, for the same
-    reason, which is that a history that can be rewritten is not one.
-
-    The diff is deliberately not stored. It is recoverable from the file's own history
-    and it would be the longest field in a log meant to be read; what cannot be
-    recovered from the file is the reason, and that is what this keeps.
-    """
-    path = root / CHANGE_LOG_NAME
-    root.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    return path
-
-
 def history(config_dir=None, limit: int = 50) -> List[Dict[str, Any]]:
-    """The recorded changes, newest first. A malformed line is skipped, not fatal."""
-    path = _config_root(config_dir) / CHANGE_LOG_NAME
-    if not path.exists():
-        return []
-    entries: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entries.append(json.loads(line))
-        except ValueError:
-            continue
-    return list(reversed(entries))[:limit]
+    """The macro changes, newest first — the shared log, narrowed to this editor."""
+    return _history(config_dir, limit=limit, kind="macro")

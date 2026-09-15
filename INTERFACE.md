@@ -252,9 +252,10 @@ the user approves. Git stays the store; the form is a validator with a nicer key
 **Rules** — review period, service level, replenishment method by segment. These stay in
 `config/planning_parameters.md`. DATA_LAYER.md's refusal to move the rule engine into a
 database holds: review, diff, rationale and owner are what a rule needs, and markdown in
-git gives all four for free. The UI's job here is not editing but **impact**: show the
-rule table read-only, and beside each rule the SKUs it hit and the SKUs it skipped —
-`policy/parameters.py` already computes both and throws them away.
+git gives all four for free. §7 revised the half of this that said the UI's job is
+therefore not editing — it edits the file, and all four survive because the storage does
+not move. What the UI adds beyond editing is **impact**: beside each rule, the SKUs it
+hit and the SKUs it skipped.
 
 And the feature that makes the page worth building at all: **a policy change is a diff
 of two runs, not a state view.** Edit a parameter file → run as a scenario → diff
@@ -291,9 +292,40 @@ than a reformatted file. Five things decided the shape:
   `analytics.rounding`, which on a real run is an hour of work past the point the value
   is set, so the check is moved forward by calling that reader — not by restating what
   it accepts.
-- **The reason and the owner go to `config/macro_changes.jsonl`**, append-only, beside
+- **The reason and the owner go to `config/config_changes.jsonl`**, append-only, beside
   the files it describes. The diff is not stored: it is recoverable from the file's own
   history, and the reason is the part that is nowhere else.
+
+**Rule editing, since 2026-09-15.** The same contract over a block instead of a value:
+`PUT /policy/rules` takes `{action, …}` and returns the diff, approval applies it, the
+basis pins it. Edit, add and remove, on one endpoint carrying the change rather than
+three shaped like HTTP verbs — the shape is what has to survive the move to a server.
+Four things a rule needed that a scalar did not:
+
+- **The rationale has a home in the file.** A rule already carries `rationale`, `owner`
+  and `date`, so an edit writes them rather than only logging them elsewhere: that is
+  where the next reader looks. `date` is stamped, not asked for.
+- **Only the changed fields are rewritten.** Re-rendering the rule from its parsed form
+  would reflow a rationale nobody touched and put six lines in the diff for a change to
+  one number. A comment written beside a parameter survives an edit to the parameter
+  next to it.
+- **Order is meaning.** Rules apply top to bottom and later ones win, so every proposal
+  reports the order the file will have afterwards, and a new rule is appended last —
+  the only position with a statable meaning.
+- **Reach cannot be predicted from here.** A scope is a question about a frame of SKUs
+  and an interface has no frame. The counts beside a rule belong to the last run under
+  the rules as they were, so an edit says they are detached and that the next run
+  measures the new scope. A guessed count beside a scope is an invitation to write the
+  scope around it.
+
+`rule_id` is not editable: the manifest records each rule's hits against it, so renaming
+one detaches every count ever recorded for it.
+
+**What was considered and left out: a second person's approval.** I had written that
+rule editing would need it where a scalar did not. It would not be one — every `by` on
+this interface is a form field nobody checks, so a second name is a second unverified
+string, and a review step that verifies nothing is worse than an honest absence of one
+because it reads as a control. It arrives with the identity seam below, not before it.
 
 **Per-rule hits, since 2026-09-15.** `policy/parameters.py` computed which SKUs each
 rule reached and which it skipped, printed it, and threw it away; the manifest now keeps
@@ -561,7 +593,7 @@ now while they are still cheap. What that asks for, against what is there:
 
 | Asked for | Today | Missing |
 |---|---|---|
-| enter macro and policy | macro written back with a diff | the same for rules |
+| enter macro and policy | both written back with a diff | — |
 | query the data | three named readings, by layer, as-of | — |
 | see the results | the workbook only | a screen over it |
 | the store holds a record | facts, landing, declarations, batch ledger | decisions |
@@ -623,14 +655,15 @@ a mechanism is cheaper now, with one instance to generalise from, than after the
    newest run under the same rule bytes and the screen shows them per rule. Details
    under §2. Smallest, and everything else on the policy screen is weaker without it:
    editing a rule without seeing what it reached is a form with no feedback.
-2. **Macro editing** — **done, 2026-09-15**; then **rule editing**. Scalars first
-   because they are a form over JSON with a diff, and that is what landed: a registry of
-   the settings the engine reads, a surgical one-line edit, validation by loading, and
-   the rationale in an append-only log beside the files. Details under §2. The
-   propose-and-approve contract the rules need is built and proven here — the digest of
-   the file is what ties an approval to the diff it was shown — so rule editing inherits
-   a mechanism rather than inventing one. What it still has to add is that a rule's
-   change needs review by someone other than its author, which a scalar's does not.
+2. **Macro editing, then rule editing** — **both done, 2026-09-15**. Scalars first
+   because they are a form over JSON with a diff: a registry of the settings the engine
+   reads, a surgical one-line edit, validation by loading, the rationale in an
+   append-only log beside the files. Rules second, over the same propose-and-approve
+   contract — the digest of the file is what ties an approval to the diff it was shown
+   — with edit, add and remove, and the rule's own rationale, owner and date moving with
+   the change. `policy/edits.py` holds what the two share, so there is one place the
+   basis is checked and one log. Details under §2. What I said rule editing would still
+   need — review by someone other than the author — it does not, and §2 says why.
 3. **The results screen**, over the workbook, located from the manifest.
 4. **The workspace seam**, then **the identity seam**, then **the migration mechanism**.
 5. **Decisions in the store (P6)** — and not before. The results screen does not need it;

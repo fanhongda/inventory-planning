@@ -199,8 +199,17 @@ The CLI compensates for one of its checks (`product_dimension`, via a `parser.er
 disagreeing inventory export runs to completion with exit 0 on the CLI and raises
 `DataQualityError` through `load_all`.
 
-What this still needs: **rule editing** over the same contract, and a **SKU-level diff
-over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
+**The rules are editable too. Done 2026-09-15.** `PUT /policy/rules` over the same
+propose-then-approve contract, with edit, add and remove. Only the fields that changed
+are rewritten, so a comment beside a parameter survives an edit to the parameter next to
+it and a rationale nobody touched is not reflowed. The rule's own `rationale`, `owner`
+and `date` move with the change — that is where the next reader looks — and the reason
+for the change goes to the log, which for a removal is the only record left. Every
+proposal reports the rule order the file will have afterwards, because later rules win
+and where a rule sits is part of what it does. `rule_id` is not editable: the manifest
+records hits against it.
+
+What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
 which recommendations flipped. Neither needs new identity work.
 
 **Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the

@@ -17,7 +17,7 @@ import json
 import pytest
 
 from inventory_planning.provenance import (
-    RunComparison, RunManifest, RunRegistry,
+    RuleHitRecord, RunComparison, RunManifest, RunRegistry, sha256_file,
 )
 
 
@@ -256,6 +256,169 @@ class TestPolicyFingerprint:
         m = RunManifest.begin(policy_file=base)
         m.note_policy_override(base)
         assert not any("rules differ" in n for n in m.notes)
+
+
+class TestRuleHitsAreRetained:
+    """
+    The rule ids said which rules were in force and nothing about which of them did
+    anything — the reach was computed on every run, printed, and dropped, so the only
+    way to see what a rule touched was to run the pipeline and watch the console. It is
+    kept now, because a policy screen that cannot say what a rule reached is a form
+    with no feedback.
+    """
+
+    class _Rule:
+        rule_id, name, scope = "R-001", "A class weekly", 'abc_class == "A"'
+        overrides = {"review_period_days": 7}
+
+    class _Hit:
+        rule = None
+        matched, effective = 12, 9
+        sample_skus = ["A-1", "A-2"]
+        unavailable_columns: list = []
+        overrides_earlier = {"review_period_days": "R-000"}
+
+    def _hit(self):
+        hit = self._Hit()
+        hit.rule = self._Rule()
+        return hit
+
+    def test_the_rule_is_legible_without_the_file_it_came_from(self, tmp_path):
+        """
+        The manifest describes a run that has already happened and the rules file
+        moves. `R-001 matched 12` read against a scope rewritten since would be worse
+        than no record at all.
+        """
+        m = _manifest()
+        m.record_rule_hits([self._hit()])
+        hit = m.rule_hits[0]
+        assert hit.rule_id == "R-001" and hit.scope == 'abc_class == "A"'
+        assert hit.sets == {"review_period_days": 7}
+        assert (hit.matched, hit.effective) == (12, 9)
+        assert hit.overrides_earlier == {"review_period_days": "R-000"}
+
+    def test_it_moves_no_fingerprint(self, tmp_path):
+        """
+        Same reason `record_rules` does not: batches are stamped with these values
+        before a frame exists to match a rule against.
+        """
+        cfg = tmp_path / "config"; cfg.mkdir()
+        (cfg / "fx_rates.json").write_text('{"a": 1}', encoding="utf-8")
+        rules = tmp_path / "rules.md"; rules.write_text("x\n", encoding="utf-8")
+        m = RunManifest.begin(config_dir=cfg, policy_file=rules)
+        before = (m.config_fingerprint, m.policy_fingerprint, m.input_fingerprint)
+        m.record_rule_hits([self._hit()])
+        assert (m.config_fingerprint, m.policy_fingerprint,
+                m.input_fingerprint) == before
+
+    def test_the_ids_survive_a_run_that_recorded_only_the_reach(self):
+        m = _manifest()
+        m.record_rule_hits([self._hit()])
+        assert m.rule_ids == ["R-001"]
+
+    def test_the_ids_recorded_at_parse_time_are_not_narrowed_to_the_ones_that_ran(self):
+        """
+        A rule skipped for a missing column is still a rule that was in force, and
+        `rule_ids` is what `policy_fingerprint` is read beside.
+        """
+        m = _manifest()
+        m.record_rules(["R-001", "R-002"])
+        m.record_rule_hits([self._hit()])
+        assert m.rule_ids == ["R-001", "R-002"]
+
+    def test_a_skipped_rule_is_not_a_rule_that_matched_nothing(self):
+        hit = self._hit()
+        hit.matched, hit.effective = 0, None
+        hit.unavailable_columns = ["product_family"]
+        m = _manifest()
+        m.record_rule_hits([hit])
+        assert m.rule_hits[0].skipped
+        assert m.rule_hits[0].effective is None
+
+    def test_the_summary_says_how_many_rules_are_actually_deciding(self):
+        inert = self._hit()
+        inert.rule = self._Rule(); inert.rule.rule_id = "R-009"
+        inert.matched, inert.effective = 4, 0
+        m = _manifest()
+        m.record_rules(["R-001", "R-009"])
+        m.record_rule_hits([self._hit(), inert])
+        assert "2 rules, 1 standing" in m.summary()
+        assert "R-009" in m.summary()
+
+    def test_a_manifest_with_no_reach_recorded_says_nothing_about_it(self):
+        """A run that died before resolution has no reach, not a reach of zero."""
+        m = _manifest()
+        m.record_rules(["R-001"])
+        assert "standing" not in m.summary()
+
+    def test_it_survives_the_round_trip_through_the_registry(self, tmp_path):
+        m = _manifest(output_dir=tmp_path)
+        m.record_rule_hits([self._hit()])
+        RunRegistry(tmp_path).save(m)
+        stored = RunRegistry(tmp_path).get(m.run_id)["rule_hits"]
+        assert [h["rule_id"] for h in stored] == ["R-001"]
+        assert stored[0]["effective"] == 9
+
+
+class TestFindingTheRunThatUsedTheseRules:
+    """
+    What the policy screen asks: these are the rules on disk — has anything actually
+    run under them? Matched on the content of the file, because a scenario copy of the
+    same rules at another path is the same rules, and because identical bytes cannot
+    declare a different set of rule ids, which is what makes the answer safe to line up
+    rule by rule.
+    """
+
+    def _run(self, tmp_path, rules, *, hits=True):
+        m = RunManifest.begin(output_dir=tmp_path, policy_file=rules)
+        if hits:
+            m.record_rules(["R-001"])
+            m.rule_hits = [RuleHitRecord(rule_id="R-001", matched=3, effective=3)]
+        RunRegistry(tmp_path).save(m)
+        return m
+
+    def test_the_newest_run_under_these_bytes_is_the_answer(self, tmp_path):
+        rules = tmp_path / "rules.md"; rules.write_text("a\n", encoding="utf-8")
+        self._run(tmp_path, rules)
+        newest = self._run(tmp_path, rules)
+        found = RunRegistry(tmp_path).latest_under_rules(sha256_file(rules))
+        assert found["run_id"] == newest.run_id
+
+    def test_an_edited_file_matches_nothing(self, tmp_path):
+        """
+        And the caller shows no counts rather than the old ones. Counts from before an
+        edit belong to the rules as they were.
+        """
+        rules = tmp_path / "rules.md"; rules.write_text("a\n", encoding="utf-8")
+        self._run(tmp_path, rules)
+        rules.write_text("a\nb\n", encoding="utf-8")
+        assert RunRegistry(tmp_path).latest_under_rules(sha256_file(rules)) is None
+
+    def test_the_same_rules_at_another_path_still_match(self, tmp_path):
+        """A scenario copy is the same rule set; `policy_fingerprint` folds in the path."""
+        rules = tmp_path / "rules.md"; rules.write_text("a\n", encoding="utf-8")
+        run = self._run(tmp_path, rules)
+        copy = tmp_path / "scenario.md"; copy.write_text("a\n", encoding="utf-8")
+        found = RunRegistry(tmp_path).latest_under_rules(sha256_file(copy))
+        assert found["run_id"] == run.run_id
+        assert found["policy_fingerprint"] != RunManifest.begin(
+            policy_file=copy).policy_fingerprint
+
+    def test_a_newer_run_that_recorded_no_reach_does_not_hide_an_older_one(self, tmp_path):
+        """
+        Runs from before the reach was kept, and runs that died before resolution. An
+        older run under the same bytes says more about those rules than a newer one
+        that recorded nothing.
+        """
+        rules = tmp_path / "rules.md"; rules.write_text("a\n", encoding="utf-8")
+        with_hits = self._run(tmp_path, rules)
+        self._run(tmp_path, rules, hits=False)
+        registry = RunRegistry(tmp_path)
+        assert registry.latest_under_rules(sha256_file(rules),
+                                           with_hits=True)["run_id"] == with_hits.run_id
+
+    def test_an_unreadable_rules_file_asks_nothing(self, tmp_path):
+        assert RunRegistry(tmp_path).latest_under_rules(None) is None
 
 
 class TestComparisonNamesWhatMoved:

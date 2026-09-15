@@ -112,6 +112,42 @@ class TestPlanningParameters:
         assert "R-002" in frame.loc["ACT-1", "applied_rules"]
         assert frame.loc["VAL-1", "applied_rules"] == ""
 
+    def test_a_rule_reports_what_is_still_standing_not_only_what_it_matched(self, resolved):
+        """
+        R-001 gives every A-class SKU a weekly review, and on this frame both of them
+        are taken back — one by the actuator rule, one by the long-lead rule. It
+        matched 2 and decides nothing, and a screen that showed only `matched` would
+        report a dead rule as the busiest one on the page.
+        """
+        hits = {h.rule.rule_id: h for h in resolved.hits}
+        assert hits["R-001"].matched == 2
+        assert hits["R-001"].effective == 0
+        assert "deciding nothing" in str(hits["R-001"])
+        assert hits["R-002"].effective == hits["R-002"].matched == 1
+
+    def test_standing_counts_skus_not_parameters(self, params, skus):
+        """
+        R-003 sets three parameters on one SKU. Counting rows × parameters would make
+        it 3 — a number that cannot be read beside `matched`, which is the only number
+        it is ever read beside.
+        """
+        skus = skus.copy()
+        skus["abc_class"] = params.assign_abc(skus)
+        hits = {h.rule.rule_id: h for h in params.resolve(skus).hits}
+        assert len(hits["R-003"].rule.overrides) == 3
+        assert hits["R-003"].matched == 1 and hits["R-003"].effective == 1
+
+    def test_a_skipped_rule_has_no_standing_count_rather_than_zero(self, params, skus):
+        """
+        Zero would read as "this scope matched nothing" — a reason to go and rewrite a
+        scope that is perfectly good and was simply asked of a frame missing a column.
+        """
+        skus = skus.drop(columns=["product_family"])
+        skus["abc_class"] = params.assign_abc(skus)
+        hits = {h.rule.rule_id: h for h in params.resolve(skus).hits}
+        assert hits["R-002"].effective is None
+        assert hits["R-001"].effective is not None
+
     def test_rule_on_unavailable_column_matches_nothing_and_says_so(self, params, skus):
         skus = skus.drop(columns=["product_family"])
         skus["abc_class"] = params.assign_abc(skus)

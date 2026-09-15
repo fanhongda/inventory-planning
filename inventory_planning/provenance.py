@@ -45,7 +45,14 @@ INDEX_NAME = "index.jsonl"
 _CONFIG_GLOBS = ("*.json", "planning_parameters.md")
 
 
-def _sha256_file(path: Path) -> Optional[str]:
+def sha256_file(path: Path) -> Optional[str]:
+    """
+    Content digest of one file, or None if it cannot be read.
+
+    Public because the interface has to ask the same question of the rules file that a
+    run asked — "are these the bytes that run read?" — and a second implementation of
+    that hash would be a second answer the day one of them changed.
+    """
     try:
         h = hashlib.sha256()
         with open(path, "rb") as fh:
@@ -104,6 +111,46 @@ class OutputRecord:
 
 
 @dataclass
+class RuleHitRecord:
+    """
+    What one rule reached in one run.
+
+    The rule ids alone say which rules were in force; they say nothing about which of
+    them did anything, and that is the question anyone editing a rule is actually
+    asking. The engine has always worked this out — it prints it — and then dropped it
+    on the floor, so the only way to see a rule's reach was to run the pipeline and
+    read the console.
+
+    Enough of the rule is copied in for the record to be legible on its own. That
+    duplicates the rules file, which is normally the wrong trade; here it is the point,
+    because the file moves and the manifest describes a run that has already happened.
+    A record saying `R-014 matched 23` against a scope that has since been rewritten
+    would be worse than no record.
+    """
+
+    rule_id: str
+    name: str = ""
+    scope: str = ""
+    sets: Dict[str, Any] = dc_field(default_factory=dict)
+    matched: int = 0
+    # Where at least one of its values was still standing at the end of the file.
+    # Below `matched` means a later rule took some of it back; zero means the rule ran
+    # and decided nothing.
+    effective: Optional[int] = None
+    sample_skus: List[str] = dc_field(default_factory=list)
+    # A rule whose scope names a column the run did not have matches nothing and is not
+    # a failure — but it is also not a rule that matched zero SKUs, and a screen that
+    # showed both as `0` would send someone to rewrite a scope that is perfectly good.
+    unavailable_columns: List[str] = dc_field(default_factory=list)
+    # param -> the earlier rule whose value this one replaced
+    overrides_earlier: Dict[str, str] = dc_field(default_factory=dict)
+
+    @property
+    def skipped(self) -> bool:
+        return bool(self.unavailable_columns)
+
+
+@dataclass
 class RunManifest:
     """What one run read, resolved and wrote."""
 
@@ -118,6 +165,7 @@ class RunManifest:
     # on disk, and running an alternate rule set is exactly what a scenario is.
     policy_files: Dict[str, str] = dc_field(default_factory=dict)
     rule_ids: List[str] = dc_field(default_factory=list)
+    rule_hits: List[RuleHitRecord] = dc_field(default_factory=list)
     inputs: List[InputRecord] = dc_field(default_factory=list)
     outputs: List[OutputRecord] = dc_field(default_factory=list)
     notes: List[str] = dc_field(default_factory=list)
@@ -164,7 +212,7 @@ class RunManifest:
             return
         for pattern in _CONFIG_GLOBS:
             for path in sorted(config_dir.glob(pattern)):
-                digest = _sha256_file(path)
+                digest = sha256_file(path)
                 if digest:
                     self.config_files[path.name] = digest
 
@@ -176,7 +224,7 @@ class RunManifest:
         if p is not None and p.exists():
             stat = p.stat()
             rec.path = str(p.resolve())
-            rec.sha256 = _sha256_file(p)
+            rec.sha256 = sha256_file(p)
             rec.bytes = stat.st_size
             rec.modified_at = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
         for k, v in extra.items():
@@ -225,7 +273,46 @@ class RunManifest:
         self.outputs.append(record)
 
     def record_rules(self, rule_ids) -> None:
+        """The rules in force, recorded when the file is parsed."""
         self.rule_ids = [str(r) for r in rule_ids]
+
+    def record_rule_hits(self, hits) -> None:
+        """
+        What those rules reached, recorded once the run has resolved against them.
+
+        Separate from `record_rules` and deliberately later: the ids are known as soon
+        as the file is read, the reach only after a frame exists to match against, and
+        a run that dies in between should still record which rules were in force.
+
+        Duck-typed over `policy.parameters.RuleHit` rather than importing it. Nothing
+        else in this module knows what a rule is, and provenance that could fail to
+        import would be provenance that can fail the run it documents.
+
+        Like every other fingerprint input, this never moves one: the hits are an
+        outcome of the run, and `policy_fingerprint` is over the rules file, fixed
+        before the first batch was stamped with it.
+        """
+        records: List[RuleHitRecord] = []
+        for hit in hits:
+            rule = getattr(hit, "rule", None)
+            records.append(RuleHitRecord(
+                rule_id=str(getattr(rule, "rule_id", "") or getattr(hit, "rule_id", "")),
+                name=str(getattr(rule, "name", "") or ""),
+                scope=str(getattr(rule, "scope", "") or ""),
+                sets=dict(getattr(rule, "overrides", None) or {}),
+                matched=int(getattr(hit, "matched", 0) or 0),
+                effective=getattr(hit, "effective", None),
+                sample_skus=[str(s) for s in (getattr(hit, "sample_skus", None) or [])],
+                unavailable_columns=[
+                    str(c) for c in (getattr(hit, "unavailable_columns", None) or [])],
+                overrides_earlier={
+                    str(k): str(v) for k, v in
+                    (getattr(hit, "overrides_earlier", None) or {}).items()},
+            ))
+        self.rule_hits = records
+        # A run that resolved rules without anyone recording the ids still knows them.
+        if not self.rule_ids:
+            self.rule_ids = [r.rule_id for r in records]
 
     def set_policy_file(self, path) -> None:
         """
@@ -238,7 +325,7 @@ class RunManifest:
         hold still for the whole run, the same reason `config_fingerprint` is read here.
         """
         p = Path(path)
-        digest = _sha256_file(p)
+        digest = sha256_file(p)
         self.policy_files = {str(p): digest} if digest else {}
         if not digest:
             self.notes.append(f"rules file {p} unreadable — policy unfingerprinted")
@@ -325,6 +412,7 @@ class RunManifest:
             "config_files": self.config_files,
             "policy_files": self.policy_files,
             "rule_ids": self.rule_ids,
+            "rule_hits": [asdict(h) for h in self.rule_hits],
             "inputs": [asdict(i) for i in self.inputs],
             "outputs": [asdict(o) for o in self.outputs],
             "notes": self.notes,
@@ -344,6 +432,12 @@ class RunManifest:
             "outputs": len(self.outputs),
         }
 
+    def _reach(self) -> str:
+        """`, 9 standing` — silent when nothing recorded the reach."""
+        if not self.rule_hits:
+            return ""
+        return f", {sum(1 for h in self.rule_hits if h.effective)} standing"
+
     def summary(self) -> str:
         code = self.code or {}
         sha = (code.get("git_sha") or "unknown")[:8]
@@ -354,9 +448,13 @@ class RunManifest:
             f"    config  {self.config_fingerprint}  "
             f"({len(self.config_files)} files)",
             f"    policy  {self.policy_fingerprint}  "
-            f"({len(self.rule_ids)} rules)",
+            f"({len(self.rule_ids)} rules{self._reach()})",
             f"    code    {sha}{dirty}",
         ]
+        inert = [h for h in self.rule_hits if not h.skipped and not h.effective]
+        if inert:
+            lines.append(f"    · {len(inert)} rule(s) decided nothing this run — "
+                         f"{', '.join(h.rule_id for h in inert[:5])}")
         unstorable = self.unstorable_inputs
         if unstorable:
             lines.append(f"    · {len(unstorable)} input(s) on a partial natural key — "
@@ -474,6 +572,35 @@ class RunRegistry:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+
+    def latest_under_rules(self, digest: Optional[str], *, with_hits: bool = False,
+                           limit: int = 50) -> Optional[Dict[str, Any]]:
+        """
+        The newest saved run that resolved exactly these rule bytes.
+
+        Matched on the digest of the rules file rather than on `policy_fingerprint`,
+        which folds in the path the run was given: the same rules read from a scenario
+        copy fingerprint differently, and the question here is the content one — did
+        this run plan under these rules. Matching on content is also what makes the
+        answer safe to line up rule by rule, since identical bytes cannot declare a
+        different set of rules.
+
+        `with_hits` skips runs that recorded no reach — runs from before it was kept,
+        or that died before resolution. An older run under the same bytes says more
+        about those rules than a newer one that recorded nothing.
+        """
+        if not digest:
+            return None
+        for entry in reversed(self.index()[-limit:]):
+            manifest = self.get(entry.get("run_id", ""))
+            if manifest is None:
+                continue
+            if digest not in (manifest.get("policy_files") or {}).values():
+                continue
+            if with_hits and not manifest.get("rule_hits"):
+                continue
+            return manifest
+        return None
 
     def compare(self, run_a: str, run_b: str) -> Optional[RunComparison]:
         by_id = {e["run_id"]: e for e in self.index()}

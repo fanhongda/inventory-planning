@@ -120,6 +120,23 @@ class Override:
         return bool(wanted or source or target.get("doc_type"))
 
 
+def _actor_or_refuse(claimed, what: str):
+    """
+    One place turns a name into an actor, here as everywhere else.
+
+    A declaration written by a program has only `by` and `reason` to say who asserted
+    something and why, which is why both are required here though the parser tolerates
+    their absence in a hand-written file — one sits under a comment explaining itself
+    and the other does not.
+    """
+    from ..attribution import Unattributed, resolve_actor
+
+    try:
+        return resolve_actor(claimed, what=what)
+    except Unattributed as exc:
+        raise DeclarationError(str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class GateWaiver:
     """One check, on one document, declared a false positive here — until a date."""
@@ -221,9 +238,7 @@ class Declarations:
             raise DeclarationError(
                 "an override written through an interface must carry a reason — it is "
                 "the only account of why the pipeline was overruled")
-        if not str(override.by or "").strip():
-            raise DeclarationError(
-                "an override written through an interface must name who asserted it")
+        actor = _actor_or_refuse(override.by, "an override written through an interface")
 
         import yaml
         if config_dir is None:
@@ -240,9 +255,56 @@ class Declarations:
             "field": override.field,
             "value": override.value,
             "reason": " ".join(str(override.reason).split()),
-            "by": override.by,
+            **actor.record(),
             "at": (override.at or date.today()).isoformat(),
             **({"expires": override.expires.isoformat()} if override.expires else {}),
+        }]}
+        path.write_text(yaml.safe_dump(body, sort_keys=False, allow_unicode=True),
+                        encoding="utf-8")
+        return path
+
+    @staticmethod
+    def write_waiver(waiver: "GateWaiver", config_dir=None) -> Path:
+        """
+        Persist one gate waiver, in the same place and syntax a hand-written one goes.
+
+        The three required fields are required here for the reasons the parser already
+        gives, and one more that only applies to a waiver written by clicking. A gate
+        exists because a report built on that data would be complete, plausible and
+        wrong; waiving one is a claim that this particular check is a false positive on
+        this particular document, and that claim needs a name against it.
+
+        `expires` is the field that keeps this from being `allow_degraded` with extra
+        steps. A waiver with no end date is a permanently disabled check, and a pipeline
+        loses its gates one convenient afternoon at a time rather than by decision. The
+        parser refuses an undated waiver; this refuses to write one.
+        """
+        if not str(waiver.reason or "").strip():
+            raise DeclarationError(
+                "a waiver must say why this check is a false positive here — it is the "
+                "only thing that lets anyone judge later whether it still is")
+        actor = _actor_or_refuse(waiver.by, "a waiver")
+        if waiver.expires is None:
+            raise DeclarationError(
+                "a waiver must expire — one that does not is a disabled check")
+        if not str(waiver.check or "").strip():
+            raise DeclarationError("a waiver must name the check it waives")
+
+        import yaml
+        if config_dir is None:
+            config_dir = Path(__file__).parents[2] / "config"
+        target_dir = Path(config_dir) / DECLARATIONS_DIRNAME
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in waiver.check)
+        path = target_dir / f"{stamp}-waiver-{safe}.yaml"
+        body = {"version": 1, "gate_waivers": [{
+            "check": waiver.check,
+            **({"doc_type": waiver.doc_type} if waiver.doc_type else {}),
+            "reason": " ".join(str(waiver.reason).split()),
+            **actor.record(),
+            "expires": waiver.expires.isoformat(),
         }]}
         path.write_text(yaml.safe_dump(body, sort_keys=False, allow_unicode=True),
                         encoding="utf-8")

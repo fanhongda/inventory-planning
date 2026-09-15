@@ -40,10 +40,23 @@ CONSECUTIVE_MONTHS_THRESHOLD = 3   # months of persistent gap to trigger classif
 
 class LossCalculator:
 
-    def __init__(self, snapshot_path: str | Path):
+    def __init__(self, snapshot_path: str | Path, snapshot: dict = None):
+        """
+        A snapshot on disk, or one held in memory with its actuals already attached.
+
+        The second exists so scoring does not have to write the actuals back into the
+        decision record first. `FeedbackCollector` did, which made a decision mutable —
+        and a record that can be edited after the fact cannot answer what was decided
+        at the time, which is the only question it exists for. `path` is still needed
+        for the history folder, since cumulative gaps are read from the neighbouring
+        snapshots.
+        """
         self.path = Path(snapshot_path)
-        with open(self.path, encoding="utf-8") as f:
-            self.snapshot = json.load(f)
+        if snapshot is not None:
+            self.snapshot = snapshot
+        else:
+            with open(self.path, encoding="utf-8") as f:
+                self.snapshot = json.load(f)
         # history dir = parent of this snapshot's month folder
         self.history_dir = self.path.parent.parent
 
@@ -103,11 +116,12 @@ class LossCalculator:
         agg["attribution"] = attribution
         agg["suggestions"] = self._suggest(agg, attribution)
 
-        # Write back
+        # Held, not written back. Attaching a score to the decision record makes the
+        # decision mutable: a snapshot that can be edited after the fact cannot say what
+        # was decided at the time, which is the only question it is kept for. The caller
+        # writes the score as its own record — see `feedback/__main__.py`.
         self.snapshot["loss"] = agg
         self.snapshot["loss_detail"] = detail_df.to_dict(orient="records")
-        self.path.write_text(json.dumps(self.snapshot, indent=2, ensure_ascii=False),
-                             encoding="utf-8")
 
         self._print_report(agg)
         return {"aggregate": agg, "detail": detail_df}

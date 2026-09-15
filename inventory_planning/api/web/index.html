@@ -14,6 +14,8 @@
 <nav id="tabs"></nav>
 
 <main>
+<div id="setup"></div>
+
 <div id="screen-review">
   <p class="lede">
     Upload an export and see what it was read as. <strong>Nothing here enters a
@@ -27,16 +29,28 @@
   </section>
 
   <div id="requirements"></div>
+  <div id="gates"></div>
   <div id="results"></div>
 </div>
 
 <div id="screen-policy" hidden>
   <p class="lede">
-    The parameters in force, and what a change to one did to a run. Read-only on
-    purpose — a rule wants review, a diff, a rationale and an owner, and version
-    control gives all four.
+    The parameters in force, and what a change to one did to a run. Both the scalars
+    and the rules are editable here — proposed as a diff, applied with a reason and a
+    name, written back to the file that stays the store. What nobody checks is the
+    name: until there is a login behind it, that field is an audit trail with no one
+    verifying it.
   </p>
   <div id="policy-body"></div>
+</div>
+
+<div id="screen-results" hidden>
+  <p class="lede">
+    What a run produced, rendered from the files it wrote. <strong>Nothing here is
+    recalculated</strong> — every figure is a cell out of the workbook, shown under the
+    workbook's own number format, so this page and the file cannot disagree.
+  </p>
+  <div id="results-body"></div>
 </div>
 
 <div id="screen-browse" hidden>

@@ -163,12 +163,139 @@ Output files are stamped with the `run_id` rather than the minute. Four independ
 planner trying a rule change, which is the whole point — overwrote each other's CSVs.
 
 A UI now exists over this — see [INTERFACE.md](INTERFACE.md) — and the run diff it
-serves answers only *whether* a difference is attributable, not what moved. What it still
-needs, in order: **per-rule hits retained on the manifest** (`policy/parameters.py`
-counts them and throws them away, so the policy screen has to say it cannot show them),
-and then a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the
-safety-stock total moved by, which recommendations flipped. Neither needs new identity
-work.
+serves answers only *whether* a difference is attributable, not what moved.
+
+**Per-rule hits are retained. Done 2026-09-15.** The manifest carries, per rule, what it
+matched, what was still standing once the later rules had run, the columns a skipped rule
+wanted, and sample SKUs. `GET /policy` finds the newest run under the same rule *bytes* —
+not the same `policy_fingerprint`, which folds in the path, so a scenario copy of the
+rules still matches — and serves the counts keyed by rule id; edit the file and they
+disappear rather than going stale. The standing count is the part worth keeping: `R-001`
+on the sample data matches 4 A-class SKUs and keeps 2, and on the test frame keeps none,
+so `matched` alone reports a dead rule as the busiest on the page.
+
+**Macro scalars are editable. Done 2026-09-15.** `policy/macro.py` proposes a change as
+a one-line diff and applies it once approved: the value is replaced where it sits, so the
+comments explaining a setting and the prose keys `fx_rates.json` carries survive
+untouched. The edit is validated by loading the file with the pipeline's own loader
+before anything is written; the reason and the owner go to `config/macro_changes.jsonl`.
+The two halves are one endpoint called twice, tied together by the digest of the file the
+diff was made against — approving a change approves *those bytes*, and a file that moved
+in between is refused. `PUT /policy/macro`, and an Edit on each row of the settings
+table. The rules are still read-only.
+
+**The quality gate is on the import screen. Done 2026-09-15.** `GET /gates` runs the
+intake checkpoint over everything landed and renders its three severities;
+`POST /gates/{check}/waivers` writes an ordinary `gate_waivers` entry, so a finding
+waived by clicking is waived in a headless run and not merely hidden on the screen — a
+waived finding stays on the page, downgraded, carrying who waived it and until when.
+The page says the intake gate is one of four and names the other three, because they
+need a time series, a forecast and a position and so cannot be answered before the run.
+
+**Found while doing it, not fixed:** `cli.py`'s per-file path never builds an
+`IntakeResult`, so the intake gate does not run there at all — only under `load_all`.
+The CLI compensates for one of its checks (`product_dimension`, via a `parser.error`);
+`sku_agreement`, `semantic_failure` and `dimension_spelling` simply do not fire. A
+disagreeing inventory export runs to completion with exit 0 on the CLI and raises
+`DataQualityError` through `load_all`.
+
+**The rules are editable too. Done 2026-09-15.** `PUT /policy/rules` over the same
+propose-then-approve contract, with edit, add and remove. Only the fields that changed
+are rewritten, so a comment beside a parameter survives an edit to the parameter next to
+it and a rationale nobody touched is not reflowed. The rule's own `rationale`, `owner`
+and `date` move with the change — that is where the next reader looks — and the reason
+for the change goes to the log, which for a removal is the only record left. Every
+proposal reports the rule order the file will have afterwards, because later rules win
+and where a rule sits is part of what it does. `rule_id` is not editable: the manifest
+records hits against it.
+
+**The results screen is up. Done 2026-09-15.** A fourth screen renders what a run
+wrote, located from the manifest: the workbook's sheets, its text outputs verbatim, and
+every file it produced with a download. It computes nothing — the numbers are cells,
+shown under the workbook's own number formats with Excel's rounding, so the page and the
+file cannot disagree. A test pins the writer's format constants to the reader's, because
+that is the only way the two files stay in agreement without becoming one.
+
+**The workspace seam is cut. Done 2026-09-15.** `workspace.py` resolves config, store
+and output from a tenant id in one place; `--tenant` on the pipeline, the server and the
+store CLI. The default tenant moves no path. It found one defect on the way: `--output`
+defaulted to the string `"output"`, argparse passed it every run, so it reached the
+resolver as an explicit argument and outranked the tenant — a tenant's outputs landed in
+the shared directory the results screen reads while config and store were isolated. The
+same literal was in the API service and its server. It also found that the API tests
+were reading the repository's own `./output`, so "no runs here" was an assertion about
+the developer's machine.
+
+**The identity seam is cut. Done 2026-09-15.** `attribution.py` turns a name into an
+actor in one place — six API endpoints, three CLIs and four writers now ask it instead
+of reading `by` off a payload. It records *how* the name was established, not only the
+name: `self_asserted` today, `verified` when a token fills it. Absent means
+self-asserted, so nothing was written to disk and nothing migrated, and the 1,218
+attributed records already in the store are correctly classified by the new reader. It
+closed the same defect the workspace seam found, one layer down: `by` defaulted to `""`
+on `ledger.restate` and `ledger.void`, so enforcement was only at the entry points.
+
+Still a form field, and nothing behind it. The bind address remains the whole access
+control — `api/__main__.py` says so where someone deciding to expose the port will read
+it.
+
+**A maintenance plan is now pinned to what it was read against. Done 2026-09-15.**
+`store/migration.py`. `store restate --apply` used to select again from scratch, so it
+changed whatever the predicate matched at that second rather than what was counted and
+approved — and shadow write lands batches while a plan is being read. A plan is now
+written to `<store>/plans/`, and `--apply --plan <file>` carries out exactly the ids in
+it. The basis digests the *selection* (sorted batch ids + operation + target layer), not
+the selector, which would have digested identically at both moments and checked nothing.
+A batch restated by someone else in between is a refusal that names it. `--batch` alone
+is exempt: ids name the batches rather than describing them.
+
+Still open, and the rest of that seam: **a migration has no identity**. The 1,188 lines
+share a reason string, so a store can only be grepped for what has run against it, not
+asked. And a layout change bumps `SCHEMA_VERSION` while a restatement does not — the
+first migration that happened was the kind the stamp does not cover, and its refusal
+names a `migrate` command that does not exist.
+
+**The feedback loop closes. Done 2026-09-15.** It never had: 2,430 snapshots, 63 MB,
+none ever scored, and three of `feedback/`'s five modules with no caller. `record_actuals`
+asked for two hand-assembled frames a month later; the store already held both.
+`feedback/actuals.py` reads them at scoring time and
+`python -m inventory_planning.feedback score --run <id> --sales <batch>` runs it. The
+snapshot is never written to — `LossCalculator.compute` was also writing back — and the
+score is its own record under `<store>/scores/`, carrying which batch and which period
+produced it. The scoring period comes from `as_of`, not `planning_month`: those are
+different things and using the wall clock would score a forecast against another month's
+demand.
+
+Verified on a real run rather than a fixture: a plan anchored to 2026-07-23, an August
+extract landed after it, first score ever produced — MAPE 15.8%, over-forecast,
+attributed to `MODEL_BIAS` with the parameter it points at.
+
+**On real data the loop still cannot close**, and that is a data fact rather than a code
+one: every extract in the store is the same July pull, so there is no later month to
+score against. The refusal says so by name rather than reporting every SKU as having
+sold nothing.
+
+**The CLI routes by contract. Done 2026-09-15.** Found by running the real extract
+before a production run: the documented invocation died on it with `KeyError: ['qty']`.
+The sales history heads its quantity column `Shipped Quantity`; the legacy `schema.py`
+the per-file readers use does not carry that alias, and the contracts do. It is not one
+alias — **the contracts carry 1,216 the legacy table does not**, across every document
+type. `inventory-plan <dir-or-files...>` now routes by content, which is the path that
+already worked and had no command line. The flags still work and print what they cost.
+
+Why it survived: `sample_data/sales_history.csv` heads that column `Sales Qty`, which
+the legacy table knows. Every test passed while the real export failed, and there were
+no CLI tests at all. There are now, and the one that matters compares the two alias
+tables directly rather than checking that the CLI runs.
+
+**Still two implementations of intake.** The right end state is the readers reading
+through the contracts, so there is one alias table; that is a bigger change than this
+was and it is not done. Until then the per-file path is a fallback that says so.
+
+What this still needs: **decisions queryable** — `run_id` is in the snapshot filename and
+not its body, and there is no query layer over 2,430 JSON files — and a **SKU-level diff
+over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
+which recommendations flipped. Neither needs new identity work.
 
 **Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the
 root (`--store` / `$INVENTORY_PLANNING_STORE` / `$XDG_DATA_HOME` / `~/.local/share`),

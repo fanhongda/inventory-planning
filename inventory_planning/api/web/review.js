@@ -412,6 +412,146 @@ async function showBatch(batch, container, openFields = false) {
     rowsCard(rows));
 }
 
+// ── Quality gates ───────────────────────────────────────────────────────────
+//
+// The checkpoint that catches the failure this pipeline actually has: not a crash, but
+// a complete report, correctly formatted, built on a join that matched nothing — and no
+// error anywhere. That is visible here and invisible in the report it would go on to
+// write, so it belongs on the screen of the person who just uploaded the file.
+//
+// Three severities, kept apart, because they ask for three different things. A BLOCK
+// stops the run. A SEVERE does not, but means specific figures are not what they
+// appear to be and the reader has to know which before acting on any of them. A WARN is
+// context to note and move past. Collapsing them is how a page of eleven items gets
+// skimmed and the one that mattered gets skimmed with it.
+//
+// And the page says what a clean result does *not* mean. This is one gate of four; the
+// other three need a time series, a forecast and a position, none of which exist until
+// the run has done the work. "Nothing at intake stops this" is the claim; "the run will
+// pass" is not.
+
+const SEVERITY = {
+  block: { cls: "stop", label: "blocks the run", mark: "\u2717" },
+  severe: { cls: "warn", label: "does not stop the run, but changes how to read it",
+            mark: "!" },
+  warn: { cls: "", label: "worth knowing", mark: "\u26a0" },
+};
+
+// A finding is waived on one check and one document, until a date. All three are
+// required and the date is the one that matters: a waiver without an end is
+// `allow_degraded` with extra steps, and it is how a checked pipeline becomes an
+// unchecked one without anybody deciding to.
+function waiverForm(finding, done) {
+  const reason = el("input", { type: "text",
+    placeholder: "why this check is a false positive on this document" });
+  const by = el("input", { type: "text", placeholder: "who is declaring it" });
+  const expires = el("input", { type: "date" });
+  const out = el("div", {});
+
+  const submit = async () => {
+    try {
+      const body = await api(`/gates/${encodeURIComponent(finding.check)}/waivers`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ doc_type: finding.doc_type, reason: reason.value,
+                               by: by.value, expires: expires.value }),
+      });
+      done(body);
+    } catch (err) {
+      mount(out, el("p", { class: "status bad" }, String(err.message)));
+    }
+  };
+
+  return el("form", { class: "declare",
+                      onsubmit: (e) => { e.preventDefault(); submit(); } },
+    el("p", { class: "note" },
+       finding.doc_type
+         ? `Waives ${finding.check} on ${finding.doc_type} only — every other document `
+           + `is still checked.`
+         : `This finding names no document, so the waiver covers the check everywhere. `
+           + `It is the wide kind; prefer fixing the cause.`),
+    el("div", { class: "row2" }, reason, by),
+    el("label", {}, "review this by"), expires,
+    el("div", {}, el("button", { type: "submit" }, "Declare it a false positive")),
+    out);
+}
+
+function findingCard(finding, refresh) {
+  const level = SEVERITY[finding.severity] || SEVERITY.warn;
+  const drawer = el("div", { hidden: true });
+  const waive = el("button", { class: "link", type: "button",
+    onclick: () => {
+      drawer.hidden = !drawer.hidden;
+      mount(drawer, drawer.hidden ? [] : waiverForm(finding, refresh));
+    } }, "Declare a false positive");
+
+  return el("div", { class: "finding" },
+    el("p", {},
+       el("span", { class: `tag ${finding.severity === "block" ? "absent" : "default"}` },
+          `${level.mark} ${finding.severity}`),
+       " ", el("code", {}, finding.check),
+       finding.doc_type ? el("span", { class: "k" }, ` \u00b7 ${finding.doc_type}`) : null),
+    el("p", {}, finding.what),
+    el("p", { class: "k" }, finding.why),
+    (finding.impacts || []).length
+      ? el("ul", { class: "impacts" },
+           finding.impacts.map((i) => el("li", {}, i)))
+      : null,
+    el("p", { class: "k" }, `Fix: ${finding.fix}`),
+    finding.waived
+      ? el("p", { class: "note" },
+           `Waived by ${finding.waived_by || "someone"} until ${finding.waived_until} `
+           + `— still reported, no longer blocking.`)
+      : (finding.severity === "block" ? waive : null),
+    drawer);
+}
+
+function gatesCard(body, refresh) {
+  const later = el("details", {},
+    el("summary", {}, "Three more gates run during the plan"),
+    el("ul", { class: "impacts" },
+      (body.later_stages || []).map((g) =>
+        el("li", {}, el("code", {}, g.stage), ` — ${g.checks}. Needs ${g.needs}, `
+           + `which does not exist until the run builds it.`))));
+
+  if (!body.ran) {
+    return el("section", { class: "card" },
+      el("h2", {}, "Quality gate"),
+      el("p", { class: "sub" }, body.note),
+      later);
+  }
+
+  const counts = body.counts || {};
+  const worst = counts.block ? "stop" : (counts.severe ? "warn" : "");
+  const head = counts.block
+    ? `${counts.block} finding(s) would stop a run`
+    : "Nothing at intake would stop a run";
+
+  return el("section", { class: `card ${worst}` },
+    el("h2", {}, "Quality gate",
+       el("span", { class: `badge ${counts.block ? "todo" : "ok"}` },
+          counts.block ? "blocked" : "clear")),
+    el("p", { class: "sub" },
+       `${head}, across ${(body.documents || []).length} document(s). `
+       + `This is the intake checkpoint — it compares the documents against each other, `
+       + `which is where a complete report of confident zeroes is caught. It is not a `
+       + `promise about the run.`),
+    body.findings.length
+      ? el("div", {}, body.findings.map((f) => findingCard(f, refresh)))
+      : el("p", { class: "note" },
+           "No findings. The item numbers agree across the documents, the columns "
+           + "carry what they claim, and the grouping dimensions are spelled one way."),
+    later);
+}
+
+async function showGates() {
+  const host = $("#gates");
+  try {
+    mount(host, gatesCard(await api("/gates"), () => { showGates(); }));
+  } catch (err) {
+    mount(host, el("p", { class: "status bad" }, String(err.message)));
+  }
+}
+
 async function showRequirements() {
   const host = $("#requirements");
   try {
@@ -446,6 +586,7 @@ async function upload(file) {
       await showBatch(landed, section);
     }
     await showRequirements();
+    await showGates();
   } catch (err) {
     status.className = "status bad";
     status.textContent = String(err.message);
@@ -455,6 +596,7 @@ async function upload(file) {
 
 export function mountReview() {
   showRequirements();
+  showGates();
   const drop = $("#drop");
   $("#pick").addEventListener("click", () => $("#file").click());
   $("#file").addEventListener("change",

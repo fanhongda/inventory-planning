@@ -703,11 +703,41 @@ defaulted to `""` on `ledger.restate` and `ledger.void`, so enforcement lived en
 at the four entry points and the next caller to go round one of them would have written
 an unattributed record in silence. **The default is the hole**; there is no default now.
 
-**A migration path.** TODO.md noted there was a schema version, a refusal, and nothing
-between them, and that the first bump had to bring one. The first migration has now
-happened — 1,188 batches restated by hand, from a reviewed plan — so the shape is known:
-versioned, planned before applied, recorded in the ledger, idempotent. Writing it down as
-a mechanism is cheaper now, with one instance to generalise from, than after the second.
+**A migration path. Half cut 2026-09-15 — `store/migration.py`.** TODO.md noted there
+was a schema version, a refusal, and nothing between them. The first migration has now
+happened — 1,188 batches restated from a reviewed plan — so the shape is known:
+versioned, planned before applied, recorded in the ledger, idempotent.
+
+**Planned before applied** is the half that was failing today, and it was failing in the
+way the two file editors already knew about. `store restate` printed a plan and then, on
+`--apply`, **selected again from scratch** — so what changed was whatever the predicate
+matched at that second, not what was counted and approved, and shadow write lands
+batches while a plan is being read. Three things decided the fix:
+
+- **The selection is the basis, not the selector.** The candidate that looks right and
+  checks nothing is digesting the selector arguments: `--loaded-before X --layer
+  canonical` digests identically at both moments and selects differently, which is the
+  failure wearing a safety check's clothes. The digest covers the sorted batch ids, the
+  operation and the target layer.
+- **Applying replays the plan; it never re-selects.** Re-selecting and comparing would
+  still rest on the selector behaving identically twice. A fixed list rests on nothing,
+  and what is checked at apply time becomes "are these batches still as the plan assumed"
+  — a question about the store rather than about the query.
+- **A refusal names what moved.** "Stale" sends someone to re-run the command and hope.
+  *`20260915_201350-d26005` has been restated since the plan was made — applying would
+  overwrite somebody else's correction* does not.
+
+`--apply` over a predicate now needs `--plan`. Selecting by `--batch` alone is exempt: a
+list of ids names the batches rather than describing them, so it cannot match something
+else tomorrow.
+
+**Still missing, and now the whole of this seam:** a migration has no identity. The 1,188
+lines share a reason string, so a store cannot be asked *which* migrations have run
+against it — only grepped. And the two kinds are still conflated: a layout change bumps
+`SCHEMA_VERSION` and old code must refuse, while a restatement leaves the version alone
+and changes the store anyway. The first migration that actually happened was the second
+kind, which the stamp does not cover, and the refusal it would print names a `migrate`
+command that does not exist.
 
 ### Order
 
@@ -730,8 +760,9 @@ a mechanism is cheaper now, with one instance to generalise from, than after the
    2026-09-15** — it renders the run's own files and computes nothing, down to using
    the workbook's own number formats so the page and the file cannot disagree. Details
    under §2, M4.
-4. **The workspace seam** and **the identity seam** — both **done, 2026-09-15** — then
-   **the migration mechanism**. `workspace.py` resolves all three directories from a
+4. **The workspace seam** and **the identity seam** — both **done, 2026-09-15**; the
+   **migration mechanism** half done, plan-to-apply binding built and migration identity
+   still open. `workspace.py` resolves all three directories from a
    tenant id in one place; every entry point takes `--tenant`. The default tenant moves
    no path, which the tests assert directly. Two things came out of doing it: the
    isolation §7 called untestable now has a `contains()` to assert against, and a real

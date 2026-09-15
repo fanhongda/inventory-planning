@@ -239,6 +239,22 @@ Still a form field, and nothing behind it. The bind address remains the whole ac
 control — `api/__main__.py` says so where someone deciding to expose the port will read
 it.
 
+**A maintenance plan is now pinned to what it was read against. Done 2026-09-15.**
+`store/migration.py`. `store restate --apply` used to select again from scratch, so it
+changed whatever the predicate matched at that second rather than what was counted and
+approved — and shadow write lands batches while a plan is being read. A plan is now
+written to `<store>/plans/`, and `--apply --plan <file>` carries out exactly the ids in
+it. The basis digests the *selection* (sorted batch ids + operation + target layer), not
+the selector, which would have digested identically at both moments and checked nothing.
+A batch restated by someone else in between is a refusal that names it. `--batch` alone
+is exempt: ids name the batches rather than describing them.
+
+Still open, and the rest of that seam: **a migration has no identity**. The 1,188 lines
+share a reason string, so a store can only be grepped for what has run against it, not
+asked. And a layout change bumps `SCHEMA_VERSION` while a restatement does not — the
+first migration that happened was the kind the stamp does not cover, and its refusal
+names a `migrate` command that does not exist.
+
 What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
 which recommendations flipped. Neither needs new identity work.
 

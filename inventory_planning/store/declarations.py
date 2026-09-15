@@ -120,6 +120,23 @@ class Override:
         return bool(wanted or source or target.get("doc_type"))
 
 
+def _actor_or_refuse(claimed, what: str):
+    """
+    One place turns a name into an actor, here as everywhere else.
+
+    A declaration written by a program has only `by` and `reason` to say who asserted
+    something and why, which is why both are required here though the parser tolerates
+    their absence in a hand-written file — one sits under a comment explaining itself
+    and the other does not.
+    """
+    from ..attribution import Unattributed, resolve_actor
+
+    try:
+        return resolve_actor(claimed, what=what)
+    except Unattributed as exc:
+        raise DeclarationError(str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class GateWaiver:
     """One check, on one document, declared a false positive here — until a date."""
@@ -221,9 +238,7 @@ class Declarations:
             raise DeclarationError(
                 "an override written through an interface must carry a reason — it is "
                 "the only account of why the pipeline was overruled")
-        if not str(override.by or "").strip():
-            raise DeclarationError(
-                "an override written through an interface must name who asserted it")
+        actor = _actor_or_refuse(override.by, "an override written through an interface")
 
         import yaml
         if config_dir is None:
@@ -240,7 +255,7 @@ class Declarations:
             "field": override.field,
             "value": override.value,
             "reason": " ".join(str(override.reason).split()),
-            "by": override.by,
+            **actor.record(),
             "at": (override.at or date.today()).isoformat(),
             **({"expires": override.expires.isoformat()} if override.expires else {}),
         }]}
@@ -268,8 +283,7 @@ class Declarations:
             raise DeclarationError(
                 "a waiver must say why this check is a false positive here — it is the "
                 "only thing that lets anyone judge later whether it still is")
-        if not str(waiver.by or "").strip():
-            raise DeclarationError("a waiver must name who declared it")
+        actor = _actor_or_refuse(waiver.by, "a waiver")
         if waiver.expires is None:
             raise DeclarationError(
                 "a waiver must expire — one that does not is a disabled check")
@@ -289,7 +303,7 @@ class Declarations:
             "check": waiver.check,
             **({"doc_type": waiver.doc_type} if waiver.doc_type else {}),
             "reason": " ".join(str(waiver.reason).split()),
-            "by": waiver.by,
+            **actor.record(),
             "expires": waiver.expires.isoformat(),
         }]}
         path.write_text(yaml.safe_dump(body, sort_keys=False, allow_unicode=True),

@@ -226,6 +226,19 @@ same literal was in the API service and its server. It also found that the API t
 were reading the repository's own `./output`, so "no runs here" was an assertion about
 the developer's machine.
 
+**The identity seam is cut. Done 2026-09-15.** `attribution.py` turns a name into an
+actor in one place — six API endpoints, three CLIs and four writers now ask it instead
+of reading `by` off a payload. It records *how* the name was established, not only the
+name: `self_asserted` today, `verified` when a token fills it. Absent means
+self-asserted, so nothing was written to disk and nothing migrated, and the 1,218
+attributed records already in the store are correctly classified by the new reader. It
+closed the same defect the workspace seam found, one layer down: `by` defaulted to `""`
+on `ledger.restate` and `ledger.void`, so enforcement was only at the entry points.
+
+Still a form field, and nothing behind it. The bind address remains the whole access
+control — `api/__main__.py` says so where someone deciding to expose the port will read
+it.
+
 What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
 which recommendations flipped. Neither needs new identity work.
 

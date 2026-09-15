@@ -261,14 +261,14 @@ class TestTheLedgerIsAppendOnly:
 
     def test_a_voided_batch_drops_out_of_the_listing(self, store, frame):
         batch = store.write_batch("inventory", frame, valid_time="2026-08-25")
-        store.ledger.void(batch.batch_id, reason="wrong extract")
+        store.ledger.void(batch.batch_id, reason="wrong extract", by="tester")
         assert store.batches("inventory") == []
         assert len(store.ledger.batches("inventory", include_void=True)) == 1
 
     def test_the_data_of_a_voided_batch_is_still_there(self, store, frame):
         """Void is a statement about the batch, not an erasure of what it said."""
         batch = store.write_batch("inventory", frame, valid_time="2026-08-25")
-        store.ledger.void(batch.batch_id)
+        store.ledger.void(batch.batch_id, reason="wrong extract", by="tester")
         assert store.read_batch(batch.batch_id) is not None
 
     def test_a_truncated_final_line_does_not_lose_the_rest(self, tmp_path, frame):

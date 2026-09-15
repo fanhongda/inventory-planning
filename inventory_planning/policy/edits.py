@@ -57,21 +57,29 @@ def unified(before: str, after: str, filename: str) -> str:
         fromfile=f"a/{filename}", tofile=f"b/{filename}", n=3))
 
 
-def require_attribution(reason: Any, by: Any, what: str) -> None:
+def require_attribution(reason: Any, by: Any, what: str):
     """
-    Both, always. Refused before the proposal is even recomputed.
+    Both, always, and the actor comes back typed. Refused before anything is recomputed.
 
     The wording names what is being changed because these carry very different weight:
     a label on an output and a convention that restates every figure in the run are
     both "a change", and a message that said so identically would be telling the
     reader less than it knows.
+
+    `by` goes through `identity.resolve_actor` rather than being length-checked here —
+    one place turns a name into an actor, so a token replaces a form field in that one
+    place rather than in every writer (INTERFACE.md §7).
     """
+    from ..attribution import Unattributed, resolve_actor
+
     if not str(reason or "").strip():
         raise EditRefused(
             f"{what} must carry a reason — it is the only account of why this moved, "
             f"and the file records what it says, never why it says it")
-    if not str(by or "").strip():
-        raise EditRefused(f"{what} must name who made it")
+    try:
+        return resolve_actor(by, what=what)
+    except Unattributed as exc:
+        raise EditRefused(str(exc)) from exc
 
 
 def check_basis(claimed: Optional[str], actual: str, filename: str) -> None:
@@ -90,7 +98,13 @@ def check_basis(claimed: Optional[str], actual: str, filename: str) -> None:
 
 
 def record(config_dir, entry: Dict[str, Any]) -> Path:
-    """Append one change to the log, and return where it went."""
+    """
+    Append one change to the log, and return where it went.
+
+    A `by_basis` of None is dropped rather than written: self-asserted is what every
+    entry is today, and a marker on all of them would distinguish nothing.
+    """
+    entry = {k: v for k, v in entry.items() if not (k == "by_basis" and v is None)}
     root = config_root(config_dir)
     root.mkdir(parents=True, exist_ok=True)
     path = root / CHANGE_LOG_NAME

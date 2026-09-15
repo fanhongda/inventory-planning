@@ -86,6 +86,34 @@ _LATER_GATES = [
 ]
 
 
+def _actor(body: Dict[str, Any], what: str):
+    """
+    Who is making this request, as an actor rather than as a string off the payload.
+
+    The identity seam (INTERFACE.md §7). Today the name comes from the form field the
+    payload carries and nothing checks it; when a token arrives, `verified=` is filled
+    from it here and every endpoint below is already correct. That is the whole point of
+    reading it in one place instead of six.
+
+    The bind address remains the entire access control until that day — see
+    `api/__main__.py`, which says so where someone deciding to expose the port will read
+    it.
+    """
+    # Both imported inside the function: FastAPI is an optional extra, so importing
+    # this module must not require it, and `HTTPException` is therefore not in scope at
+    # module level. Referring to it from here without the import raised `NameError`
+    # from inside an `except` clause — which surfaced as the original refusal escaping
+    # as a 500 instead of the 400 it is.
+    from fastapi import HTTPException
+
+    from ..attribution import Unattributed, resolve_actor
+
+    try:
+        return resolve_actor((body or {}).get("by"), verified=None, what=what)
+    except Unattributed as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 def _output_kind(name: str) -> str:
     """
     How the screen should offer one output: a workbook to browse, text to read, or a
@@ -659,7 +687,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             path = Declarations.write_waiver(
                 GateWaiver(check=check, doc_type=str(payload.get("doc_type") or ""),
                            expires=when, reason=str(payload.get("reason") or ""),
-                           by=str(payload.get("by") or "")),
+                           by=_actor(payload, f"waiving {check}").name),
                 config_dir=service.config_dir)
         except DeclarationError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -810,13 +838,12 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
 
         record = service.find_batch(batch_id)
         valid_time = str(body.get("valid_time", "")).strip()
-        by = str(body.get("by", "")).strip()
         if not valid_time:
             raise HTTPException(
                 400, "`valid_time` is required — the date this data describes, which is "
                      "not the date the file was downloaded and cannot be inferred from it")
-        if not by:
-            raise HTTPException(400, "`by` is required")
+        actor = _actor(body, f"promoting batch {batch_id}")
+        by = actor.name
         if service.status_of(batch_id) != "landed":
             raise HTTPException(
                 409, f"batch {batch_id} is {service.status_of(batch_id)}, not landed")
@@ -868,10 +895,10 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         """
         service.find_batch(batch_id)
         reason = str(body.get("reason", "")).strip()
-        by = str(body.get("by", "")).strip()
-        if not reason or not by:
-            raise HTTPException(400, "voiding a batch needs `reason` and `by`")
-        record = service.ledger.void(batch_id, reason=reason, by=by)
+        if not reason:
+            raise HTTPException(400, "voiding a batch needs a `reason`")
+        actor = _actor(body, f"voiding batch {batch_id}")
+        record = service.ledger.void(batch_id, reason=reason, by=actor.name)
         return {"batch_id": batch_id, "status": "void",
                 "voided_at": record.voided_at, "voided_by": record.voided_by}
 

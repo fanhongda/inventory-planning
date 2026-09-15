@@ -673,10 +673,35 @@ resolved from a tenant id makes multi-tenancy "resolve a different workspace" ra
 a refactor of every call site. It also makes the isolation testable, which the store path
 already is and the other two are not.
 
-**`by` comes from a session, not a form field.** Every declaration, override, void and
-restatement already requires it — the audit trail predates the login, which is the right
-order. What is missing is only that nothing checks it. When an identity layer arrives it
-fills `by` from the token and the form field becomes the single-user fallback.
+**`by` comes from a session, not a form field. Cut 2026-09-15 — `attribution.py`.**
+Every declaration, override, void and restatement already required it — the audit trail
+predates the login, which is the right order, because the reverse gives a system that
+knows who you are and does not record what you did. The real store carries 1,188
+restatements and 30 voids, every one named and reasoned. What was missing is only that
+nothing checks the name.
+
+So the seam is not a login. A name becomes an actor in one place, and the day a token
+arrives it is a substitution there rather than an edit in six endpoints, three CLIs and
+four writers. Three things it carries:
+
+- **The basis, not only the name.** A name from a form field and a name from a verified
+  token are different claims, and a store where they are indistinguishable cannot be
+  asked which kind it holds. The pipeline already ranks its own figures this way —
+  `measured` over `stated` over `defaulted` — and an audit field is the same problem.
+- **Absent means self-asserted, so nothing was written and nothing migrated.** A marker
+  on every record distinguishes nothing, and `self_asserted` is what every record
+  already is. It is serialised only when it is not, which is the only day it means
+  anything. Every existing record is correctly classified by the new reader.
+- **A claim that disagrees with a session is refused**, not resolved one way or the
+  other. A form saying `bob` under a token saying `alice` is a mistake or an attempt,
+  and a change attributed to someone who did not make it is worse than one attributed
+  to nobody. Nothing passes `verified` yet; the rule is written down before it can be
+  got wrong.
+
+It also closed a hole of the same shape as the one the workspace seam found. `by`
+defaulted to `""` on `ledger.restate` and `ledger.void`, so enforcement lived entirely
+at the four entry points and the next caller to go round one of them would have written
+an unattributed record in silence. **The default is the hole**; there is no default now.
 
 **A migration path.** TODO.md noted there was a schema version, a refusal, and nothing
 between them, and that the first bump had to bring one. The first migration has now
@@ -705,7 +730,7 @@ a mechanism is cheaper now, with one instance to generalise from, than after the
    2026-09-15** — it renders the run's own files and computes nothing, down to using
    the workbook's own number formats so the page and the file cannot disagree. Details
    under §2, M4.
-4. **The workspace seam** — **done, 2026-09-15** — then **the identity seam**, then
+4. **The workspace seam** and **the identity seam** — both **done, 2026-09-15** — then
    **the migration mechanism**. `workspace.py` resolves all three directories from a
    tenant id in one place; every entry point takes `--tenant`. The default tenant moves
    no path, which the tests assert directly. Two things came out of doing it: the

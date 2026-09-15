@@ -176,6 +176,9 @@ def main(argv: List[str] = None) -> int:
     if not batches:
         return 0
     if not args.reason.strip() or not args.by.strip():
+        # The ledger refuses an unnamed change too, now. Kept here as well so the
+        # message a person gets is about the flag they did not pass rather than about
+        # a writer three frames down.
         parser.error("--apply needs --reason and --by. A change to the store with no "
                      "account of who made it or why is the thing this layer replaces.")
 

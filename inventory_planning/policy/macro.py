@@ -436,7 +436,7 @@ def apply(name: str, value: Any, *, reason: str, by: str, basis: str,
     asserted it and why, and an unattributed change to a convention that restates every
     figure in the run is exactly what this layer exists to replace.
     """
-    require_attribution(reason, by, "a change to a macro setting")
+    actor = require_attribution(reason, by, "a change to a macro setting")
 
     proposal = propose(name, value, config_dir=config_dir)
     if proposal.unchanged:
@@ -455,12 +455,13 @@ def apply(name: str, value: Any, *, reason: str, by: str, basis: str,
     at = datetime.now().isoformat(timespec="seconds")
     log_path = record(config_dir, {
         "kind": "macro",
-        "at": at, "by": str(by), "reason": collapse(reason),
+        "at": at, **actor.record(), "by_basis": actor.basis_recorded,
+        "reason": collapse(reason),
         "setting": proposal.name, "file": proposal.filename,
         "from": proposal.before, "to": proposal.after,
         "basis": proposal.basis, "digest": _digest(edited),
     })
-    return MacroChange(proposal=proposal, by=str(by), reason=collapse(reason), at=at,
+    return MacroChange(proposal=proposal, by=actor.name, reason=collapse(reason), at=at,
                        after_digest=_digest(edited), log_path=str(log_path))
 
 

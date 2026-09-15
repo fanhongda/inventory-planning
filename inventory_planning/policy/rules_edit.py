@@ -525,7 +525,7 @@ def apply(proposal_for, *, reason: str, by: str, basis: str,
     write something the proposal did not produce — the two paths are one path called
     twice, and there is no second place where the edit is assembled.
     """
-    require_attribution(reason, by, "a change to a rule")
+    actor = require_attribution(reason, by, "a change to a rule")
 
     proposal = proposal_for()
     if proposal.unchanged:
@@ -543,13 +543,14 @@ def apply(proposal_for, *, reason: str, by: str, basis: str,
 
     at = datetime.now().isoformat(timespec="seconds")
     log_path = record(config_dir, {
-        "kind": "rule", "action": proposal.action, "at": at, "by": str(by),
+        "kind": "rule", "action": proposal.action, "at": at,
+        **actor.record(), "by_basis": actor.basis_recorded,
         "reason": collapse(reason), "rule_id": proposal.rule_id, "file": RULES_FILE,
         "from": proposal.before, "to": proposal.after,
         "basis": proposal.basis, "digest": digest(edited),
     })
     body = proposal.to_dict()
-    body.update({"applied": True, "by": str(by), "reason": collapse(reason),
+    body.update({"applied": True, "by": actor.name, "reason": collapse(reason),
                  "at": at, "digest": digest(edited), "recorded_in": str(log_path)})
     return body
 

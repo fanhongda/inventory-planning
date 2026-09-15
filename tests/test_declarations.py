@@ -256,7 +256,9 @@ class TestAWaiverWrittenByAnInterface:
     def test_it_refuses_an_unexplained_or_unattributed_waiver(self, tmp_path):
         with pytest.raises(DeclarationError, match="why this check is a false positive"):
             Declarations.write_waiver(self._waiver(reason="  "), config_dir=tmp_path)
-        with pytest.raises(DeclarationError, match="name who declared it"):
+        # The wording is `identity.resolve_actor`'s, not this module's: one place turns
+        # a name into an actor, so one place explains why a blank one is refused.
+        with pytest.raises(DeclarationError, match="must name who made it"):
             Declarations.write_waiver(self._waiver(by=""), config_dir=tmp_path)
 
     def test_a_refused_waiver_writes_no_file(self, tmp_path):

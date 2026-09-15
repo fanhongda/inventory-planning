@@ -203,6 +203,69 @@ class TestWaiversMustExpire:
         assert "applies again" in notes
 
 
+class TestAWaiverWrittenByAnInterface:
+    """
+    The governing rule, applied to waivers: a waiver declared by clicking and one typed
+    into the file must be the same statement, so a headless run honours one made in a
+    browser. That is why this writes YAML into the config directory rather than keeping
+    the waiver anywhere of its own.
+    """
+
+    def _waiver(self, **kw):
+        return GateWaiver(**{"check": "sku_agreement", "doc_type": "inventory",
+                             "expires": date(2026, 12, 31),
+                             "reason": "this DC stocks spares nothing else sells",
+                             "by": "jfanhon", **kw})
+
+    def test_it_lands_where_a_hand_written_one_lands_and_loads_the_same(self, tmp_path):
+        path = Declarations.write_waiver(self._waiver(), config_dir=tmp_path)
+        assert path.parent.name == "declarations.d"
+
+        loaded = Declarations.load(tmp_path, today=TODAY)
+        waived = loaded.waive(GateReport("intake", [_finding()]))
+        assert not waived.blocking
+        assert waived.findings[0].severity == WARN
+
+    def test_the_downgraded_finding_still_says_who_and_until_when(self, tmp_path):
+        """A waiver that hid the finding would be a check that never fired."""
+        Declarations.write_waiver(self._waiver(), config_dir=tmp_path)
+        waived = Declarations.load(tmp_path, today=TODAY).waive(
+            GateReport("intake", [_finding()]))
+        assert waived.findings[0].evidence["waived_by"] == "jfanhon"
+        assert waived.findings[0].evidence["waived_until"] == "2026-12-31"
+
+    def test_it_waives_the_named_document_and_not_the_others(self, tmp_path):
+        """
+        The reason per-check waiving exists at all: `allow_degraded` would also wave
+        through an open PO quantity mapped to a money column.
+        """
+        Declarations.write_waiver(self._waiver(), config_dir=tmp_path)
+        elsewhere = _finding()
+        elsewhere = Finding(
+            stage=elsewhere.stage, check=elsewhere.check, severity=BLOCK,
+            what=elsewhere.what, why=elsewhere.why, fix=elsewhere.fix,
+            evidence={"doc_type": "open_po"})
+        report = Declarations.load(tmp_path, today=TODAY).waive(
+            GateReport("intake", [_finding(), elsewhere]))
+        assert [f.severity for f in report.findings] == [WARN, BLOCK]
+
+    def test_it_refuses_a_waiver_with_no_end_date(self, tmp_path):
+        with pytest.raises(DeclarationError, match="disabled check"):
+            Declarations.write_waiver(self._waiver(expires=None), config_dir=tmp_path)
+
+    def test_it_refuses_an_unexplained_or_unattributed_waiver(self, tmp_path):
+        with pytest.raises(DeclarationError, match="why this check is a false positive"):
+            Declarations.write_waiver(self._waiver(reason="  "), config_dir=tmp_path)
+        with pytest.raises(DeclarationError, match="name who declared it"):
+            Declarations.write_waiver(self._waiver(by=""), config_dir=tmp_path)
+
+    def test_a_refused_waiver_writes_no_file(self, tmp_path):
+        for bad in ({"expires": None}, {"reason": ""}, {"by": ""}, {"check": ""}):
+            with pytest.raises(DeclarationError):
+                Declarations.write_waiver(self._waiver(**bad), config_dir=tmp_path)
+        assert not list(tmp_path.rglob("*.yaml"))
+
+
 # ── Hygiene ──────────────────────────────────────────────────────────────────
 
 class TestADeclarationThatMatchedNothingSaysSo:

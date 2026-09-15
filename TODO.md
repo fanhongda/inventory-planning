@@ -184,6 +184,21 @@ diff was made against — approving a change approves *those bytes*, and a file 
 in between is refused. `PUT /policy/macro`, and an Edit on each row of the settings
 table. The rules are still read-only.
 
+**The quality gate is on the import screen. Done 2026-09-15.** `GET /gates` runs the
+intake checkpoint over everything landed and renders its three severities;
+`POST /gates/{check}/waivers` writes an ordinary `gate_waivers` entry, so a finding
+waived by clicking is waived in a headless run and not merely hidden on the screen — a
+waived finding stays on the page, downgraded, carrying who waived it and until when.
+The page says the intake gate is one of four and names the other three, because they
+need a time series, a forecast and a position and so cannot be answered before the run.
+
+**Found while doing it, not fixed:** `cli.py`'s per-file path never builds an
+`IntakeResult`, so the intake gate does not run there at all — only under `load_all`.
+The CLI compensates for one of its checks (`product_dimension`, via a `parser.error`);
+`sku_agreement`, `semantic_failure` and `dimension_spelling` simply do not fire. A
+disagreeing inventory export runs to completion with exit 0 on the CLI and raises
+`DataQualityError` through `load_all`.
+
 What this still needs: **rule editing** over the same contract, and a **SKU-level diff
 over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
 which recommendations flipped. Neither needs new identity work.

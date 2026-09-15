@@ -208,8 +208,38 @@ Correcting a mapping here writes a `scope: mapping` declaration keyed on **heade
 appended to `config/declarations.yaml` with `by` / `at` / `reason` — the reason field
 required, not optional. Then re-resolve from landing. No re-upload, no adapter re-freeze.
 
-Gate findings render as their three severities (`BLOCK` / `SEVERE` / `WARN`) with the
-per-check waiver available inline, `expires` mandatory as it already is in YAML.
+**The quality gate, since 2026-09-15.** Findings render as their three severities
+(`BLOCK` / `SEVERE` / `WARN`) with the per-check waiver inline, `expires` mandatory as it
+already is in YAML. `GET /gates` runs the intake checkpoint over everything landed;
+`POST /gates/{check}/waivers` writes a `gate_waivers` entry. Three points decided the
+shape:
+
+- **The intake gate, and the page says it is one of four.** `demand`, `forecast` and
+  `plan` need a time series, a forecast and a position, none of which exist before the
+  run — they are not unimplemented here, they are unanswerable here. So a clean result
+  reads "nothing at intake would stop a run", never "the run will pass", and the other
+  three are listed by name so the distinction is not left to be inferred. Nothing landed
+  reads as neither: the gate compares documents against each other, and one document
+  cannot disagree with itself.
+- **The waiver is the same statement a hand-written one is.** It lands in the config
+  directory as `gate_waivers`, so a run driven from a browser and a headless one honour
+  the same declaration — the governing rule, applied to the one surface that could most
+  easily have kept its own copy. Verified end to end: a waiver declared in the browser
+  downgrades the same finding under `load_all`, carrying who declared it and until when.
+- **A waived finding stays on the page.** Downgraded, not hidden, still carrying its
+  `what` / `why` / `fix` and now also who waived it and when that expires. A waiver that
+  removed the finding would be indistinguishable from a check that never fired.
+
+Two things this surfaced rather than fixed. `cli.py` loads the five files individually
+and never builds an `IntakeResult`, so **the intake gate does not run on the CLI's own
+default path** — only under `load_all`. The CLI knows this for one of its checks and
+compensates with a `parser.error` on a missing product family; the rest — SKU agreement,
+semantic failure, dimension spelling — simply do not fire there. Which means this screen
+is currently the only place several of them run at all for anyone driving the pipeline
+by flags. Worth fixing on the CLI side, not here. And the API's reading of what is landed is now
+shared with the requirements checklist (`Service.landed_documents`) rather than scanned
+twice, because two scans are two answers about what is loaded and the gate's is the one
+that decides whether a run may happen.
 
 ### M2 — Macro and policy
 

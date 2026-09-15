@@ -604,6 +604,183 @@ class TestPolicyIsShownAndNotEdited:
         assert not {n for n in names if "working" in n or "growth" in n}
 
 
+class TestTheQualityGate:
+    """
+    The checkpoint that catches this pipeline's actual failure: not a crash, but a
+    complete report built on a join that matched nothing. It is visible at intake and
+    invisible in the report it would go on to write, which is why it belongs in front of
+    the person who just uploaded the file rather than in a run log an hour later.
+    """
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("quality_gates.json", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    @pytest.fixture
+    def disagreeing(self, tmp_path):
+        """An inventory export whose item numbers meet nothing else — the real case."""
+        import pandas as pd
+
+        frame = pd.read_csv(SAMPLE)
+        frame["Item Code"] = [f"ZZ-{9000 + i}" for i in range(len(frame))]
+        path = tmp_path / "inventory.csv"
+        frame.to_csv(path, index=False)
+        return path
+
+    def test_with_nothing_landed_it_says_so_rather_than_passing(self, client):
+        """
+        A clean result on an empty store would read as "your data is fine". The gate
+        compares documents against each other, and one document cannot disagree with
+        itself.
+        """
+        body = client.get("/gates").json()
+        assert body["ran"] is False
+        assert body["passed"] is None
+        assert "nothing to check" in body["note"]
+
+    def test_a_clean_set_passes_with_no_findings(self, client):
+        for name in ("inventory", "sales_history", "item_master"):
+            _upload(client, Path(f"sample_data/{name}.csv"))
+        body = client.get("/gates").json()
+        assert body["ran"] is True and body["passed"] is True
+        assert body["findings"] == []
+
+    def test_an_item_number_that_meets_nothing_blocks(self, client, disagreeing):
+        _upload(client, disagreeing)
+        _upload(client, Path("sample_data/sales_history.csv"))
+        _upload(client, Path("sample_data/item_master.csv"))
+
+        body = client.get("/gates").json()
+        assert body["passed"] is False
+        assert body["counts"]["block"] == 1
+        finding, = body["findings"]
+        assert finding["check"] == "sku_agreement"
+        assert finding["severity"] == "block"
+        assert finding["doc_type"] == "inventory"
+        # what / why / fix, all three: a finding that cannot say what to do about it is
+        # a finding that should not stop a run.
+        assert finding["what"] and finding["why"] and finding["fix"]
+
+    def test_a_clean_answer_never_claims_the_run_will_pass(self, client):
+        """
+        Three of the four gates need a time series, a forecast and a position, none of
+        which exist before the run. "Nothing at intake stops this" is the claim that can
+        be made here; the page has the other three by name so it is not left to inference.
+        """
+        for name in ("inventory", "sales_history", "item_master"):
+            _upload(client, Path(f"sample_data/{name}.csv"))
+        body = client.get("/gates").json()
+        assert {g["stage"] for g in body["later_stages"]} == {"demand", "forecast", "plan"}
+        assert all(g["needs"] and g["checks"] for g in body["later_stages"])
+
+
+class TestWaivingOneCheck:
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("quality_gates.json", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    @pytest.fixture
+    def blocked(self, client, tmp_path):
+        import pandas as pd
+
+        frame = pd.read_csv(SAMPLE)
+        frame["Item Code"] = [f"ZZ-{9000 + i}" for i in range(len(frame))]
+        path = tmp_path / "inventory.csv"
+        frame.to_csv(path, index=False)
+        _upload(client, path)
+        _upload(client, Path("sample_data/sales_history.csv"))
+        _upload(client, Path("sample_data/item_master.csv"))
+        return client
+
+    def _waive(self, client, **body):
+        return client.post("/gates/sku_agreement/waivers",
+                           json={"doc_type": "inventory", **body})
+
+    def test_a_waiver_downgrades_the_finding_and_leaves_it_visible(self, blocked):
+        assert self._waive(blocked, expires="2027-12-31", by="jfanhon",
+                           reason="this DC stocks spares nothing else sells"
+                           ).status_code == 200
+
+        body = blocked.get("/gates").json()
+        assert body["passed"] is True
+        finding, = body["findings"]
+        assert finding["severity"] == "warn"
+        assert finding["waived"] is True
+        assert finding["waived_by"] == "jfanhon"
+        assert finding["waived_until"] == "2027-12-31"
+
+    def test_it_lands_as_an_ordinary_declaration_a_headless_run_reads(
+            self, blocked, workspace):
+        """
+        The governing rule. A waiver made by clicking has to be the same statement, in
+        the same place, as one typed into the file — otherwise the run and the screen
+        disagree about what has been declared.
+        """
+        from inventory_planning.quality.gates import BLOCK, Finding, GateReport
+
+        self._waive(blocked, expires="2027-12-31", by="jfanhon", reason="disjoint")
+        loaded = Declarations.load(workspace[0])
+        report = loaded.waive(GateReport("intake", [Finding(
+            stage="intake", check="sku_agreement", severity=BLOCK,
+            what="w", why="y", fix="f", evidence={"doc_type": "inventory"})]))
+        assert not report.blocking
+
+    def test_a_waiver_must_expire(self, blocked):
+        response = self._waive(blocked, by="jfanhon", reason="disjoint")
+        assert response.status_code == 400
+        assert "permanently disabled check" in response.json()["detail"]
+
+    def test_an_expiry_already_past_is_refused_rather_than_written(self, blocked):
+        """It would write cleanly, apply to nothing, and read as a waiver in force."""
+        response = self._waive(blocked, expires="2020-01-01", by="jfanhon",
+                               reason="disjoint")
+        assert response.status_code == 400
+        assert "in the past" in response.json()["detail"]
+        assert blocked.get("/gates").json()["passed"] is False
+
+    def test_it_must_say_why_and_who(self, blocked):
+        assert self._waive(blocked, expires="2027-12-31", by="jfanhon"
+                           ).status_code == 400
+        assert self._waive(blocked, expires="2027-12-31", reason="disjoint"
+                           ).status_code == 400
+
+    def test_a_waiver_on_one_document_leaves_the_others_checked(self, blocked,
+                                                                workspace):
+        """
+        The whole reason this is not `allow_degraded`: waiving the agreement finding on
+        a stock snapshot must not wave through an open PO mapped to a money column. The
+        scope has to be in the file, because the file is what the run reads.
+        """
+        from inventory_planning.quality.gates import BLOCK, Finding, GateReport
+
+        self._waive(blocked, expires="2027-12-31", by="jfanhon", reason="disjoint")
+        waiver, = Declarations.load(workspace[0]).waivers
+        assert waiver.doc_type == "inventory"
+
+        elsewhere = GateReport("intake", [Finding(
+            stage="intake", check="sku_agreement", severity=BLOCK,
+            what="w", why="y", fix="f", evidence={"doc_type": "open_po"})])
+        assert Declarations.load(workspace[0]).waive(elsewhere).blocking
+
+    def test_a_malformed_expiry_is_a_400_not_a_500(self, blocked):
+        response = self._waive(blocked, expires="next tuesday", by="jfanhon",
+                               reason="disjoint")
+        assert response.status_code == 400
+
+
 class TestEditingAScalar:
     """
     Two requests, not a stored proposal: the first asks what a change would do, the

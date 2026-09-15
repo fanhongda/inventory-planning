@@ -31,6 +31,7 @@ returning an empty list, which would read as "no data".
 import hashlib
 import shutil
 import tempfile
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -66,6 +67,77 @@ def _require_fastapi():
             "    pip install -e '.[api]'\n"
             "The planning pipeline itself does not depend on it."
         ) from exc
+
+
+# The three checkpoints that cannot run before the pipeline does, named so the screen
+# can say what a clean intake does and does not promise. Each needs something that does
+# not exist until the run builds it, which is why they are not merely "not implemented
+# here" — they are not answerable here.
+_LATER_GATES = [
+    {"stage": "demand", "needs": "a compiled time series",
+     "checks": "whether there is a demand signal at all, and how stale it is"},
+    {"stage": "forecast", "needs": "a forecast",
+     "checks": "whether every SKU with demand came out with one — a SKU planned "
+               "against zero demand is never bought until it stocks out"},
+    {"stage": "plan", "needs": "positions and recommendations",
+     "checks": "whether the SKUs that should be stocked have a position to plan from"},
+]
+
+
+def _finding_dict(finding) -> Dict[str, Any]:
+    """
+    One finding as the screen needs it, which is the gate's own dict plus two readings.
+
+    `waived` is derived from the evidence `Declarations.waive` stamps on rather than
+    tracked separately, because a waived finding is a real finding that was downgraded
+    — the record of that is already in the finding, and a second flag could disagree
+    with it.
+    """
+    body = finding.to_dict()
+    evidence = body.get("evidence") or {}
+    body["waived"] = bool(evidence.get("waived_until"))
+    body["waived_by"] = evidence.get("waived_by") or ""
+    body["waived_until"] = evidence.get("waived_until") or ""
+    # Which document the finding is about, where it is about one. The waiver form needs
+    # it: a waiver scoped to a doc_type is the narrow kind, and one without is the kind
+    # that turns a check off everywhere.
+    body["doc_type"] = str(evidence.get("doc_type") or "")
+    return body
+
+
+class _IntakeView:
+    """
+    The documents, shaped as `gate_intake` expects to be handed them.
+
+    `gate_intake` reads one attribute off an intake result and this supplies exactly
+    that. Passing a real `IntakeResult` would mean building one from parts the API does
+    not have — a plan, failures, supersessions, assumptions — and filling those with
+    empties would state four things the API has not established.
+    """
+
+    def __init__(self, documents):
+        self.documents = documents
+
+
+@dataclass
+class LandedIntake:
+    """
+    One reading of everything landed: the documents, the plan, and what was withheld.
+
+    A structure rather than a tuple because three callers want different parts of it
+    and a positional unpack is where "which of these five is the plan" becomes a bug
+    nobody reads.
+    """
+
+    documents: Dict[str, Any]
+    plan: Any
+    records: Dict[str, Dict[str, Any]]
+    declarations: Declarations
+    # doc_type -> capabilities the document declares but cannot back. Carried from the
+    # scan rather than recovered from the plan: the plan records what it decided, not
+    # what it was told, and reconstructing the input from the output is how the two
+    # drift.
+    withheld: Dict[str, Any]
 
 
 class Service:
@@ -117,6 +189,54 @@ class Service:
         frame = self.landing.rows(record.get("doc_type", ""), record["batch_id"],
                                   named=True)
         return frame.drop(columns=["row_no"], errors="ignore")
+
+    def landed_documents(self):
+        """
+        Every landed document, read the way the pipeline reads it, plus the plan.
+
+        Shared by the requirements checklist and the quality gate because they are two
+        readings of one thing. Two scans would be two answers about what is loaded, and
+        the gate's answer is the one that decides whether a run may happen — a checklist
+        that disagreed with it would be believed over it, because it is a checklist.
+
+        Recomputed per call for the same reason `/requirements` recomputed it: a batch
+        voided since the last call is not loaded any more, and a remembered list would
+        not know.
+        """
+        from ..ingest.capabilities import CapabilityResolver
+        from ..ingest.intake import Intake, unsupplied_capabilities
+
+        declarations = self.declarations()
+        intake = Intake(verbose=False, declarations=declarations)
+
+        documents = {}
+        names: Dict[str, str] = {}
+        withheld: Dict[str, Any] = {}
+        records: Dict[str, Dict[str, Any]] = {}
+        # Newest first, so where two batches claim one document type the later upload is
+        # the one described — the same rule a re-export follows everywhere else.
+        for record in self.landing.batches():
+            doc_type = record.get("doc_type") or ""
+            if doc_type in records or self.status_of(record["batch_id"]) == "void":
+                continue
+            frame = self.landed_frame(record)
+            doc = intake.load_frame(
+                frame, source_name=record.get("source_name", record["batch_id"]))
+            if doc.doc_type != doc_type:
+                # Re-classified since it landed. Believe the reading, not the folder.
+                doc_type = doc.doc_type
+                if doc_type in records:
+                    continue
+            missing = unsupplied_capabilities(doc.frame, doc.route.contract)
+            if missing:
+                withheld[doc_type] = missing
+            documents[doc_type] = doc
+            names[doc_type] = record.get("source_name", record["batch_id"])
+            records[doc_type] = record
+
+        plan = CapabilityResolver().resolve(names, withheld=withheld)
+        return LandedIntake(documents=documents, plan=plan, records=records,
+                            declarations=declarations, withheld=withheld)
 
     def status_of(self, batch_id: str) -> str:
         """
@@ -359,35 +479,17 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         what is there, drifts from the store the first time a batch is voided — and it
         is a checklist, so a person will trust it over the store.
         """
-        from ..ingest.capabilities import CAPABILITIES, CapabilityResolver
-        from ..ingest.intake import Intake, unsupplied_capabilities
+        from ..ingest.capabilities import CAPABILITIES
         from ..resolution import SOURCE_ABSENT, from_document
 
-        declarations = service.declarations()
-        intake = Intake(verbose=False, declarations=declarations)
+        loaded = service.landed_documents()
+        plan, withheld = loaded.plan, loaded.withheld
 
-        documents: Dict[str, str] = {}
-        withheld: Dict[str, Any] = {}
         landed: Dict[str, Dict[str, Any]] = {}
-        # Newest first, so where two batches claim one document type the later upload is
-        # the one described — the same rule a re-export follows everywhere else.
-        for record in service.landing.batches():
-            doc_type = record.get("doc_type") or ""
-            if doc_type in landed or service.status_of(record["batch_id"]) == "void":
-                continue
-            frame = service.landed_frame(record)
-            doc = intake.load_frame(
-                frame, source_name=record.get("source_name", record["batch_id"]))
-            if doc.doc_type != doc_type:
-                # Re-classified since it landed. Believe the reading, not the folder.
-                doc_type = doc.doc_type
-                if doc_type in landed:
-                    continue
-            resolved = from_document(doc, frame, declarations=declarations)
-            documents[doc_type] = record.get("source_name", record["batch_id"])
-            missing = unsupplied_capabilities(doc.frame, doc.route.contract)
-            if missing:
-                withheld[doc_type] = missing
+        for doc_type, record in loaded.records.items():
+            resolved = from_document(loaded.documents[doc_type],
+                                     service.landed_frame(record),
+                                     declarations=loaded.declarations)
             landed[doc_type] = {
                 "batch_id": record["batch_id"],
                 "source_name": record.get("source_name", ""),
@@ -398,8 +500,6 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                     for f in resolved.fields if f.required
                 ],
             }
-
-        plan = CapabilityResolver().resolve(documents, withheld=withheld)
 
         capabilities = []
         for name, cap in CAPABILITIES.items():
@@ -439,6 +539,102 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
             "documents": sorted(wanted.values(),
                                 key=lambda d: (not d["required"], d["doc_type"])),
         }
+
+    @app.get("/gates")
+    def gates() -> Dict[str, Any]:
+        """
+        The intake quality gate, over everything landed, before a run is attempted.
+
+        This is the checkpoint worth having here: every silent failure this pipeline has
+        produced was visible at intake and invisible in the report it went on to write.
+        Running it before the plan means a mapping that would have produced a complete
+        page of zeroes is found while the person who uploaded the file is still looking
+        at it.
+
+        **It is one of four, and the page has to say so.** `demand`, `forecast` and
+        `plan` run during the run and cannot run here — they need a time series, a
+        forecast and a position, none of which exist until the pipeline has done the
+        work. So a clean answer here is "nothing at intake stops this", never "the run
+        will pass", and the reply carries the other three by name so that distinction is
+        not left to be inferred.
+
+        Waivers are applied the way the run applies them: through `Declarations.waive`,
+        which downgrades a blocking finding it has been told is a false positive here
+        and leaves it visible, carrying who waived it and until when. The same call, so
+        a finding waived on this screen is waived in the run and not merely hidden on
+        the screen.
+        """
+        from ..quality import GateThresholds
+        from ..quality.checks import gate_intake
+
+        loaded = service.landed_documents()
+        if not loaded.documents:
+            return {
+                "stage": "intake", "ran": False, "findings": [],
+                "passed": None,
+                "note": "Nothing is landed, so there is nothing to check. The intake "
+                        "gate compares the documents against each other — whether "
+                        "their item numbers meet, whether a column is a column — and "
+                        "one document cannot disagree with itself.",
+                "later_stages": _LATER_GATES,
+            }
+
+        report = gate_intake(_IntakeView(loaded.documents), loaded.plan,
+                             GateThresholds.load(service.config_dir))
+        report = loaded.declarations.waive(report)
+
+        return {
+            "stage": "intake",
+            "ran": True,
+            "passed": report.passed,
+            "documents": sorted(loaded.documents),
+            "counts": {
+                "block": len(report.blocking),
+                "severe": len(report.severe),
+                "warn": len(report.warnings),
+            },
+            "findings": [_finding_dict(f) for f in report.ordered],
+            "later_stages": _LATER_GATES,
+        }
+
+    @app.post("/gates/{check}/waivers")
+    def waive_gate(check: str, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Declare one check a false positive on one document, until a date.
+
+        Narrower than `allow_degraded` by construction, which is the whole reason it
+        exists: waiving the SKU-agreement finding on a whole-warehouse stock snapshot
+        does not also wave through an open PO quantity mapped to a money column.
+
+        It lands as an ordinary `gate_waivers` entry in the config directory — the same
+        statement, in the same syntax, in the same place as a hand-written one — so the
+        headless run honours a waiver made by clicking. That is the governing rule of
+        this whole interface, and a waiver stored anywhere else would break it.
+        """
+        from ..store.declarations import GateWaiver
+
+        expires = payload.get("expires")
+        try:
+            when = date.fromisoformat(str(expires)) if expires else None
+        except ValueError:
+            raise HTTPException(400, f"expires must be a date (YYYY-MM-DD), "
+                                     f"not {expires!r}") from None
+        if when is None:
+            raise HTTPException(400, "expires is required — a waiver without an end "
+                                     "date is a permanently disabled check")
+        if when < date.today():
+            raise HTTPException(400, f"{when} is in the past, so the waiver would "
+                                     f"never apply. Pick a date to review this by.")
+        try:
+            path = Declarations.write_waiver(
+                GateWaiver(check=check, doc_type=str(payload.get("doc_type") or ""),
+                           expires=when, reason=str(payload.get("reason") or ""),
+                           by=str(payload.get("by") or "")),
+                config_dir=service.config_dir)
+        except DeclarationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"check": check, "expires": when.isoformat(),
+                "doc_type": payload.get("doc_type") or "", "written_to": str(path)}
 
     @app.get("/batches/{batch_id}/summary")
     def summary(batch_id: str) -> Dict[str, Any]:

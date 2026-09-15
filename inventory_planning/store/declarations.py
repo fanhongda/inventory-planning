@@ -249,6 +249,54 @@ class Declarations:
         return path
 
     @staticmethod
+    def write_waiver(waiver: "GateWaiver", config_dir=None) -> Path:
+        """
+        Persist one gate waiver, in the same place and syntax a hand-written one goes.
+
+        The three required fields are required here for the reasons the parser already
+        gives, and one more that only applies to a waiver written by clicking. A gate
+        exists because a report built on that data would be complete, plausible and
+        wrong; waiving one is a claim that this particular check is a false positive on
+        this particular document, and that claim needs a name against it.
+
+        `expires` is the field that keeps this from being `allow_degraded` with extra
+        steps. A waiver with no end date is a permanently disabled check, and a pipeline
+        loses its gates one convenient afternoon at a time rather than by decision. The
+        parser refuses an undated waiver; this refuses to write one.
+        """
+        if not str(waiver.reason or "").strip():
+            raise DeclarationError(
+                "a waiver must say why this check is a false positive here — it is the "
+                "only thing that lets anyone judge later whether it still is")
+        if not str(waiver.by or "").strip():
+            raise DeclarationError("a waiver must name who declared it")
+        if waiver.expires is None:
+            raise DeclarationError(
+                "a waiver must expire — one that does not is a disabled check")
+        if not str(waiver.check or "").strip():
+            raise DeclarationError("a waiver must name the check it waives")
+
+        import yaml
+        if config_dir is None:
+            config_dir = Path(__file__).parents[2] / "config"
+        target_dir = Path(config_dir) / DECLARATIONS_DIRNAME
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in waiver.check)
+        path = target_dir / f"{stamp}-waiver-{safe}.yaml"
+        body = {"version": 1, "gate_waivers": [{
+            "check": waiver.check,
+            **({"doc_type": waiver.doc_type} if waiver.doc_type else {}),
+            "reason": " ".join(str(waiver.reason).split()),
+            "by": waiver.by,
+            "expires": waiver.expires.isoformat(),
+        }]}
+        path.write_text(yaml.safe_dump(body, sort_keys=False, allow_unicode=True),
+                        encoding="utf-8")
+        return path
+
+    @staticmethod
     def _parse_override(item: Dict[str, Any], target: Path, index: int) -> Override:
         where = f"{target}: overrides[{index}]"
         if not isinstance(item, dict):

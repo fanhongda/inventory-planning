@@ -582,7 +582,18 @@ policy  = planner.run_policy_analysis(
 review  = planner.run_kpi_review(policy, sales_df=inputs["sales_df"], ...)
 ```
 
-Or name the files explicitly:
+The same thing from the command line — hand it the folder:
+
+```bash
+inventory-plan exports/ --output output/
+inventory-plan a.xlsx b.xlsx c.xlsx --output output/    # or the files themselves
+```
+
+Each file is routed to a contract by its content, so the order does not matter and the
+filenames need not mean anything. **This is the invocation to use.**
+
+<details>
+<summary>The per-file flags still work, and what they cost</summary>
 
 ```bash
 inventory-plan \
@@ -591,10 +602,22 @@ inventory-plan \
   --open-so          open_so.xlsx \
   --open-po          open_po.xlsx \
   --inventory        inventory.xlsx \
-  --timeseries       timeseries_3yr.xlsx    # optional pre-compiled wide-format TS
-  --item-master      item_master.xlsx       # optional ERP master
-  --planning-master  planner_sheet.xlsx     # optional planner worksheet
+  --item-master      item_master.xlsx
 ```
+
+This path reads each file through `schema.py`, which carries **1,216 fewer aliases than
+the contracts**. A real SAP export whose quantity column reads `Shipped Quantity` fails
+here with `KeyError: ['qty']` and routes cleanly through the contracts — which is how the
+gap was found, on the first attempt at a production run. It survived because
+`sample_data/sales_history.csv` heads that column `Sales Qty`, which the legacy table
+does know, so every test and every demonstration passed.
+
+It also builds no capability plan, so **the intake quality gate does not run** — including
+the check that catches two documents keyed on different numbering systems, which once
+passed a full report of confident zeroes.
+
+The run prints this warning every time it is used.
+</details>
 
 CSV and Excel are both accepted. Each file is profiled, routed to a contract,
 transformed by an adapter and verified by contract tests before it reaches the analytics.

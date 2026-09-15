@@ -275,6 +275,23 @@ one: every extract in the store is the same July pull, so there is no later mont
 score against. The refusal says so by name rather than reporting every SKU as having
 sold nothing.
 
+**The CLI routes by contract. Done 2026-09-15.** Found by running the real extract
+before a production run: the documented invocation died on it with `KeyError: ['qty']`.
+The sales history heads its quantity column `Shipped Quantity`; the legacy `schema.py`
+the per-file readers use does not carry that alias, and the contracts do. It is not one
+alias — **the contracts carry 1,216 the legacy table does not**, across every document
+type. `inventory-plan <dir-or-files...>` now routes by content, which is the path that
+already worked and had no command line. The flags still work and print what they cost.
+
+Why it survived: `sample_data/sales_history.csv` heads that column `Sales Qty`, which
+the legacy table knows. Every test passed while the real export failed, and there were
+no CLI tests at all. There are now, and the one that matters compares the two alias
+tables directly rather than checking that the CLI runs.
+
+**Still two implementations of intake.** The right end state is the readers reading
+through the contracts, so there is one alias table; that is a bigger change than this
+was and it is not done. Until then the per-file path is a fallback that says so.
+
 What this still needs: **decisions queryable** — `run_id` is in the snapshot filename and
 not its body, and there is no query layer over 2,430 JSON files — and a **SKU-level diff
 over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,

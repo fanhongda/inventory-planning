@@ -28,13 +28,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog="inventory-plan",
         description="DC Inventory Planning — demand classification, safety stock, forecast, purchase recommendations",
     )
-    parser.add_argument("--sales",        required=True,  help="Sales history file (CSV/xlsx)")
-    parser.add_argument("--po-history",   required=True,  help="PO history file (CSV/xlsx)")
-    parser.add_argument("--open-so",      required=True,  help="Open sales orders file (CSV/xlsx)")
-    parser.add_argument("--open-po",      required=True,  help="Open purchase orders file (CSV/xlsx)")
-    parser.add_argument("--inventory",    required=True,  help="Inventory snapshot file (CSV/xlsx)")
+    parser.add_argument(
+        "inputs", nargs="*",
+        help="Files or a directory holding them. Each is routed to a contract by its "
+             "content, so the order does not matter and the filenames need not mean "
+             "anything. This is the path to use: it maps every alias the contracts "
+             "know, runs the intake quality gate, and builds a capability plan.")
+    # The per-file flags. Kept working and no longer required — see `_legacy_warning`
+    # for what they cost.
+    parser.add_argument("--sales",        default=None,  help="Sales history file (CSV/xlsx)")
+    parser.add_argument("--po-history",   default=None,  help="PO history file (CSV/xlsx)")
+    parser.add_argument("--open-so",      default=None,  help="Open sales orders file (CSV/xlsx)")
+    parser.add_argument("--open-po",      default=None,  help="Open purchase orders file (CSV/xlsx)")
+    parser.add_argument("--inventory",    default=None,  help="Inventory snapshot file (CSV/xlsx)")
     parser.add_argument("--timeseries",   default=None,   help="Pre-compiled time series file (wide format, optional)")
-    parser.add_argument("--item-master",  required=True,
+    parser.add_argument("--item-master",  default=None,
                         help="ERP item master: supplier, lead time, MOQ, cost and — "
                              "required — the product family each SKU belongs to")
     parser.add_argument("--planning-master", default=None, help="Planner worksheet (optional): safety stock, min/max, LT — compared, not consumed")
@@ -71,8 +79,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Every extension the intake can route. A directory is expanded to these rather than to
+# everything in it, so a stray `.docx` or a lock file is skipped instead of failing the
+# run at the routing step.
+_READABLE = (".csv", ".xlsx", ".xlsm", ".xls", ".tsv", ".txt")
+
+
+def _expand(inputs) -> list:
+    """Files as given; a directory as the readable files directly inside it."""
+    out = []
+    for raw in inputs:
+        path = Path(raw)
+        if path.is_dir():
+            out.extend(sorted(
+                str(child) for child in path.iterdir()
+                if child.is_file() and child.suffix.lower() in _READABLE
+                and not child.name.startswith(("~$", "."))))
+        else:
+            out.append(str(path))
+    return out
+
+
+def _legacy_warning() -> str:
+    """
+    What the per-file flags cost, said every time they are used.
+
+    Not a deprecation notice. The flags work, and on the sample data they work
+    perfectly — which is exactly why the gap survived: `sample_data/sales_history.csv`
+    heads its quantity column `Sales Qty`, which the legacy table knows, and a real SAP
+    export heads it `Shipped Quantity`, which only the contracts know.
+    """
+    lines = [
+        "  \u26a0 The per-file flags read through `schema.py`, which carries 1,216 fewer",
+        "    aliases than the contracts. A real export whose quantity column reads",
+        "    `Shipped Quantity` fails here and routes cleanly through the contracts.",
+        "",
+        "    This path also builds no capability plan, so the intake quality gate does",
+        "    not run \u2014 including the check that catches two documents keyed on",
+        "    different numbering systems, which once passed a whole report of zeroes.",
+        "",
+        "    Pass the files positionally instead, and none of these flags are needed:",
+        "        inventory-plan <dir-or-files...> --output <dir>",
+    ]
+    return "\n".join(lines)
+
+
 def main():
     args = build_parser().parse_args()
+    if not args.inputs and not any(
+            (args.sales, args.po_history, args.open_so, args.open_po, args.inventory)):
+        build_parser().error(
+            "name the input files. Either positionally — a directory or the files "
+            "themselves, routed by content — or one per flag. The positional form is "
+            "the one to use; the flags read through a narrower alias table and skip "
+            "the intake quality gate.")
 
     planner = InventoryPlanner(
         config_dir=args.config,
@@ -87,6 +147,44 @@ def main():
     # reading a manifest for a run that should not have happened.
     print()
     print(planner.workspace.summary())
+
+    # ── The contract path ────────────────────────────────────────────────────
+    if args.inputs:
+        paths = _expand(args.inputs)
+        if not paths:
+            build_parser().error(
+                f"nothing readable in {', '.join(args.inputs)} — looked for "
+                f"{', '.join(_READABLE)}.")
+        print(f"\nRouting {len(paths)} file(s) by content...")
+        loaded = planner.load_all(paths)
+        sales_plan = (planner.load_sales_plan(args.sales_plan)
+                      if args.sales_plan else None)
+        if args.timeseries:
+            pivot, meta, _ = planner.load_timeseries(
+                args.timeseries, rolling_months=args.ts_months)
+            loaded["timeseries_pivot"], loaded["timeseries_meta"] = pivot, meta
+
+        results = planner.run_planning(**loaded, sales_plan=sales_plan)
+        planner.run_policy_analysis(
+            results,
+            inventory_df=loaded.get("inventory_df"),
+            open_po_df=loaded.get("open_po_df"),
+            item_master_df=loaded.get("item_master_df"),
+            planning_master_df=loaded.get("planning_master_df"),
+        )
+        return
+
+    # ── The per-file path ────────────────────────────────────────────────────
+    print()
+    print(_legacy_warning())
+    missing = [flag for flag, value in (
+        ("--sales", args.sales), ("--po-history", args.po_history),
+        ("--open-so", args.open_so), ("--open-po", args.open_po),
+        ("--inventory", args.inventory)) if not value]
+    if missing:
+        build_parser().error(
+            f"the per-file path needs all five: missing {', '.join(missing)}. "
+            f"Passing the files positionally needs none of them.")
 
     print("Loading input files...")
     sales_df,   _ = planner.load_sales_history(args.sales)
@@ -121,7 +219,7 @@ def main():
     masters = [df for df in (item_master_df, planning_master_df) if df is not None]
     if not any("product_family" in df.columns and df["product_family"].notna().any()
                for df in masters):
-        parser.error(
+        build_parser().error(
             f"{args.item_master} carries no product family. Nothing mapped to "
             f"`product_family` — the column is probably there under a name no alias "
             f"matched. Run `python -m inventory_planning.explain {args.item_master}` "

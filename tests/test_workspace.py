@@ -95,11 +95,38 @@ class TestIsolation:
         for path in a.paths.values():
             assert not b.contains(path)
 
+    def test_a_named_tenant_keeps_nothing_in_the_working_tree(self):
+        """
+        The first version of this put a tenant's config and output at
+        `<repo>/tenants/<name>/...` — untracked, one `git clean -fdx` from gone, and
+        dirtying `git status` on every machine that pulls. That is what
+        `store/location.py` already argues against for the store, and it applies to a
+        tenant's config for the same reason.
+        """
+        from inventory_planning.store.location import inside_repo
+
+        workspace = Workspace.resolve("acme")
+        for key, path in workspace.paths.items():
+            assert not inside_repo(path), f"{key} landed in the working tree"
+
+    def test_the_default_tenant_still_uses_the_repository_config(self):
+        """
+        And must: the rules are markdown in git, which is what gives them review, a
+        diff, a rationale and an owner. Only a *named* tenant moves out.
+        """
+        from inventory_planning.store.location import inside_repo
+
+        assert inside_repo(Workspace.resolve().config_dir)
+
+    def test_a_config_forced_into_the_working_tree_is_reported(self, tmp_path):
+        workspace = Workspace.resolve("acme", config_dir=REPO / "tenants" / "acme")
+        assert any("inside the working tree" in w for w in workspace.warnings)
+
     def test_a_tenant_is_not_inside_the_default_workspace(self):
         """
-        The default tenant's config is `<repo>/config`; a tenant's is
-        `<repo>/tenants/<name>/config`. Neither contains the other, which is what stops
-        a tenant's rules from being picked up by a default run.
+        The default tenant's config is `<repo>/config`; a tenant's is beside the store.
+        Neither contains the other, which is what stops a tenant's rules from being
+        picked up by a default run.
         """
         default = Workspace.resolve()
         tenant = Workspace.resolve("acme")

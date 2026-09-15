@@ -764,6 +764,29 @@ change) neither collide nor need to be told apart by hand.
 | `policy/policy.md` | Company-level hard constraints (human-readable, Claude-interpreted) |
 | `config/config_changes.jsonl` | Append-only: who changed which setting or rule, what moved, and why. Written by the interface, not by a run |
 
+### Keeping a production run apart from a working tree you pull into
+
+```bash
+inventory-plan exports/ --tenant prod
+```
+
+A named tenant's **three** directories sit together outside any working tree:
+
+```
+<data>/inventory-planning/tenants/prod/config    the rules this tenant plans under
+<data>/inventory-planning/tenants/prod/store     its facts — the one thing not regenerable
+<data>/inventory-planning/tenants/prod/output    its workbooks
+```
+
+`git pull`, `checkout`, `reset --hard` and `clean -fdx` cannot reach any of them, and
+`git status` stays clean. Only the **default** tenant reads the repository's own
+`config/` — which is the point, because those rules are markdown in git and that is what
+gives them review, a diff, a rationale and an owner. A tenant that wants its rules
+versioned points `--config` at a repository of its own.
+
+Every run prints the workspace it resolved before it reads anything, so which config a
+run planned under is answerable before the run rather than afterwards.
+
 A run's config, store and output are resolved together as a **workspace**
 (`workspace.py`). `--tenant <name>` names all three at once instead of pointing at three
 directories separately, and each entry point prints the workspace it resolved before it

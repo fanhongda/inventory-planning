@@ -21,8 +21,18 @@ rather than putting them under one root:
 
 ## One rule for where a named tenant's directories go
 
-    resolved from a base     default <base>/<leaf>      tenant <base>/tenants/<name>/<leaf>
+    resolved from a base     default <repo>/<leaf>      tenant <data>/tenants/<name>/<leaf>
     named by a variable      default <$VAR>             tenant <$VAR>/tenants/<name>
+
+The default tenant's config is the repository's own `config/`, which is the point: the
+rules are markdown in git, and git is what gives them review, diff, rationale and owner.
+A *named* tenant's config is not this repository's content, and the first version of this
+put it at `<repo>/tenants/<name>/config` — inside the working tree, untracked, one
+`git clean -fdx` from gone, and permanently dirtying `git status` on a machine that
+pulls. That is the failure `store/location.py` already argues against for the store, and
+it applies to a tenant's config for the same reason. So a named tenant's three
+directories all sit together under the data directory, outside any working tree. A tenant
+that wants its rules versioned points `--config` at a repository of its own.
 
 Two shapes because a variable already names the directory itself — `$..._CONFIG` is the
 config directory, the way `--config` is — so appending the leaf again would give
@@ -139,11 +149,15 @@ class Workspace:
         """
         name = check_tenant(tenant)
         root = Path(base) if base else Path(__file__).parents[1]
+        # Where a *named* tenant's directories hang off: beside the store, outside any
+        # working tree. `base` overrides both so a test can put a whole workspace in a
+        # temporary directory.
+        data = Path(base) if base else default_store_root().parent
         origins: Dict[str, str] = {}
 
-        config = cls._pick(config_dir, ENV_CONFIG, root, "config", name, origins,
+        config = cls._pick(config_dir, ENV_CONFIG, root, data, "config", name, origins,
                            "config_dir")
-        output = cls._pick(output_dir, ENV_OUTPUT, root, "output", name, origins,
+        output = cls._pick(output_dir, ENV_OUTPUT, root, data, "output", name, origins,
                            "output_dir")
 
         # The store keeps its own resolver: it has one more step than the others
@@ -165,12 +179,25 @@ class Workspace:
             origin = f"{origin} + tenant"
         origins["store_root"] = origin
 
-        warnings = tuple(w for w in (warn_if_inside_repo(store),) if w)
+        # Said for all three now. The store always checked; config and output did not,
+        # and a named tenant's config landing in the working tree is the case that
+        # needed saying — `git clean -fdx` deletes it and `git status` is dirty until
+        # somebody does.
+        found = [warn_if_inside_repo(store)]
+        if name != DEFAULT_TENANT:
+            for path in (config, output):
+                inside = warn_if_inside_repo(path)
+                if inside:
+                    found.append(
+                        f"tenant {name}: {path} is inside the working tree — "
+                        f"`git clean -fdx` deletes it and every pull sees it as "
+                        f"untracked. Point it outside, or let it default.")
+        warnings = tuple(w for w in found if w)
         return cls(tenant=name, config_dir=config, store_root=store, output_dir=output,
                    origins=origins, warnings=warnings)
 
     @staticmethod
-    def _pick(explicit, env_var: str, root: Path, leaf: str, tenant: str,
+    def _pick(explicit, env_var: str, root: Path, data: Path, leaf: str, tenant: str,
               origins: Dict[str, str], key: str) -> Path:
         if explicit:
             origins[key] = "argument"
@@ -183,8 +210,11 @@ class Workspace:
                 return path / _TENANTS_DIRNAME / tenant
             origins[key] = f"${env_var}"
             return path
-        origins[key] = "tenant" if tenant != DEFAULT_TENANT else "default"
-        return _scoped(root, leaf, tenant)
+        if tenant != DEFAULT_TENANT:
+            origins[key] = "tenant"
+            return _scoped(data, leaf, tenant)
+        origins[key] = "default"
+        return root / leaf
 
     # ── Reading ──────────────────────────────────────────────────────────────
 

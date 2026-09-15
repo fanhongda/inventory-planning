@@ -48,3 +48,10 @@ htmlcov/
 # Development log entries that quote real extract data (see docs/devlog/README.md)
 docs/devlog/local/*
 !docs/devlog/local/.gitkeep
+
+# A tenant workspace, if one is ever forced in here with --config or --output. The
+# default puts all three of a named tenant's directories beside the store, outside any
+# working tree — a production config that `git clean -fdx` deletes is the failure this
+# and `store/location.py` both exist to avoid. Ignored as well as defaulted away,
+# because the first version of the workspace seam put them here.
+tenants/

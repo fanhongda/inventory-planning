@@ -216,6 +216,16 @@ shown under the workbook's own number formats with Excel's rounding, so the page
 file cannot disagree. A test pins the writer's format constants to the reader's, because
 that is the only way the two files stay in agreement without becoming one.
 
+**The workspace seam is cut. Done 2026-09-15.** `workspace.py` resolves config, store
+and output from a tenant id in one place; `--tenant` on the pipeline, the server and the
+store CLI. The default tenant moves no path. It found one defect on the way: `--output`
+defaulted to the string `"output"`, argparse passed it every run, so it reached the
+resolver as an explicit argument and outranked the tenant — a tenant's outputs landed in
+the shared directory the results screen reads while config and store were isolated. The
+same literal was in the API service and its server. It also found that the API tests
+were reading the repository's own `./output`, so "no runs here" was an assertion about
+the developer's machine.
+
 What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
 which recommendations flipped. Neither needs new identity work.
 

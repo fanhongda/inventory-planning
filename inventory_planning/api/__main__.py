@@ -28,9 +28,14 @@ def main(argv=None) -> int:
                         help="Store root. Overrides INVENTORY_PLANNING_STORE — the "
                              "store path is the isolation between a dev run and a real "
                              "one, exactly as a branch is for code.")
-    parser.add_argument("--output", default="output",
+    parser.add_argument("--output", default=None,
                         help="Output directory. The run registry lives under it, so "
-                             "this is where the policy screen reads runs from.")
+                             "this is where the policy screen reads runs from. "
+                             "Defaults to the workspace's, which is what makes "
+                             "--tenant reach it.")
+    parser.add_argument("--tenant", default=None,
+                        help="Which workspace to serve. --config / --store / --output "
+                             "still win where given.")
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args(argv)
 
@@ -44,7 +49,7 @@ def main(argv=None) -> int:
     from .app import create_app
 
     uvicorn.run(create_app(config_dir=args.config, store_root=args.store,
-                           output_dir=args.output),
+                           output_dir=args.output, tenant=args.tenant),
                 host=args.host, port=args.port, reload=args.reload)
     return 0
 

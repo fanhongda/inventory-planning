@@ -107,6 +107,11 @@ def main(argv: List[str] = None) -> int:
     parser.add_argument("--store", default=None,
                         help="Store root. Defaults to $INVENTORY_PLANNING_STORE or the "
                              "platform data directory.")
+    parser.add_argument("--tenant", default=None,
+                        help="Which tenant's store. Combines with --store rather than "
+                             "replacing it: a tenant under an explicit root gets its "
+                             "own subtree, so pointing --store at a dev store does not "
+                             "merge every tenant's facts into it.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("show", help="What the store holds, by document and layer")
@@ -135,7 +140,16 @@ def main(argv: List[str] = None) -> int:
                              required=True, help="What the selected batches actually hold")
 
     args = parser.parse_args(argv)
-    root, source = resolve_store_root(args.store)
+    # Through the workspace resolver, so --tenant means the same thing here as it does
+    # to the pipeline and the API. Maintenance that ran against a different store than
+    # the run did is the failure this shares one resolver to avoid.
+    from ..workspace import BadTenant, Workspace
+
+    try:
+        workspace = Workspace.resolve(args.tenant, store_root=args.store)
+    except BadTenant as exc:
+        parser.error(str(exc))
+    root, source = workspace.store_root, workspace.origins["store_root"]
     ledger = BatchLedger(root)
 
     if args.command == "show":

@@ -666,8 +666,8 @@ than the conclusion.
 
 Each is cheap while there is one user and expensive once there are many.
 
-**A workspace, not three arguments.** `store_root`, `config_dir` and `output_dir` are
-resolved separately today and passed around independently; `Intake` and the adapters
+**A workspace, not three arguments. Cut 2026-09-15 — `workspace.py`.** `store_root`,
+`config_dir` and `output_dir` were resolved separately and passed around independently; `Intake` and the adapters
 already carry a `tenant`, and nothing else does. Collapsing the three into one object
 resolved from a tenant id makes multi-tenancy "resolve a different workspace" rather than
 a refactor of every call site. It also makes the isolation testable, which the store path
@@ -705,7 +705,17 @@ a mechanism is cheaper now, with one instance to generalise from, than after the
    2026-09-15** — it renders the run's own files and computes nothing, down to using
    the workbook's own number formats so the page and the file cannot disagree. Details
    under §2, M4.
-4. **The workspace seam**, then **the identity seam**, then **the migration mechanism**.
+4. **The workspace seam** — **done, 2026-09-15** — then **the identity seam**, then
+   **the migration mechanism**. `workspace.py` resolves all three directories from a
+   tenant id in one place; every entry point takes `--tenant`. The default tenant moves
+   no path, which the tests assert directly. Two things came out of doing it: the
+   isolation §7 called untestable now has a `contains()` to assert against, and a real
+   defect surfaced — `--output` defaulted to the string `"output"`, so argparse handed
+   it over as an explicit argument on every run and it outranked the tenant. A tenant's
+   outputs went to the shared directory the results screen reads while config and store
+   were correctly isolated. The same literal was in the API service and its server. A
+   default is not an argument, and the entry points now pass `None` for what they were
+   not given.
 5. **Decisions in the store (P6)** — and not before. The results screen does not need it;
    feedback learning does, and that is the thing to build it for.
 

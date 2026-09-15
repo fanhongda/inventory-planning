@@ -168,13 +168,24 @@ class Service:
     mechanism for data exactly as a branch is for code.
     """
 
-    def __init__(self, config_dir=None, store_root=None, output_dir=None):
+    def __init__(self, config_dir=None, store_root=None, output_dir=None,
+                 workspace=None, tenant=None):
+        from ..workspace import Workspace
+
+        # Resolved through the one resolver, even when all three were passed in — see
+        # `workspace.py`. What the API keeps from before is that an unset config_dir
+        # stays None: several endpoints read that as "use the package's own config",
+        # and a workspace that helpfully filled it in would change which rules a test
+        # with no config directory plans under.
+        self.workspace = workspace or Workspace.resolve(
+            tenant, config_dir=config_dir, store_root=store_root,
+            output_dir=output_dir)
         self.config_dir = Path(config_dir) if config_dir else None
         self.store_root = store_root
         # Where the runs are. The registry lives under the output directory the pipeline
         # writes to, so the interface reads the runs the CLI produced rather than
         # keeping a second record that could disagree with it.
-        self.output_dir = Path(output_dir) if output_dir else Path("output")
+        self.output_dir = self.workspace.output_dir
         self.contracts = default_registry()
 
     @property
@@ -274,7 +285,7 @@ class Service:
         return "landed"
 
 
-def create_app(config_dir=None, store_root=None, output_dir=None):
+def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
     """Build the application. Importing this module does not require FastAPI; calling
     this does."""
     _require_fastapi()
@@ -282,7 +293,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
     from fastapi.responses import FileResponse
 
     service = Service(config_dir=config_dir, store_root=store_root,
-                      output_dir=output_dir)
+                      output_dir=output_dir, tenant=tenant)
     app = FastAPI(
         title="Inventory planning — intake",
         description=__doc__,

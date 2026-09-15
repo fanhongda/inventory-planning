@@ -15,7 +15,15 @@ from pathlib import Path
 from .orchestrator import InventoryPlanner
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Split out of `main` so the defaults can be asserted without running a plan.
+
+    Worth the three lines: `--output` defaulted to the string "output", argparse passed
+    it on every run, and it therefore reached the workspace as an explicit argument and
+    outranked `--tenant` — putting a tenant's outputs in the shared directory the
+    results screen reads while every other path was correctly isolated.
+    """
     parser = argparse.ArgumentParser(
         prog="inventory-plan",
         description="DC Inventory Planning — demand classification, safety stock, forecast, purchase recommendations",
@@ -31,7 +39,13 @@ def main():
                              "required — the product family each SKU belongs to")
     parser.add_argument("--planning-master", default=None, help="Planner worksheet (optional): safety stock, min/max, LT — compared, not consumed")
     parser.add_argument("--ts-months",    type=int, default=36, help="Rolling months for time series (default 36)")
-    parser.add_argument("--output",       default="output", help="Output directory (default: ./output)")
+    # Default None, not "output". argparse passes its default on every run, so a
+    # literal here reaches the workspace as an explicit argument and outranks the
+    # tenant — which put a tenant's outputs in the shared directory the results screen
+    # reads, silently, while every other path was correctly isolated.
+    parser.add_argument("--output",       default=None,
+                        help="Output directory (default: the workspace's — ./output "
+                             "for the single-user default)")
     parser.add_argument("--config",       default=None,   help="Config directory (default: ./config)")
     parser.add_argument("--parameters",   default=None,
                         help="Rule set to plan under (default: <config>/planning_parameters.md). "
@@ -48,8 +62,17 @@ def main():
                              "override are recorded in quality_gates_<run>.json — every "
                              "figure then rests on data that did not pass.")
     parser.add_argument("--no-interactive", action="store_true", help="Skip column-mapping confirmation prompts")
+    parser.add_argument("--tenant", default=None,
+                        help="Which workspace to plan in. Names a tenant's config, "
+                             "store and output together rather than pointing at three "
+                             "directories separately; --config / --store / --output "
+                             "still win where given. Omit for the single-user default.")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     planner = InventoryPlanner(
         config_dir=args.config,
@@ -57,7 +80,13 @@ def main():
         interactive=not args.no_interactive,
         parameters_file=args.parameters,
         allow_degraded=args.allow_degraded,
+        tenant=args.tenant,
     )
+    # Printed before anything is read. Which config a run planned under is the first
+    # question asked when a run's numbers look wrong, and answering it afterwards means
+    # reading a manifest for a run that should not have happened.
+    print()
+    print(planner.workspace.summary())
 
     print("Loading input files...")
     sales_df,   _ = planner.load_sales_history(args.sales)

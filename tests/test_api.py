@@ -32,9 +32,20 @@ def workspace(tmp_path):
 
 
 @pytest.fixture
-def client(workspace):
+def client(workspace, tmp_path):
+    """
+    All three directories disposable, not two.
+
+    `output_dir` used to be left unset, which resolved to the repository's own
+    `./output` — so a test asserting "no runs here" was asserting something about the
+    developer's machine. It passed because that directory happened to hold no run under
+    the current rules, and failed the moment one did. The store path was always
+    isolated; this is the other half, and it is what INTERFACE.md §7's workspace seam
+    exists to make sayable.
+    """
     config, store = workspace
-    return TestClient(create_app(config_dir=config, store_root=store))
+    return TestClient(create_app(config_dir=config, store_root=store,
+                                 output_dir=tmp_path / "output"))
 
 
 def _upload(client, path=SAMPLE, name=None):

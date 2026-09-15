@@ -741,6 +741,16 @@ change) neither collide nor need to be told apart by hand.
 | `policy/policy.md` | Company-level hard constraints (human-readable, Claude-interpreted) |
 | `config/config_changes.jsonl` | Append-only: who changed which setting or rule, what moved, and why. Written by the interface, not by a run |
 
+A run's config, store and output are resolved together as a **workspace**
+(`workspace.py`). `--tenant <name>` names all three at once instead of pointing at three
+directories separately, and each entry point prints the workspace it resolved before it
+reads anything — which config a run planned under is the first question asked when its
+numbers look wrong. `--config` / `--store` / `--output` still win where given, and the
+default tenant resolves exactly what it always did. The three environment variables are
+`INVENTORY_PLANNING_CONFIG`, `INVENTORY_PLANNING_STORE` and
+`INVENTORY_PLANNING_OUTPUT`; a named tenant gets its own subtree under whichever of them
+is set, so pointing the store at a dev path does not merge every tenant's facts into it.
+
 These stay the store, and a text editor stays a first-class way to change them. The
 interface edits the same files: it proposes the change as a diff, refuses it if the
 pipeline's own loader will not read the result, and records who made it and why. For a

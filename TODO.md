@@ -292,6 +292,34 @@ tables directly rather than checking that the CLI runs.
 through the contracts, so there is one alias table; that is a bigger change than this
 was and it is not done. Until then the per-file path is a fallback that says so.
 
+**Real business figures sit in a public repository.** Noticed 2026-09-16 while
+checking that no real extract had reached git — none had, and `sample_data/` is
+synthetic, but the *numbers* from one did. The repository is public
+(`github.com/fanhongda/inventory-planning`), and several arguments quote the scale of a
+real employer's data to make their point:
+
+| Where | What |
+|---|---|
+| `README.md:387` | `13,163 of 32,800` rows, `9.7%` of shipped quantity, `759 of 1,256` SKUs |
+| `inventory_planning/ingest/adapter.py:150` | the same figures, in the mixed-date comment |
+| `ingest/adapters/default__regional_planning_master/planning_master.yaml` | `1,256 sales SKUs`, `1,028` joining — in the adapter's own description |
+| `tests/test_invariants.py`, `tests/test_mixed_formats.py` | the same percentages, quoted in docstrings |
+
+None of it is data — no material number, customer or quantity — and all of it predates
+the interface work; the figures added since are about this tool's own bookkeeping
+(batch counts, snapshot counts), most of which are development runs. So this is
+housekeeping rather than a leak, which is why it is here and not a fix.
+
+**The fix when it happens:** the arguments do not depend on the magnitudes. "On a real
+sales extract this silently removed a tenth of shipped quantity across three-fifths of
+the SKUs" makes the same point as `8,737 of 34,128`, and says nothing about whose
+warehouse it was. Replace the counts with proportions or with "a real extract", and
+leave the reasoning exactly as it is — the reasoning is the thing worth keeping.
+
+Also worth deciding at the same time: whether the adapter directory should be named for
+a system at all. It was `default__fsp_in30` and is now `default__regional_planning_master`,
+which is already the right instinct applied once.
+
 What this still needs: **decisions queryable** — `run_id` is in the snapshot filename and
 not its body, and there is no query layer over 2,430 JSON files — and a **SKU-level diff
 over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,

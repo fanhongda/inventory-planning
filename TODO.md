@@ -255,7 +255,29 @@ asked. And a layout change bumps `SCHEMA_VERSION` while a restatement does not �
 first migration that happened was the kind the stamp does not cover, and its refusal
 names a `migrate` command that does not exist.
 
-What this still needs: a **SKU-level diff over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
+**The feedback loop closes. Done 2026-09-15.** It never had: 2,430 snapshots, 63 MB,
+none ever scored, and three of `feedback/`'s five modules with no caller. `record_actuals`
+asked for two hand-assembled frames a month later; the store already held both.
+`feedback/actuals.py` reads them at scoring time and
+`python -m inventory_planning.feedback score --run <id> --sales <batch>` runs it. The
+snapshot is never written to — `LossCalculator.compute` was also writing back — and the
+score is its own record under `<store>/scores/`, carrying which batch and which period
+produced it. The scoring period comes from `as_of`, not `planning_month`: those are
+different things and using the wall clock would score a forecast against another month's
+demand.
+
+Verified on a real run rather than a fixture: a plan anchored to 2026-07-23, an August
+extract landed after it, first score ever produced — MAPE 15.8%, over-forecast,
+attributed to `MODEL_BIAS` with the parameter it points at.
+
+**On real data the loop still cannot close**, and that is a data fact rather than a code
+one: every extract in the store is the same July pull, so there is no later month to
+score against. The refusal says so by name rather than reporting every SKU as having
+sold nothing.
+
+What this still needs: **decisions queryable** — `run_id` is in the snapshot filename and
+not its body, and there is no query layer over 2,430 JSON files — and a **SKU-level diff
+over two `run_id`s** — which SKUs changed class, what the safety-stock total moved by,
 which recommendations flipped. Neither needs new identity work.
 
 **Step 3 — the store. Phase one done.** `store/` holds it: `location.py` resolves the

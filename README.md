@@ -771,6 +771,20 @@ manifest, which is what lets the policy screen show a rule's reach without a re-
 
 ## Feedback loop
 
+Scoring a plan against what happened:
+
+```bash
+python -m inventory_planning.feedback runs
+python -m inventory_planning.feedback score --run <run_id> --sales <batch_id> --write
+```
+
+The actuals are read from the store at scoring time, so the decision record is never
+written to — a snapshot that can be edited afterwards cannot say what was decided at the
+time. The score is its own record under `<store>/scores/`, and it carries the batch and
+the period it was computed against, so the number can be reproduced. The extract is named
+rather than searched for: a score computed against whatever the store happened to hold
+that day is not one you can defend later.
+
 After each run a snapshot is saved to `output/history/YYYY-MM/`. The following month,
 once actuals are available:
 

@@ -775,6 +775,38 @@ command that does not exist.
 5. **Decisions in the store (P6)** — and not before. The results screen does not need it;
    feedback learning does, and that is the thing to build it for.
 
+   **Revised 2026-09-15, on looking at it.** Feedback learning had never run: 2,430
+   decision snapshots, 63 MB, not one ever scored, and `collector.py`, `loss.py` and
+   `drift.py` with no caller anywhere in the package. Building a substrate for a
+   consumer that has never run is the thing this document rules out elsewhere, so the
+   loop was closed first — `feedback/actuals.py` and `python -m inventory_planning.feedback`.
+   The reason it had never closed was in the signature: `record_actuals(sales_df,
+   inventory_df)` asked a person to assemble two frames by hand a month later, and the
+   store already held both.
+
+   Three things the closing decided, which the substrate now has to preserve rather than
+   be designed around:
+
+   - **The decision record is never written to.** Actuals are read at scoring time, so
+     there is nothing to write back. Both `FeedbackCollector` and `LossCalculator.compute`
+     were writing into the snapshot, which made a decision mutable — and a record that
+     can be edited afterwards cannot say what was decided at the time, which is the only
+     question it is kept for. The score is its own record under `<store>/scores/`.
+   - **The scoring period comes from `as_of`, not `planning_month`.** A snapshot carries
+     both: the first is the newest date in the data the run anchored to, the second is
+     the wall clock when it executed. `forecast_next_period` is the forecast for the
+     period after `as_of`. Scoring by the wall clock would compare a 2024-08 forecast
+     against 2026-09 demand and report a confident number.
+   - **The extract is named, not searched for.** `FactQuery.current` refuses on sales
+     history — the stored batches carry no `so_line_number`, so the key is incomplete —
+     and reading every batch would multiply-count one extract by the number of times it
+     was imported. A score names the batch it was computed against, the way a run
+     manifest names the facts it planned on, and that batch id is in the score record.
+
+   What this leaves for the substrate is narrower and better understood: `run_id` is in
+   the snapshot's *filename* and not its body, and there is no query layer over 2,430
+   JSON files. Both are worth fixing; neither was the reason the loop was open.
+
 Still out: multi-node planning, editable facts, and moving the rule engine into a database
 before C/S actually requires it.
 

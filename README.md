@@ -99,6 +99,48 @@ when the deviation cannot be explained by execution failure or supply constraint
 
 ---
 
+## Architecture
+
+Five code stages and a substrate. The mental model is "read → store → forecast →
+replenish → report"; the code has one more, and it is load-bearing — `policy/` decides
+**which arithmetic a SKU gets**, and every later module attaches to the choosing rather
+than to the running.
+
+```
+                    ┌─── api/ ────────────────────────────────────────────────┐
+     browser  ─────▶│ Import review · Stored facts · Policy & runs · Results  │
+                    └────┬──────────────┬───────────────┬─────────────────────┘
+                         │              │               │
+                         ▼              │               ▼
+  exports/ ──▶ ingest/ ──▶ policy/ ──▶ analytics/ ──▶ analytics/ ──▶ reporting/ ──▶ .xlsx
+               ────────   ────────     ──────────     ──────────     ──────────
+               route by   which        forecast:      replenish:     five sheets
+               content,   arithmetic   competition    R+LT exposure, one question
+               not name   per SKU      + backtest     EOQ as a bound each
+
+                    quality gates:  intake ─ demand ─ forecast ─ plan
+                                    BLOCK stops the run · SEVERE · WARN
+                         │
+                         ▼   read / shadow-write
+  ┌─── store/ ──────────────────────────────────────────────────────────────────┐
+  │  landing      facts        ledger       identity     declarations           │
+  │  verbatim     append-only  which        SAP no. ↔    what a person          │
+  │  by column    bitemporal   files are    part no.     asserted, with         │
+  │  index        natural key  read                      by / at / reason       │
+  └──── parquet, read in place by duckdb · outside the repository ──────────────┘
+
+  provenance.py   run_id  =  facts × config × rules × code  →  outputs
+                  two runs differ by one axis, or `mixed` refuses to attribute
+```
+
+The store is drawn underneath rather than in the chain because `reporting/` and
+`feedback/` read it directly, without passing through forecasting.
+
+A run's config, store and output are resolved together as a **workspace**, from a tenant
+id — see [Keeping a production run apart](#keeping-a-production-run-apart-from-a-working-tree-you-pull-into).
+
+---
+
 ## What it does
 
 | Step | Method | Output |
@@ -582,7 +624,18 @@ policy  = planner.run_policy_analysis(
 review  = planner.run_kpi_review(policy, sales_df=inputs["sales_df"], ...)
 ```
 
-Or name the files explicitly:
+The same thing from the command line — hand it the folder:
+
+```bash
+inventory-plan exports/ --output output/
+inventory-plan a.xlsx b.xlsx c.xlsx --output output/    # or the files themselves
+```
+
+Each file is routed to a contract by its content, so the order does not matter and the
+filenames need not mean anything. **This is the invocation to use.**
+
+<details>
+<summary>The per-file flags still work, and what they cost</summary>
 
 ```bash
 inventory-plan \
@@ -591,10 +644,22 @@ inventory-plan \
   --open-so          open_so.xlsx \
   --open-po          open_po.xlsx \
   --inventory        inventory.xlsx \
-  --timeseries       timeseries_3yr.xlsx    # optional pre-compiled wide-format TS
-  --item-master      item_master.xlsx       # optional ERP master
-  --planning-master  planner_sheet.xlsx     # optional planner worksheet
+  --item-master      item_master.xlsx
 ```
+
+This path reads each file through `schema.py`, which carries **1,216 fewer aliases than
+the contracts**. A real SAP export whose quantity column reads `Shipped Quantity` fails
+here with `KeyError: ['qty']` and routes cleanly through the contracts — which is how the
+gap was found, on the first attempt at a production run. It survived because
+`sample_data/sales_history.csv` heads that column `Sales Qty`, which the legacy table
+does know, so every test and every demonstration passed.
+
+It also builds no capability plan, so **the intake quality gate does not run** — including
+the check that catches two documents keyed on different numbering systems, which once
+passed a full report of confident zeroes.
+
+The run prints this warning every time it is used.
+</details>
 
 CSV and Excel are both accepted. Each file is profiled, routed to a contract,
 transformed by an adapter and verified by contract tests before it reaches the analytics.
@@ -697,6 +762,40 @@ zeroes and no error at all.
 
 ---
 
+## The front end
+
+```bash
+pip install -e ".[api]"
+python -m inventory_planning.api --tenant prod      # → http://127.0.0.1:8000
+```
+
+Four screens, no build step and no framework — plain ES modules talking to the same HTTP
+API any other client would use, so replacing the whole directory costs nothing but the
+files in it.
+
+| Screen | What it is for | The constraint it holds |
+|---|---|---|
+| **Import review** | Upload an export and see what it was read as: the proposed mapping beside its evidence, the verbatim row beside the canonical one, the intake totals, and the quality gate | A correction is written as a `declaration` in the config directory — a headless run reproduces a run driven from the browser |
+| **Stored facts** | An as-of query by document type, the batches behind an answer with both their timestamps, and any batch shown before and after the adapter | Facts are appended, never edited. Withdrawing a batch appends a void; the rows stay |
+| **Policy & runs** | The scalars and the rules, both editable, each change proposed as a diff and applied with a reason and a name; every rule's reach from the last run; the diff of any two runs with its `basis` | Editing writes the file — git stays the store. The approval is pinned to the bytes the diff was made against |
+| **Results** | The run's own workbook, its sheets browsable, its text outputs verbatim, everything it wrote listed from the manifest | **It computes nothing.** Numbers are cells, shown under the workbook's own number formats, so the page and the file cannot disagree |
+
+The governing rule is one sentence: **every action the interface offers emits a
+declaration, and nothing the interface knows lives only in the interface.** A planner
+clicking "this column is the material" and a planner typing it into
+`config/declarations.yaml` produce byte-identical state.
+
+A server started on a workspace nobody has set up shows a setup panel with one button
+rather than four screens of errors. The tenant is the one the server was started with and
+is never taken from the request.
+
+> **It binds to localhost and stays there.** There is no login: `by` is a form field and
+> nothing checks it, so the bind address is the whole of the access control. Someone who
+> reaches the port can change a convention that restates every figure in the next run,
+> and sign it with any name. See the identity seam in [INTERFACE.md](INTERFACE.md) §7.
+
+---
+
 ## Output
 
 ```
@@ -739,16 +838,92 @@ change) neither collide nor need to be told apart by hand.
 | `config/node_config.json` | Location ID, reporting currency — one entry per DC |
 | `config/fx_rates.json` | Exchange rates into the reporting currency, effective-dated. A currency absent here is reported unvalued, never counted at face value |
 | `policy/policy.md` | Company-level hard constraints (human-readable, Claude-interpreted) |
+| `config/config_changes.jsonl` | Append-only: who changed which setting or rule, what moved, and why. Written by the interface, not by a run |
+
+### Keeping a production run apart from a working tree you pull into
+
+Two commands, once and then every time:
+
+```bash
+inventory-plan --setup --tenant prod        # once — makes the directories, seeds the rules
+inventory-plan exports/ --tenant prod       # every run after that
+```
+
+`--setup` is safe to repeat: a config directory that already holds rules is left exactly
+alone, so re-running it by habit cannot put a production policy back to the default. Run
+the second command before the first and it refuses with the first one, rather than
+failing inside a reader on a missing file.
+
+**Or from the browser.** A server started on a workspace nobody has prepared shows a
+setup panel instead of four screens that cannot answer anything, and one button does the
+same thing `--setup` does. The tenant is the one the server was started with and is never
+taken from the request — a request that could name its own would be a request that writes
+a directory tree wherever the resolver resolves to.
+
+A named tenant's **three** directories sit together outside any working tree:
+
+```
+<data>/inventory-planning/tenants/prod/config    the rules this tenant plans under
+<data>/inventory-planning/tenants/prod/store     its facts — the one thing not regenerable
+<data>/inventory-planning/tenants/prod/output    its workbooks
+```
+
+`git pull`, `checkout`, `reset --hard` and `clean -fdx` cannot reach any of them, and
+`git status` stays clean. Only the **default** tenant reads the repository's own
+`config/` — which is the point, because those rules are markdown in git and that is what
+gives them review, a diff, a rationale and an owner. A tenant that wants its rules
+versioned points `--config` at a repository of its own.
+
+Every run prints the workspace it resolved before it reads anything, so which config a
+run planned under is answerable before the run rather than afterwards.
+
+A run's config, store and output are resolved together as a **workspace**
+(`workspace.py`). `--tenant <name>` names all three at once instead of pointing at three
+directories separately, and each entry point prints the workspace it resolved before it
+reads anything — which config a run planned under is the first question asked when its
+numbers look wrong. `--config` / `--store` / `--output` still win where given, and the
+default tenant resolves exactly what it always did. The three environment variables are
+`INVENTORY_PLANNING_CONFIG`, `INVENTORY_PLANNING_STORE` and
+`INVENTORY_PLANNING_OUTPUT`; a named tenant gets its own subtree under whichever of them
+is set, so pointing the store at a dev path does not merge every tenant's facts into it.
+
+These stay the store, and a text editor stays a first-class way to change them. The
+interface edits the same files: it proposes the change as a diff, refuses it if the
+pipeline's own loader will not read the result, and records who made it and why. For a
+scalar that reason has nowhere else to live; for a rule it is written into the rule's own
+`rationale` as well, which is where the next reader will look. A parameter changed by
+clicking and one changed by typing are indistinguishable to every later run.
 
 `planning_parameters.md` is markdown with fenced YAML, not a config format, because the
 knowledge of *which SKU gets which policy* is business judgment that changes far more
 often than the arithmetic does. Every rule must carry a rationale — three months on, the
 reason is the only thing that lets anyone judge whether the rule still applies. Every run
-prints which rules hit which SKUs, and flags where two rules fight over one parameter.
+prints which rules hit which SKUs, flags where two rules fight over one parameter, and
+says how many SKUs each rule was still deciding once the later rules had run — a rule can
+match hundreds and be taken back on every one of them. The same record is kept on the run
+manifest, which is what lets the policy screen show a rule's reach without a re-run.
 
 ---
 
 ## Feedback loop
+
+Scoring a plan against what happened:
+
+```bash
+python -m inventory_planning.feedback runs --tenant prod
+python -m inventory_planning.feedback score --run <run_id> --sales <batch_id> --write
+```
+
+`--tenant` and `--store` go before or after the subcommand, whichever reads better — the
+same on `python -m inventory_planning.store`. Omit them and the command reads the default
+workspace, which is a different store from the one a `--tenant prod` run wrote to.
+
+The actuals are read from the store at scoring time, so the decision record is never
+written to — a snapshot that can be edited afterwards cannot say what was decided at the
+time. The score is its own record under `<store>/scores/`, and it carries the batch and
+the period it was computed against, so the number can be reproduced. The extract is named
+rather than searched for: a score computed against whatever the store happened to hold
+that day is not one you can defend later.
 
 After each run a snapshot is saved to `output/history/YYYY-MM/`. The following month,
 once actuals are available:
@@ -816,6 +991,10 @@ misses 90 days becoming 110, which is the more expensive event.
 ```
 inventory_planning/
 ├── orchestrator.py            run_planning → run_policy_analysis → run_kpi_review
+├── cli.py                     `inventory-plan <dir-or-files...>` — routes by content
+├── workspace.py               one tenant's config + store + output, resolved in one place
+├── attribution.py             a name → an actor, and how the name was established
+├── provenance.py              run_id: what one run read, resolved and wrote
 ├── ingest_bridge.py           canonical frames → analytics column expectations
 ├── fx.py                      transaction currency → reporting currency, effective-dated
 ├── explain.py                 why a file routed where it did — per-contract scoring
@@ -829,8 +1008,28 @@ inventory_planning/
 │   ├── contract_tests.py      structural / semantic / reconciliation assertions
 │   ├── capabilities.py        capability resolution + degradation reporting
 │   └── intake.py              entry point: files in, canonical frames out
+├── store/                     ← the substrate: parquet + a ledger, outside the repo
+│   ├── landing.py             verbatim rows keyed by column index; rejects kept apart
+│   ├── fact_store.py          append-only batches, bitemporal, schema-versioned
+│   ├── ledger.py              which files a reading may use; void and restate
+│   ├── query.py               as-of reads over parquet via duckdb; `current` vs `history`
+│   ├── identity.py            which codes name the same material — read, not maintained
+│   ├── declarations.py        overrides and gate waivers: by / at / reason, expiring
+│   ├── migration.py           a maintenance plan pinned to the batches it was read against
+│   └── location.py            where the store lives, and why never inside the repo
+├── quality/                   ← four checkpoints, three severities
+│   ├── gates.py               BLOCK / SEVERE / WARN by whether a reader could tell
+│   ├── checks.py              intake, demand, forecast and plan checks
+│   └── health.py              every reservation attached to a run, ranked
+├── api/                       ← the HTTP surface and the four screens
+│   ├── app.py                 31 endpoints over what already exists
+│   └── web/                   plain ES modules, no build step
 ├── policy/                    ← should-be, levers, targets, suggestions
 │   ├── parameters.py          planning_parameters.md parser + scoped rule engine
+│   ├── profile.py             the eight axes a replenishment method is chosen on
+│   ├── edits.py               propose → diff → approve, pinned to a file digest
+│   ├── macro.py               the scalars, edited one line at a time
+│   ├── rules_edit.py          the rules, edited a block at a time
 │   ├── assemble.py            one per-SKU attribute frame the whole layer reads
 │   ├── crosscheck.py          source authority ranking + disagreement reporting
 │   ├── should_be.py           cycle + safety + buyer-owned pipeline, incoterm-aware
@@ -847,14 +1046,22 @@ inventory_planning/
 │   ├── safety_stock.py        MIT CTL combined variability formula
 │   ├── inventory_projector.py DOS-based excess detection
 │   ├── backlog_realization.py what share of the open order book actually ships
+│   ├── rounding.py            a countable quantity is a whole unit, and it says when
+│   ├── sop.py / sales_plan.py the S&OP worksheet out, and the reviewed plan back in
+│   ├── siop.py                supply and demand per period, in money
+│   ├── forecast_accuracy.py   did the plan we *published* hold up — not the backtest
 │   └── purchase_recommender.py  forecast consumption → net requirement
 ├── feedback/
 │   ├── snapshot.py            auto-saves planning state + the lead time planned on
-│   ├── collector.py           records actuals against prior snapshot
+│   ├── actuals.py             what happened, read from the store at scoring time
+│   ├── collector.py           records actuals against prior snapshot (hand-fed; see actuals)
 │   ├── drift.py               lead-time movement across months; drift vs source change
 │   └── loss.py                cumulative gap analysis + deviation attribution
-├── readers/                   legacy per-document readers (superseded by ingest/)
+├── readers/                   legacy per-document readers — superseded by ingest/, and
+│                              1,216 aliases behind it. The CLI warns when they are used
 └── reporting/
+    ├── workbook.py            the five-sheet workbook a meeting runs on
+    ├── read_workbook.py       the same file back, for the Results screen to render
     └── kpi_report.py          two-chapter review: what happened / what is coming
 
   (at repo root:)
@@ -882,6 +1089,22 @@ so quarantine and blocked stock read as available and the position is overstated
 exactly that much. Fixing it properly needs ERP node identifiers, stock status per
 location, and upstream/downstream relationships between nodes — not a location whitelist.
 
+Four more, each found by running this on a real extract rather than on `sample_data/`:
+
+- **Two implementations of intake.** `readers/` reads through `schema.py`, which carries
+  1,216 fewer aliases than the contracts. The CLI routes by contract now and warns when
+  the per-file flags are used, but the right end state is one alias table, not two.
+- **`by` is a form field nobody checks.** Every declaration, override, void and
+  restatement carries a name and a reason — 1,218 of them in one real store — and
+  nothing verifies any of it. The basis is recorded so that a verified name will be
+  distinguishable from a typed one the day there is one.
+- **A migration has no identity.** A store can be grepped for what has run against it,
+  not asked. And a layout change bumps `SCHEMA_VERSION` while a restatement does not —
+  the first migration that actually happened was the kind the stamp does not cover.
+- **Decisions are not queryable.** 2,430 snapshots keyed by their filename, with no
+  query layer. The feedback loop closes over them now; asking across them still means
+  opening files.
+
 ---
 
 ## Tests
@@ -890,12 +1113,37 @@ location, and upstream/downstream relationships between nodes — not a location
 python -m pytest tests/ -q
 ```
 
-285 tests, no network, no fixtures beyond `sample_data/`.
+1,525 tests, no network, no fixtures beyond `sample_data/`.
+
+CI runs a four-way matrix — Python 3.11 and 3.12 × pandas 2 and 3 — because production
+runs pandas 2 and development runs pandas 3, and the two disagree about enough that a
+suite green on one says nothing about the other. Three such divergences were found by
+hand in a single session before that matrix existed.
 
 ## Requirements
 
-- Python ≥ 3.9 — Windows, macOS and Linux. All text I/O states `encoding="utf-8"`
-  explicitly rather than inheriting the platform default, and a test enforces it:
-  `config/planning_parameters.md` is written in Chinese, so a locale-dependent read
-  fails outright on a Western Windows install (cp1252).
+- **Python ≥ 3.11** — Windows, macOS and Linux. Widening that means adding the version
+  to the CI matrix first: `>=3.9` was once claimed and the package did not meet it, in
+  two ways that were both invisible on a 3.12 developer machine.
+- All text I/O states `encoding="utf-8"` explicitly rather than inheriting the platform
+  default, and a test enforces it: `config/planning_parameters.md` is written in Chinese,
+  so a locale-dependent read fails outright on a Western Windows install (cp1252).
 - pandas, numpy, scipy, statsmodels, openpyxl, pyyaml
+- optional: `pyarrow` + `duckdb` for the store, `fastapi` + `uvicorn` for the front end.
+  Without them the pipeline still produces a plan and says what it could not do.
+
+---
+
+## Where the reasoning is written down
+
+Each of these is an argument, not a manual — they record why something is the way it is,
+including the positions that were revised and what they were protecting.
+
+| | |
+|---|---|
+| [DATA_LAYER.md](DATA_LAYER.md) | Why an append-only bitemporal store rather than an editable database; the three kinds of table; `run_id` as the pivot |
+| [INTERFACE.md](INTERFACE.md) | Where a human decision enters the pipeline; the four screens; the three seams a client/server split needs cut early |
+| [KNOWLEDGE_GRAPH.md](KNOWLEDGE_GRAPH.md) | The ontology the contracts already are, and what a graph layer would and would not add |
+| [TODO.md](TODO.md) | What is done, what is next, and what was found on the way |
+| [AUDIT.md](AUDIT.md) | Principles against code, checked rather than asserted |
+| [principles/sc-principles.md](principles/sc-principles.md) | MIT CTL concepts and formulas this is grounded in |

@@ -87,13 +87,31 @@ class TestARestatementIsAppendedNotApplied:
         assert len(ledger.batches()) == count
 
 
+def _plan_then_apply(store, command, *selector, to=None, by="tests", reason="r"):
+    """
+    The supported shape since the plan file landed: read the plan, then carry out that
+    file. `--apply` straight over a selector is refused now, because it re-ran the
+    selector against a store that had moved since the counts were read.
+    """
+    layer = ["--layer-to", to] if to else []
+    plan = store.root / "plans"
+    _run(store, command, *selector, *layer)
+    written = sorted(plan.glob("*.json"), key=lambda p: p.stat().st_mtime)[-1]
+    return _run(store, command, *layer, "--plan", str(written), "--apply",
+                "--by", by, "--reason", reason)
+
+
 class TestNothingIsWrittenWithoutApply:
 
     def test_a_plan_leaves_the_ledger_alone(self, store, capsys):
         before = store.ledger.path.read_text(encoding="utf-8")
         _run(store, "restate", "--source", "real.xlsx", "--layer-to", LAYER_PREPARED)
         assert store.ledger.path.read_text(encoding="utf-8") == before
-        assert "Nothing was written" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The plan file *is* written — it is the artefact being approved — so the line
+        # says nothing was changed rather than nothing was written.
+        assert "Nothing was changed" in out
+        assert "Plan written to" in out
 
     def test_the_plan_states_the_counts_that_are_the_diagnostic(self, store, capsys):
         _run(store, "restate", "--source", "real.xlsx", "--layer-to", LAYER_PREPARED)
@@ -120,15 +138,15 @@ class TestApplying:
 
     def test_restating_by_load_time_marks_only_the_older_batches(self, store):
         cutoff = store.ledger.batches()[1]["transaction_time"]
-        _run(store, "restate", "--loaded-before", cutoff, "--layer-to", LAYER_PREPARED,
-             "--apply", "--by", "tests", "--reason", "written by the old writer")
+        _plan_then_apply(store, "restate", "--loaded-before", cutoff,
+                         to=LAYER_PREPARED, reason="written by the old writer")
         layers = [b["frame_layer"] for b in store.ledger.batches()]
         assert layers.count(LAYER_PREPARED) == 1
         assert layers.count(LAYER_CANONICAL) == 2
 
     def test_voiding_by_source_withdraws_only_those(self, store):
-        _run(store, "void", "--source", "sample_data", "--apply", "--by", "tests",
-             "--reason", "synthetic data in a store of real facts")
+        _plan_then_apply(store, "void", "--source", "sample_data",
+                         reason="synthetic data in a store of real facts")
         assert len(store.ledger.batches()) == 2
         withdrawn = [b for b in store.ledger.batches(include_void=True)
                      if b["status"] == STATUS_VOID]
@@ -141,13 +159,12 @@ class TestApplying:
 
         query = FactQuery(store.root)
         cutoff = store.ledger.batches()[1]["transaction_time"]
-        _run(store, "restate", "--loaded-before", cutoff, "--layer-to", LAYER_PREPARED,
-             "--apply", "--by", "tests", "--reason", "r")
+        _plan_then_apply(store, "restate", "--loaded-before", cutoff, to=LAYER_PREPARED)
         with pytest.raises(MixedLayers):
             query.current("inventory")
 
-        _run(store, "restate", "--layer", LAYER_CANONICAL, "--layer-to", LAYER_PREPARED,
-             "--apply", "--by", "tests", "--reason", "all of it predates the change")
+        _plan_then_apply(store, "restate", "--layer", LAYER_CANONICAL,
+                         to=LAYER_PREPARED, reason="all of it predates the change")
         assert query.select("inventory").layers == [LAYER_PREPARED]
         assert len(query.current("inventory")) == 3
 

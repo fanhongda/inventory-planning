@@ -32,15 +32,99 @@ def workspace(tmp_path):
 
 
 @pytest.fixture
-def client(workspace):
+def client(workspace, tmp_path):
+    """
+    All three directories disposable, not two.
+
+    `output_dir` used to be left unset, which resolved to the repository's own
+    `./output` — so a test asserting "no runs here" was asserting something about the
+    developer's machine. It passed because that directory happened to hold no run under
+    the current rules, and failed the moment one did. The store path was always
+    isolated; this is the other half, and it is what INTERFACE.md §7's workspace seam
+    exists to make sayable.
+    """
     config, store = workspace
-    return TestClient(create_app(config_dir=config, store_root=store))
+    return TestClient(create_app(config_dir=config, store_root=store,
+                                 output_dir=tmp_path / "output"))
 
 
 def _upload(client, path=SAMPLE, name=None):
     with open(path, "rb") as fh:
         return client.post("/uploads",
                            files={"file": (name or path.name, fh.read(), "text/csv")})
+
+
+class TestTheWorkspaceIsSetUpFromTheBrowser:
+    """
+    The target user never opens a terminal, so a workspace nobody has prepared had to be
+    fixable from the page. Before this, a server started on an unprepared tenant
+    answered every endpoint as though the *repository's* config were the tenant's — a
+    wrong answer that looked right, which is worse than the error it replaced.
+    """
+
+    @pytest.fixture
+    def fresh(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INVENTORY_PLANNING_CONFIG", str(tmp_path / "cfg"))
+        monkeypatch.setenv("INVENTORY_PLANNING_OUTPUT", str(tmp_path / "out"))
+        monkeypatch.setenv("INVENTORY_PLANNING_STORE", str(tmp_path / "store"))
+        return TestClient(create_app(tenant="acme"))
+
+    def test_an_unprepared_workspace_says_it_is_not_ready(self, fresh):
+        body = fresh.get("/workspace").json()
+        assert body["tenant"] == "acme"
+        assert body["ready"] is False
+
+    def test_it_does_not_quietly_serve_the_repositorys_rules(self, fresh):
+        """
+        The defect this replaced. `service.config_dir` kept the raw argument and was
+        None when unset, so four endpoints fell back to the package's own config and
+        `--tenant prod` served the wrong rule set while reporting success.
+        """
+        response = fresh.get("/policy")
+        assert response.status_code == 404
+        assert "acme" in response.json()["detail"]
+
+    def test_one_call_prepares_it(self, fresh):
+        body = fresh.post("/workspace/setup", json={"by": "jfanhon"}).json()
+        assert body["ready"] is True
+        assert any("seeded" in line for line in body["did"])
+        assert fresh.get("/workspace").json()["ready"] is True
+        assert fresh.get("/policy").status_code == 200
+
+    def test_it_is_safe_to_click_twice(self, fresh):
+        """
+        A second click must not put a rule set somebody has edited back to the default.
+        """
+        fresh.post("/workspace/setup", json={"by": "jfanhon"})
+        rules = Path(fresh.get("/workspace").json()["config_dir"]) \
+            / "planning_parameters.md"
+        rules.write_text(rules.read_text(encoding="utf-8") + "\n<!-- edited -->\n",
+                         encoding="utf-8")
+
+        again = fresh.post("/workspace/setup", json={"by": "jfanhon"}).json()
+        assert any("left untouched" in line for line in again["did"])
+        assert "<!-- edited -->" in rules.read_text(encoding="utf-8")
+
+    def test_it_must_name_who_is_doing_it(self, fresh):
+        assert fresh.post("/workspace/setup", json={}).status_code == 400
+
+    def test_the_tenant_is_the_servers_and_never_the_requests(self, fresh):
+        """
+        The difference between an action and a hole: a request that could name its own
+        tenant would be a request that writes a directory tree wherever the resolver
+        resolves to.
+        """
+        body = fresh.post("/workspace/setup",
+                          json={"by": "jfanhon", "tenant": "somewhere-else"}).json()
+        assert body["tenant"] == "acme"
+        assert "somewhere-else" not in body["config_dir"]
+
+    def test_a_named_tenant_keeps_nothing_in_the_working_tree(self, fresh):
+        from inventory_planning.store.location import inside_repo
+
+        body = fresh.get("/workspace").json()
+        for key in ("config_dir", "store_root", "output_dir"):
+            assert not inside_repo(Path(body[key]))
 
 
 class TestWhatThePipelineCanRead:
@@ -571,14 +655,15 @@ class TestPolicyIsShownAndNotEdited:
         assert "safety_stock_exposure" in body["conventions"]
         assert "days_per_year" in body["conventions"]
 
-    def test_it_says_hit_counts_are_not_retained_rather_than_showing_none(self, client):
+    def test_with_no_run_behind_them_it_says_so_rather_than_showing_zeros(self, client):
         """
-        A rule's reach is computed during a run and printed, never stored. Showing an
-        empty count would read as "this rule matched nothing", which is a finding.
+        A rule's reach is a question about a frame of SKUs and there is no frame here,
+        so it takes a run to answer. An empty count would read as "this rule matched
+        nothing", which is a finding rather than a silence.
         """
         body = client.get("/policy").json()
         assert body["hits"] is None
-        assert "not retained" in body["note"]
+        assert "takes a run" in body["note"]
 
     def test_no_endpoint_writes_policy(self, client):
         for method in ("post", "put", "patch", "delete"):
@@ -601,6 +686,674 @@ class TestPolicyIsShownAndNotEdited:
         names = {s["name"] for s in client.get("/policy/macro").json()["settings"]}
         assert "days_per_year" in names
         assert not {n for n in names if "working" in n or "growth" in n}
+
+
+class TestTheQualityGate:
+    """
+    The checkpoint that catches this pipeline's actual failure: not a crash, but a
+    complete report built on a join that matched nothing. It is visible at intake and
+    invisible in the report it would go on to write, which is why it belongs in front of
+    the person who just uploaded the file rather than in a run log an hour later.
+    """
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("quality_gates.json", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    @pytest.fixture
+    def disagreeing(self, tmp_path):
+        """An inventory export whose item numbers meet nothing else — the real case."""
+        import pandas as pd
+
+        frame = pd.read_csv(SAMPLE)
+        frame["Item Code"] = [f"ZZ-{9000 + i}" for i in range(len(frame))]
+        path = tmp_path / "inventory.csv"
+        frame.to_csv(path, index=False)
+        return path
+
+    def test_with_nothing_landed_it_says_so_rather_than_passing(self, client):
+        """
+        A clean result on an empty store would read as "your data is fine". The gate
+        compares documents against each other, and one document cannot disagree with
+        itself.
+        """
+        body = client.get("/gates").json()
+        assert body["ran"] is False
+        assert body["passed"] is None
+        assert "nothing to check" in body["note"]
+
+    def test_a_clean_set_passes_with_no_findings(self, client):
+        for name in ("inventory", "sales_history", "item_master"):
+            _upload(client, Path(f"sample_data/{name}.csv"))
+        body = client.get("/gates").json()
+        assert body["ran"] is True and body["passed"] is True
+        assert body["findings"] == []
+
+    def test_an_item_number_that_meets_nothing_blocks(self, client, disagreeing):
+        _upload(client, disagreeing)
+        _upload(client, Path("sample_data/sales_history.csv"))
+        _upload(client, Path("sample_data/item_master.csv"))
+
+        body = client.get("/gates").json()
+        assert body["passed"] is False
+        assert body["counts"]["block"] == 1
+        finding, = body["findings"]
+        assert finding["check"] == "sku_agreement"
+        assert finding["severity"] == "block"
+        assert finding["doc_type"] == "inventory"
+        # what / why / fix, all three: a finding that cannot say what to do about it is
+        # a finding that should not stop a run.
+        assert finding["what"] and finding["why"] and finding["fix"]
+
+    def test_a_clean_answer_never_claims_the_run_will_pass(self, client):
+        """
+        Three of the four gates need a time series, a forecast and a position, none of
+        which exist before the run. "Nothing at intake stops this" is the claim that can
+        be made here; the page has the other three by name so it is not left to inference.
+        """
+        for name in ("inventory", "sales_history", "item_master"):
+            _upload(client, Path(f"sample_data/{name}.csv"))
+        body = client.get("/gates").json()
+        assert {g["stage"] for g in body["later_stages"]} == {"demand", "forecast", "plan"}
+        assert all(g["needs"] and g["checks"] for g in body["later_stages"])
+
+
+class TestWaivingOneCheck:
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("quality_gates.json", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    @pytest.fixture
+    def blocked(self, client, tmp_path):
+        import pandas as pd
+
+        frame = pd.read_csv(SAMPLE)
+        frame["Item Code"] = [f"ZZ-{9000 + i}" for i in range(len(frame))]
+        path = tmp_path / "inventory.csv"
+        frame.to_csv(path, index=False)
+        _upload(client, path)
+        _upload(client, Path("sample_data/sales_history.csv"))
+        _upload(client, Path("sample_data/item_master.csv"))
+        return client
+
+    def _waive(self, client, **body):
+        return client.post("/gates/sku_agreement/waivers",
+                           json={"doc_type": "inventory", **body})
+
+    def test_a_waiver_downgrades_the_finding_and_leaves_it_visible(self, blocked):
+        assert self._waive(blocked, expires="2027-12-31", by="jfanhon",
+                           reason="this DC stocks spares nothing else sells"
+                           ).status_code == 200
+
+        body = blocked.get("/gates").json()
+        assert body["passed"] is True
+        finding, = body["findings"]
+        assert finding["severity"] == "warn"
+        assert finding["waived"] is True
+        assert finding["waived_by"] == "jfanhon"
+        assert finding["waived_until"] == "2027-12-31"
+
+    def test_it_lands_as_an_ordinary_declaration_a_headless_run_reads(
+            self, blocked, workspace):
+        """
+        The governing rule. A waiver made by clicking has to be the same statement, in
+        the same place, as one typed into the file — otherwise the run and the screen
+        disagree about what has been declared.
+        """
+        from inventory_planning.quality.gates import BLOCK, Finding, GateReport
+
+        self._waive(blocked, expires="2027-12-31", by="jfanhon", reason="disjoint")
+        loaded = Declarations.load(workspace[0])
+        report = loaded.waive(GateReport("intake", [Finding(
+            stage="intake", check="sku_agreement", severity=BLOCK,
+            what="w", why="y", fix="f", evidence={"doc_type": "inventory"})]))
+        assert not report.blocking
+
+    def test_a_waiver_must_expire(self, blocked):
+        response = self._waive(blocked, by="jfanhon", reason="disjoint")
+        assert response.status_code == 400
+        assert "permanently disabled check" in response.json()["detail"]
+
+    def test_an_expiry_already_past_is_refused_rather_than_written(self, blocked):
+        """It would write cleanly, apply to nothing, and read as a waiver in force."""
+        response = self._waive(blocked, expires="2020-01-01", by="jfanhon",
+                               reason="disjoint")
+        assert response.status_code == 400
+        assert "in the past" in response.json()["detail"]
+        assert blocked.get("/gates").json()["passed"] is False
+
+    def test_it_must_say_why_and_who(self, blocked):
+        assert self._waive(blocked, expires="2027-12-31", by="jfanhon"
+                           ).status_code == 400
+        assert self._waive(blocked, expires="2027-12-31", reason="disjoint"
+                           ).status_code == 400
+
+    def test_a_waiver_on_one_document_leaves_the_others_checked(self, blocked,
+                                                                workspace):
+        """
+        The whole reason this is not `allow_degraded`: waiving the agreement finding on
+        a stock snapshot must not wave through an open PO mapped to a money column. The
+        scope has to be in the file, because the file is what the run reads.
+        """
+        from inventory_planning.quality.gates import BLOCK, Finding, GateReport
+
+        self._waive(blocked, expires="2027-12-31", by="jfanhon", reason="disjoint")
+        waiver, = Declarations.load(workspace[0]).waivers
+        assert waiver.doc_type == "inventory"
+
+        elsewhere = GateReport("intake", [Finding(
+            stage="intake", check="sku_agreement", severity=BLOCK,
+            what="w", why="y", fix="f", evidence={"doc_type": "open_po"})])
+        assert Declarations.load(workspace[0]).waive(elsewhere).blocking
+
+    def test_a_malformed_expiry_is_a_400_not_a_500(self, blocked):
+        response = self._waive(blocked, expires="next tuesday", by="jfanhon",
+                               reason="disjoint")
+        assert response.status_code == 400
+
+
+class TestEditingARule:
+    """
+    The same propose-then-approve contract as a scalar, over a block instead of a
+    value. One endpoint carrying the change rather than three shaped like HTTP verbs —
+    the shape is what has to survive the move to a server, and it is worth more than
+    the REST tidiness of a `DELETE`.
+    """
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("planning_parameters.md", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    def _put(self, client, **body):
+        return client.put("/policy/rules", json=body)
+
+    def _rules(self, client):
+        return {r["rule_id"]: r for r in client.get("/policy").json()["rules"]}
+
+    def test_a_proposal_returns_the_diff_and_writes_nothing(self, client, workspace):
+        before = (workspace[0] / "planning_parameters.md").read_text(encoding="utf-8")
+        body = self._put(client, action="edit", rule_id="R-001",
+                         changes={"set": {"review_period_days": 14}}).json()
+
+        assert body["applied"] is False
+        assert "-  review_period_days: 7" in body["diff"]
+        assert "+  review_period_days: 14" in body["diff"]
+        assert (workspace[0] / "planning_parameters.md").read_text(
+            encoding="utf-8") == before
+
+    def test_approving_the_diff_applies_it(self, client):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        body = self._put(client, action="edit", rule_id="R-001",
+                         changes={"set": {"review_period_days": 14}}, apply=True,
+                         reason="ordering cost rose", by="jfanhon",
+                         basis=proposal["basis"]).json()
+
+        assert body["applied"] is True
+        assert self._rules(client)["R-001"]["sets"] == {"review_period_days": 14}
+
+    def test_every_proposal_says_where_the_rule_will_sit(self, client):
+        """
+        Half of what a rule does is which rules come after it, and that is not readable
+        off the diff.
+        """
+        body = self._put(client, action="edit", rule_id="R-001",
+                         changes={"set": {"review_period_days": 14}}).json()
+        assert body["order"] == ["R-001", "R-002", "R-003", "R-004"]
+
+    def test_a_new_rule_is_appended_last_and_says_so(self, client):
+        rule = {"rule_id": "R-009", "name": "DDP items", "scope": 'incoterm == "DDP"',
+                "set": {"service_level": 0.92}, "rationale": "risk sits with them",
+                "owner": "FHD"}
+        proposal = self._put(client, action="add", rule=rule).json()
+        assert proposal["order"][-1] == "R-009"
+        assert "wins over every rule above it" in proposal["note"]
+
+        self._put(client, action="add", rule=rule, apply=True, reason="two new DDP "
+                  "suppliers", by="jfanhon", basis=proposal["basis"])
+        assert "R-009" in self._rules(client)
+
+    def test_a_removal_shows_what_falls_back(self, client):
+        proposal = self._put(client, action="remove", rule_id="R-002").json()
+        assert "falls back to the rule above it" in proposal["note"]
+        assert "R-002" not in proposal["order"]
+
+        self._put(client, action="remove", rule_id="R-002", apply=True,
+                  reason="actuators moved to the other DC", by="jfanhon",
+                  basis=proposal["basis"])
+        assert "R-002" not in self._rules(client)
+
+    def test_a_file_that_moved_since_the_diff_is_a_refusal(self, client, workspace):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        path = workspace[0] / "planning_parameters.md"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "date: 2026-08-02", "date: 2026-08-03", 1), encoding="utf-8")
+
+        response = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}, apply=True,
+                             reason="r", by="jfanhon", basis=proposal["basis"])
+        assert response.status_code == 400
+        assert "has changed since that diff" in response.json()["detail"]
+        assert self._rules(client)["R-001"]["sets"] == {"review_period_days": 7}
+
+    def test_an_apply_without_a_reason_or_a_name_is_refused(self, client):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        for missing in ({"by": "jfanhon"}, {"reason": "because"}):
+            response = self._put(client, action="edit", rule_id="R-001",
+                                 changes={"set": {"review_period_days": 14}},
+                                 apply=True, basis=proposal["basis"], **missing)
+            assert response.status_code == 400
+
+    def test_a_scope_the_engine_cannot_parse_is_refused(self, client):
+        response = self._put(client, action="edit", rule_id="R-001",
+                             changes={"scope": 'abc_class === "A"'})
+        assert response.status_code == 400
+        assert "invalid scope" in response.json()["detail"]
+
+    def test_the_rule_id_cannot_be_renamed(self, client):
+        """The manifest records hits against it, so a rename detaches every count."""
+        response = self._put(client, action="edit", rule_id="R-001",
+                             changes={"rule_id": "R-099"})
+        assert response.status_code == 400
+        assert "not editable" in response.json()["detail"]
+
+    def test_an_unknown_action_is_a_400(self, client):
+        assert self._put(client, action="reorder", rule_id="R-001").status_code == 400
+
+    def test_the_change_is_listed_on_the_policy_screen_with_its_reason(self, client):
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        self._put(client, action="edit", rule_id="R-001",
+                  changes={"set": {"review_period_days": 14}}, apply=True,
+                  reason="ordering cost rose", by="jfanhon", basis=proposal["basis"])
+
+        entry, = client.get("/policy").json()["changes"]
+        assert entry["rule_id"] == "R-001" and entry["action"] == "edit"
+        assert entry["by"] == "jfanhon" and entry["reason"] == "ordering cost rose"
+
+    def test_a_rule_edit_does_not_show_up_as_a_macro_change(self, client):
+        """One log, two editors, told apart by `kind` rather than by two files."""
+        proposal = self._put(client, action="edit", rule_id="R-001",
+                             changes={"set": {"review_period_days": 14}}).json()
+        self._put(client, action="edit", rule_id="R-001",
+                  changes={"set": {"review_period_days": 14}}, apply=True,
+                  reason="r", by="jfanhon", basis=proposal["basis"])
+        assert client.get("/policy/macro").json()["changes"] == []
+        assert len(client.get("/policy").json()["changes"]) == 1
+
+
+class TestEditingAScalar:
+    """
+    Two requests, not a stored proposal: the first asks what a change would do, the
+    second approves the diff it was shown. Nothing is kept on the server between them —
+    INTERFACE.md rules out interface-only state — so what ties them together is the
+    digest of the file the diff was made against.
+    """
+
+    @pytest.fixture
+    def client(self, workspace, tmp_path):
+        import shutil
+
+        config, store = workspace
+        for name in ("planning_parameters.md", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=tmp_path / "out"))
+
+    def _put(self, client, **body):
+        return client.put("/policy/macro", json=body)
+
+    def test_a_proposal_returns_the_diff_and_writes_nothing(self, client, workspace):
+        before = (workspace[0] / "planning_parameters.md").read_text(encoding="utf-8")
+        body = self._put(client, name="days_per_year", value=250).json()
+
+        assert body["applied"] is False
+        assert body["from"] == 365 and body["to"] == 250
+        assert "-days_per_year: 365" in body["diff"]
+        assert "+days_per_year: 250" in body["diff"]
+        assert (workspace[0] / "planning_parameters.md").read_text(
+            encoding="utf-8") == before
+
+    def test_the_proposal_says_what_the_change_would_move(self, client):
+        """
+        These settings cost wildly different amounts. `location_name` is a label;
+        `cycle_stock_basis` halves or doubles the cycle stock in every figure, and a
+        form that presented them identically would be hiding that.
+        """
+        body = self._put(client, name="cycle_stock_basis", value="average").json()
+        assert "cycle stock" in body["impact"]
+        label = self._put(client, name="location_name", value="DC North").json()
+        assert "no figure moves" in label["impact"]
+
+    def test_approving_the_diff_applies_it(self, client, workspace):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        body = self._put(client, name="days_per_year", value=250, apply=True,
+                         reason="finance counts working days", by="jfanhon",
+                         basis=proposal["basis"]).json()
+
+        assert body["applied"] is True
+        assert "days_per_year: 250" in (
+            workspace[0] / "planning_parameters.md").read_text(encoding="utf-8")
+        assert proposal["basis"] != body["digest"]
+
+    def test_a_file_that_moved_since_the_diff_is_a_refusal(self, client, workspace):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        path = workspace[0] / "planning_parameters.md"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "transit_share_of_lt: 0.45", "transit_share_of_lt: 0.5"), encoding="utf-8")
+
+        response = self._put(client, name="days_per_year", value=250, apply=True,
+                             reason="r", by="jfanhon", basis=proposal["basis"])
+        assert response.status_code == 400
+        assert "has changed since that diff" in response.json()["detail"]
+        assert "days_per_year: 365" in path.read_text(encoding="utf-8")
+
+    def test_an_apply_without_a_reason_or_a_name_is_refused(self, client):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        for missing in ({"by": "jfanhon"}, {"reason": "because"}):
+            response = self._put(client, name="days_per_year", value=250, apply=True,
+                                 basis=proposal["basis"], **missing)
+            assert response.status_code == 400
+
+    def test_a_value_the_engine_would_ignore_is_refused_with_the_alternatives(
+            self, client):
+        response = self._put(client, name="pipeline_basis", value="incoterm_awre")
+        assert response.status_code == 400
+        assert "incoterm_aware" in response.json()["detail"]
+
+    def test_a_setting_the_pipeline_does_not_read_is_not_editable(self, client):
+        assert self._put(client, name="echelon_level", value=2).status_code == 400
+
+    def test_the_listing_says_which_settings_a_form_may_write(self, client):
+        settings = {s["name"]: s for s in client.get("/policy/macro").json()["settings"]}
+        assert settings["days_per_year"]["editable"] is True
+        assert settings["cycle_stock_basis"]["choices"] == ["peak", "average"]
+        # Derived readings are not settings: there is nothing in a file to write back.
+        assert settings["fx_currencies"]["editable"] is False
+
+    def test_the_change_is_listed_afterwards_with_its_reason(self, client):
+        proposal = self._put(client, name="days_per_year", value=250).json()
+        self._put(client, name="days_per_year", value=250, apply=True,
+                  reason="finance counts working days", by="jfanhon",
+                  basis=proposal["basis"])
+
+        body = client.get("/policy/macro").json()
+        entry, = body["changes"]
+        assert entry["by"] == "jfanhon" and entry["to"] == 250
+        assert entry["reason"] == "finance counts working days"
+        assert {s["name"]: s["value"] for s in body["settings"]}["days_per_year"] == 250
+
+
+class TestWhatEachRuleReached:
+    """
+    The counts come from a run, are labelled with the run they came from, and are shown
+    only against the rules that produced them. A count carried over from a different
+    rule set would be attached to rules that never produced it, which is worse than the
+    blank it replaced.
+    """
+
+    @pytest.fixture
+    def rules_file(self, workspace):
+        import shutil
+
+        config, _ = workspace
+        for name in ("planning_parameters.md", "node_config.json", "fx_rates.json"):
+            shutil.copy(Path("config") / name, config / name)
+        return config / "planning_parameters.md"
+
+    def _run_under(self, output_dir, rules_file, hits):
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        manifest = RunManifest.begin(output_dir=output_dir, policy_file=rules_file)
+        manifest.record_rules([h["rule_id"] for h in hits])
+        manifest.record_rule_hits([_FakeHit(h) for h in hits])
+        RunRegistry(output_dir).save(manifest)
+        return manifest
+
+    def _client(self, workspace, output_dir):
+        config, store = workspace
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=output_dir))
+
+    def test_the_counts_come_back_keyed_by_rule_and_named_with_their_run(
+            self, workspace, rules_file, tmp_path):
+        out = tmp_path / "out"
+        run = self._run_under(out, rules_file, [
+            {"rule_id": "R-001", "matched": 12, "effective": 9},
+            {"rule_id": "R-002", "matched": 3, "effective": 3},
+        ])
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"]["run_id"] == run.run_id
+        assert body["hits"]["rules"]["R-001"]["matched"] == 12
+        assert body["hits"]["rules"]["R-001"]["effective"] == 9
+        assert run.run_id in body["note"]
+
+    def test_a_rule_edited_since_the_last_run_shows_no_counts_at_all(
+            self, workspace, rules_file, tmp_path):
+        """
+        Not stale ones, and not zeros. The digest of the file is what the run is found
+        by, so an edit of any kind — including one that leaves every rule id in place —
+        detaches the counts from the rules on screen.
+        """
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        rules_file.write_text(rules_file.read_text(encoding="utf-8")
+                              + "\n<!-- a comment -->\n", encoding="utf-8")
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"] is None
+        assert "edited since the last one" in body["note"]
+
+    def test_a_rule_the_run_never_reported_is_absent_rather_than_zero(
+            self, workspace, rules_file, tmp_path):
+        """
+        The join is by rule id and the caller holds the rules, so a rule with nothing
+        recorded against it is visibly blank instead of a row that quietly reports
+        somebody else's number.
+        """
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        body = self._client(workspace, out).get("/policy").json()
+
+        ids = {r["rule_id"] for r in body["rules"]}
+        assert "R-002" in ids and "R-002" not in body["hits"]["rules"]
+
+    def test_a_run_that_kept_no_reach_is_not_reported_as_an_edit(
+            self, workspace, rules_file, tmp_path):
+        """
+        Every run from before the reach was retained lands here — on the first look at
+        an existing output directory, all of them. Saying the file has been edited
+        would send someone hunting for a change to a file nobody has touched.
+        """
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        out = tmp_path / "out"
+        manifest = RunManifest.begin(output_dir=out, policy_file=rules_file)
+        manifest.record_rules(["R-001"])
+        RunRegistry(out).save(manifest)
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"] is None
+        assert manifest.run_id in body["note"]
+        assert "recorded no per-rule reach" in body["note"]
+        assert "edited" not in body["note"]
+
+    def test_a_miss_inside_a_bounded_scan_does_not_claim_the_file_changed(
+            self, workspace, rules_file, tmp_path, monkeypatch):
+        """
+        The search reads back a bounded number of manifests. A matching run older than
+        that bound is not found, and "not found" is not "does not exist" — the claim
+        the message may make is only the one the search established.
+        """
+        from inventory_planning.api import app as app_module
+
+        monkeypatch.setattr(app_module, "_REACH_SCAN", 2)
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        other = tmp_path / "other_rules.md"
+        other.write_text(rules_file.read_text(encoding="utf-8") + "\n<!-- x -->\n",
+                         encoding="utf-8")
+        for _ in range(3):
+            self._run_under(out, other, [{"rule_id": "R-001", "matched": 1,
+                                          "effective": 1}])
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert body["hits"] is None
+        assert "2 most recent runs" in body["note"]
+        assert "edited" not in body["note"]
+
+    def test_with_every_run_searched_and_none_matching_it_does_say_edited(
+            self, workspace, rules_file, tmp_path):
+        """The one case where the claim about history is one the search can make."""
+        out = tmp_path / "out"
+        self._run_under(out, rules_file, [{"rule_id": "R-001", "matched": 12,
+                                           "effective": 9}])
+        rules_file.write_text(rules_file.read_text(encoding="utf-8")
+                              + "\n<!-- a comment -->\n", encoding="utf-8")
+        body = self._client(workspace, out).get("/policy").json()
+
+        assert "Every recorded run was searched" in body["note"]
+        assert "edited since the last one" in body["note"]
+
+
+class _FakeHit:
+    """`policy.parameters.RuleHit` as `record_rule_hits` reads it — duck-typed."""
+
+    class _Rule:
+        def __init__(self, rule_id):
+            self.rule_id, self.name, self.scope = rule_id, "", "x == 1"
+            self.overrides = {"review_period_days": 7}
+
+    def __init__(self, spec):
+        self.rule = self._Rule(spec["rule_id"])
+        self.matched = spec["matched"]
+        self.effective = spec["effective"]
+        self.sample_skus = ["A-1"]
+        self.unavailable_columns = []
+        self.overrides_earlier = {}
+
+
+class TestWhatARunProduced:
+    """
+    The results screen's half of the API. The manifest is the index rather than a
+    directory listing: it records what *this run* wrote, where a listing would mix in
+    every other run's files and could not tell them apart once a directory holds a
+    month of them.
+    """
+
+    @pytest.fixture
+    def run(self, tmp_path):
+        import pandas as pd
+
+        from inventory_planning.provenance import RunManifest, RunRegistry
+        from inventory_planning.reporting import workbook as writer
+
+        out = tmp_path / "out"
+        out.mkdir()
+        frame = pd.DataFrame({"sku": ["A-1", "A-2"],
+                              "actual_value": [52385.8, 17061.03]})
+        book = out / "planning_x.xlsx"
+        with pd.ExcelWriter(book, engine="openpyxl") as excel:
+            frame.to_excel(excel, sheet_name="Inventory", index=False)
+            writer._format_sheet(excel.book["Inventory"], frame, "Inventory")
+        (out / "run_health_x.md").write_text("# what this run rests on\n",
+                                             encoding="utf-8")
+
+        manifest = RunManifest.begin(output_dir=out)
+        manifest.record_output(book)
+        manifest.record_output(out / "run_health_x.md")
+        manifest.record_output(out / "gone.csv")
+        RunRegistry(out).save(manifest)
+        return out, manifest.run_id
+
+    @pytest.fixture
+    def client(self, workspace, run):
+        config, store = workspace
+        return TestClient(create_app(config_dir=config, store_root=store,
+                                     output_dir=run[0]))
+
+    def test_the_outputs_come_from_the_manifest_with_their_kind(self, client, run):
+        body = client.get(f"/runs/{run[1]}/outputs").json()
+        by_name = {o["name"]: o for o in body["outputs"]}
+        assert by_name["planning_x.xlsx"]["kind"] == "workbook"
+        assert by_name["run_health_x.md"]["kind"] == "text"
+        assert "does not recompute" in body["note"]
+
+    def test_a_file_the_run_recorded_but_that_is_gone_says_so(self, client, run):
+        """
+        Not dropped from the list. The manifest still says what was written, and a
+        screen that quietly listed one fewer file would be hiding the disappearance.
+        """
+        by_name = {o["name"]: o for o in
+                   client.get(f"/runs/{run[1]}/outputs").json()["outputs"]}
+        assert by_name["gone.csv"]["present"] is False
+        assert by_name["planning_x.xlsx"]["present"] is True
+        assert client.get(
+            f"/runs/{run[1]}/outputs/gone.csv/text").status_code == 410
+
+    def test_the_sheets_and_one_window_of_one(self, client, run):
+        listed = client.get(f"/runs/{run[1]}/outputs/planning_x.xlsx/sheets").json()
+        assert [s["name"] for s in listed["sheets"]] == ["Inventory"]
+
+        sheet = client.get(
+            f"/runs/{run[1]}/outputs/planning_x.xlsx/sheets/Inventory").json()
+        assert sheet["columns"] == ["sku", "actual_value"]
+        # Under the workbook's own `#,##0`, which is the whole point of the screen.
+        assert sheet["rows"][0] == ["A-1", "52,386"]
+
+    def test_a_text_output_comes_back_verbatim(self, client, run):
+        body = client.get(f"/runs/{run[1]}/outputs/run_health_x.md/text").json()
+        assert body["text"] == "# what this run rests on\n"
+        assert body["truncated"] is False
+
+    def test_a_name_the_run_did_not_write_is_refused(self, client, run, tmp_path):
+        """
+        The name is matched against the manifest's own list rather than joined onto a
+        directory, so this is not a file-read endpoint with a path in it.
+        """
+        secret = tmp_path / "out" / "secret.csv"
+        secret.write_text("not this run's", encoding="utf-8")
+        response = client.get(f"/runs/{run[1]}/outputs/secret.csv/text")
+        assert response.status_code == 404
+        assert "did not write" in response.json()["detail"]
+
+    def test_a_path_that_climbs_out_is_refused(self, client, run):
+        for name in ("../../etc/passwd", "..%2F..%2Fetc%2Fpasswd", "/etc/passwd"):
+            assert client.get(
+                f"/runs/{run[1]}/outputs/{name}/text").status_code in (404, 400)
+
+    def test_an_unknown_run_is_404(self, client):
+        assert client.get("/runs/nope/outputs").status_code == 404
+
+    def test_the_workbook_downloads_as_itself(self, client, run):
+        response = client.get(f"/runs/{run[1]}/outputs/planning_x.xlsx/download")
+        assert response.status_code == 200
+        assert response.content[:2] == b"PK"
 
 
 class TestRunsAndTheirDifferences:

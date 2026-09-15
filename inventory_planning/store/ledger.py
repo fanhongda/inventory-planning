@@ -30,7 +30,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..attribution import SELF_ASSERTED, resolve_actor
+
 LEDGER_NAME = "batches.jsonl"
+
+
+def _without_empty_basis(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Drop `by_basis` when there is none to record.
+
+    A marker on every record distinguishes nothing, and self-asserted is what every
+    record in the store already is. The field appears the day a token fills a name,
+    which is the only day it could have meant anything.
+    """
+    if body.get("by_basis") is None:
+        body.pop("by_basis", None)
+    return body
 
 STATUS_ACTIVE = "active"
 STATUS_VOID = "void"
@@ -107,9 +122,12 @@ class RestateRecord:
     restated_by: str = ""
     reason: str = ""
     op: str = "restate"
+    # How the name was established, written only when it was not self-asserted — which
+    # is every record so far, so this changes nothing on disk today. See `identity.py`.
+    by_basis: Optional[str] = None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
+        return json.dumps(_without_empty_basis(asdict(self)), ensure_ascii=False)
 
 
 @dataclass
@@ -121,9 +139,10 @@ class VoidRecord:
     voided_by: str = ""
     reason: str = ""
     op: str = "void"
+    by_basis: Optional[str] = None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
+        return json.dumps(_without_empty_basis(asdict(self)), ensure_ascii=False)
 
 
 class BatchLedger:
@@ -179,14 +198,24 @@ class BatchLedger:
         return out
 
     def restate(self, batch_id: str, frame_layer: str, reason: str = "",
-                by: str = "") -> RestateRecord:
-        """Say what layer a batch holds, after the fact. Appended, never applied."""
+                by=None) -> RestateRecord:
+        """
+        Say what layer a batch holds, after the fact. Appended, never applied.
+
+        `by` has no default any more. It used to default to `""`, so enforcement lived
+        entirely at the four entry points and any caller that went round one of them
+        wrote an unattributed record in silence — the same shape as an argparse default
+        that outranks a tenant: **the default is the hole.** A missing name is now a
+        refusal here, where it cannot be got round.
+        """
+        actor = resolve_actor(by, what=f"restating batch {batch_id}")
         record = RestateRecord(
             batch_id=batch_id,
             frame_layer=frame_layer,
             restated_at=datetime.now().isoformat(timespec="seconds"),
-            restated_by=by,
+            restated_by=actor.name,
             reason=reason,
+            by_basis=None if actor.basis == SELF_ASSERTED else actor.basis,
         )
         self.append(record)
         return record
@@ -206,12 +235,15 @@ class BatchLedger:
         """
         return {e["batch_id"]: e for e in self._lines() if e.get("op") == "void"}
 
-    def void(self, batch_id: str, reason: str = "", by: str = "") -> VoidRecord:
+    def void(self, batch_id: str, reason: str = "", by=None) -> VoidRecord:
+        """Withdraw a batch. `by` is required, for the reason given on `restate`."""
+        actor = resolve_actor(by, what=f"voiding batch {batch_id}")
         record = VoidRecord(
             batch_id=batch_id,
             voided_at=datetime.now().isoformat(timespec="seconds"),
-            voided_by=by,
+            voided_by=actor.name,
             reason=reason,
+            by_basis=None if actor.basis == SELF_ASSERTED else actor.basis,
         )
         self.append(record)
         return record

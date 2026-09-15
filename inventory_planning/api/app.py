@@ -31,16 +31,19 @@ returning an empty list, which would read as "no data".
 import hashlib
 import shutil
 import tempfile
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..ingest.contract import default_registry
 from ..ingest.exposure import Assumption, BASIS_ASSUMED, BASIS_DECLARED, measure
-from ..provenance import RunRegistry
+from ..provenance import RunRegistry, sha256_file
 from ..store.fact_store import FactStore, StoreUnavailable
 from ..ingest.templates import contract_fingerprint, emit
 from ..resolution import resolve_frame
+from ..policy.edits import EditRefused
+from ..policy.rules_edit import history as rule_history
 from ..store.declarations import (
     Declarations, DeclarationError, Override, SCOPE_MAPPING, SCOPE_VALUE,
 )
@@ -49,6 +52,13 @@ from ..store.query import (
     FactQuery, KeyIncomplete, MixedLayers, NoSuchColumn, QueryUnavailable,
 )
 from ..store.ledger import BatchLedger
+
+# How far back /policy looks for a run under the rules on disk. Bounded because each
+# candidate costs a manifest read, and named because the number appears in the sentence
+# the screen shows when the search comes up empty — a bound the reader is not told about
+# turns "not found" into "does not exist".
+_REACH_SCAN = 50
+
 
 def _require_fastapi():
     try:
@@ -61,6 +71,122 @@ def _require_fastapi():
         ) from exc
 
 
+# The three checkpoints that cannot run before the pipeline does, named so the screen
+# can say what a clean intake does and does not promise. Each needs something that does
+# not exist until the run builds it, which is why they are not merely "not implemented
+# here" — they are not answerable here.
+_LATER_GATES = [
+    {"stage": "demand", "needs": "a compiled time series",
+     "checks": "whether there is a demand signal at all, and how stale it is"},
+    {"stage": "forecast", "needs": "a forecast",
+     "checks": "whether every SKU with demand came out with one — a SKU planned "
+               "against zero demand is never bought until it stocks out"},
+    {"stage": "plan", "needs": "positions and recommendations",
+     "checks": "whether the SKUs that should be stocked have a position to plan from"},
+]
+
+
+def _actor(body: Dict[str, Any], what: str):
+    """
+    Who is making this request, as an actor rather than as a string off the payload.
+
+    The identity seam (INTERFACE.md §7). Today the name comes from the form field the
+    payload carries and nothing checks it; when a token arrives, `verified=` is filled
+    from it here and every endpoint below is already correct. That is the whole point of
+    reading it in one place instead of six.
+
+    The bind address remains the entire access control until that day — see
+    `api/__main__.py`, which says so where someone deciding to expose the port will read
+    it.
+    """
+    # Both imported inside the function: FastAPI is an optional extra, so importing
+    # this module must not require it, and `HTTPException` is therefore not in scope at
+    # module level. Referring to it from here without the import raised `NameError`
+    # from inside an `except` clause — which surfaced as the original refusal escaping
+    # as a 500 instead of the 400 it is.
+    from fastapi import HTTPException
+
+    from ..attribution import Unattributed, resolve_actor
+
+    try:
+        return resolve_actor((body or {}).get("by"), verified=None, what=what)
+    except Unattributed as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _output_kind(name: str) -> str:
+    """
+    How the screen should offer one output: a workbook to browse, text to read, or a
+    file to download. By extension, because that is all the manifest records — and the
+    alternative, sniffing the bytes, would be a second opinion about a file the run
+    already named.
+    """
+    suffix = Path(name).suffix.lower()
+    if suffix in (".xlsx", ".xlsm"):
+        return "workbook"
+    if suffix in (".md", ".txt"):
+        return "text"
+    if suffix in (".csv", ".json"):
+        return "download"
+    return "download"
+
+
+def _finding_dict(finding) -> Dict[str, Any]:
+    """
+    One finding as the screen needs it, which is the gate's own dict plus two readings.
+
+    `waived` is derived from the evidence `Declarations.waive` stamps on rather than
+    tracked separately, because a waived finding is a real finding that was downgraded
+    — the record of that is already in the finding, and a second flag could disagree
+    with it.
+    """
+    body = finding.to_dict()
+    evidence = body.get("evidence") or {}
+    body["waived"] = bool(evidence.get("waived_until"))
+    body["waived_by"] = evidence.get("waived_by") or ""
+    body["waived_until"] = evidence.get("waived_until") or ""
+    # Which document the finding is about, where it is about one. The waiver form needs
+    # it: a waiver scoped to a doc_type is the narrow kind, and one without is the kind
+    # that turns a check off everywhere.
+    body["doc_type"] = str(evidence.get("doc_type") or "")
+    return body
+
+
+class _IntakeView:
+    """
+    The documents, shaped as `gate_intake` expects to be handed them.
+
+    `gate_intake` reads one attribute off an intake result and this supplies exactly
+    that. Passing a real `IntakeResult` would mean building one from parts the API does
+    not have — a plan, failures, supersessions, assumptions — and filling those with
+    empties would state four things the API has not established.
+    """
+
+    def __init__(self, documents):
+        self.documents = documents
+
+
+@dataclass
+class LandedIntake:
+    """
+    One reading of everything landed: the documents, the plan, and what was withheld.
+
+    A structure rather than a tuple because three callers want different parts of it
+    and a positional unpack is where "which of these five is the plan" becomes a bug
+    nobody reads.
+    """
+
+    documents: Dict[str, Any]
+    plan: Any
+    records: Dict[str, Dict[str, Any]]
+    declarations: Declarations
+    # doc_type -> capabilities the document declares but cannot back. Carried from the
+    # scan rather than recovered from the plan: the plan records what it decided, not
+    # what it was told, and reconstructing the input from the output is how the two
+    # drift.
+    withheld: Dict[str, Any]
+
+
 class Service:
     """
     What the endpoints share: where config lives, and where the store is.
@@ -70,13 +196,26 @@ class Service:
     mechanism for data exactly as a branch is for code.
     """
 
-    def __init__(self, config_dir=None, store_root=None, output_dir=None):
-        self.config_dir = Path(config_dir) if config_dir else None
+    def __init__(self, config_dir=None, store_root=None, output_dir=None,
+                 workspace=None, tenant=None):
+        from ..workspace import Workspace
+
+        # Resolved through the one resolver — see `workspace.py`.
+        self.workspace = workspace or Workspace.resolve(
+            tenant, config_dir=config_dir, store_root=store_root,
+            output_dir=output_dir)
+        # The workspace's, always. This used to keep the raw argument and leave it None
+        # when unset, so four endpoints fell back to the package's own config — which
+        # meant `--tenant prod` served the *repository's* rules while reporting success.
+        # A wrong answer that looks right, which is the failure this whole layer exists
+        # to refuse. For the default tenant the workspace resolves to that same
+        # directory, so nothing moved for the case the fallback was written for.
+        self.config_dir = self.workspace.config_dir
         self.store_root = store_root
         # Where the runs are. The registry lives under the output directory the pipeline
         # writes to, so the interface reads the runs the CLI produced rather than
         # keeping a second record that could disagree with it.
-        self.output_dir = Path(output_dir) if output_dir else Path("output")
+        self.output_dir = self.workspace.output_dir
         self.contracts = default_registry()
 
     @property
@@ -111,6 +250,54 @@ class Service:
                                   named=True)
         return frame.drop(columns=["row_no"], errors="ignore")
 
+    def landed_documents(self):
+        """
+        Every landed document, read the way the pipeline reads it, plus the plan.
+
+        Shared by the requirements checklist and the quality gate because they are two
+        readings of one thing. Two scans would be two answers about what is loaded, and
+        the gate's answer is the one that decides whether a run may happen — a checklist
+        that disagreed with it would be believed over it, because it is a checklist.
+
+        Recomputed per call for the same reason `/requirements` recomputed it: a batch
+        voided since the last call is not loaded any more, and a remembered list would
+        not know.
+        """
+        from ..ingest.capabilities import CapabilityResolver
+        from ..ingest.intake import Intake, unsupplied_capabilities
+
+        declarations = self.declarations()
+        intake = Intake(verbose=False, declarations=declarations)
+
+        documents = {}
+        names: Dict[str, str] = {}
+        withheld: Dict[str, Any] = {}
+        records: Dict[str, Dict[str, Any]] = {}
+        # Newest first, so where two batches claim one document type the later upload is
+        # the one described — the same rule a re-export follows everywhere else.
+        for record in self.landing.batches():
+            doc_type = record.get("doc_type") or ""
+            if doc_type in records or self.status_of(record["batch_id"]) == "void":
+                continue
+            frame = self.landed_frame(record)
+            doc = intake.load_frame(
+                frame, source_name=record.get("source_name", record["batch_id"]))
+            if doc.doc_type != doc_type:
+                # Re-classified since it landed. Believe the reading, not the folder.
+                doc_type = doc.doc_type
+                if doc_type in records:
+                    continue
+            missing = unsupplied_capabilities(doc.frame, doc.route.contract)
+            if missing:
+                withheld[doc_type] = missing
+            documents[doc_type] = doc
+            names[doc_type] = record.get("source_name", record["batch_id"])
+            records[doc_type] = record
+
+        plan = CapabilityResolver().resolve(names, withheld=withheld)
+        return LandedIntake(documents=documents, plan=plan, records=records,
+                            declarations=declarations, withheld=withheld)
+
     def status_of(self, batch_id: str) -> str:
         """
         Where a batch has got to: landed, promoted to facts, or withdrawn.
@@ -128,7 +315,7 @@ class Service:
         return "landed"
 
 
-def create_app(config_dir=None, store_root=None, output_dir=None):
+def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
     """Build the application. Importing this module does not require FastAPI; calling
     this does."""
     _require_fastapi()
@@ -136,7 +323,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
     from fastapi.responses import FileResponse
 
     service = Service(config_dir=config_dir, store_root=store_root,
-                      output_dir=output_dir)
+                      output_dir=output_dir, tenant=tenant)
     app = FastAPI(
         title="Inventory planning — intake",
         description=__doc__,
@@ -156,6 +343,51 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
             "contracts": len(service.contracts.doc_types),
             "notes": landing.notes,
         }
+
+    @app.get("/workspace")
+    def workspace() -> Dict[str, Any]:
+        """
+        Which workspace this server is serving, and whether it has been set up.
+
+        Every screen asks this first. A server pointed at a tenant nobody has prepared
+        used to answer every other endpoint as though the repository's own config were
+        the tenant's — a wrong answer that looked right, which is the failure this whole
+        layer exists to refuse. Now the screens can say what is missing and offer the
+        one action that fixes it.
+        """
+        return {
+            **service.workspace.to_dict(),
+            "ready": service.workspace.ready,
+            "warnings": list(service.workspace.warnings),
+            "note": "The rules, the facts and the outputs of one tenant. A named tenant "
+                    "keeps all three outside any working tree, so pulling the code "
+                    "cannot reach them.",
+        }
+
+    @app.post("/workspace/setup")
+    def setup_workspace(payload: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+        """
+        Prepare **this server's own** workspace: make the directories, seed the rules.
+
+        The tenant is the one the server was started with and is never taken from the
+        request. That is the whole difference between an action and a hole: a request
+        that could name its own tenant would be a request that can write a directory
+        tree anywhere the resolver will resolve to.
+
+        Idempotent, and seeding never overwrites — a config directory that already holds
+        rules is left exactly alone, so a second click cannot put a production policy
+        back to the package default.
+        """
+        from ..workspace import BadTenant
+
+        actor = _actor(payload, "setting up this workspace")
+        try:
+            done = service.workspace.prepare()
+        except BadTenant as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"tenant": service.workspace.tenant, "ready": service.workspace.ready,
+                "by": actor.name, "did": done,
+                **service.workspace.to_dict()}
 
     @app.get("/contracts")
     def contracts() -> List[Dict[str, Any]]:
@@ -352,35 +584,17 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         what is there, drifts from the store the first time a batch is voided — and it
         is a checklist, so a person will trust it over the store.
         """
-        from ..ingest.capabilities import CAPABILITIES, CapabilityResolver
-        from ..ingest.intake import Intake, unsupplied_capabilities
+        from ..ingest.capabilities import CAPABILITIES
         from ..resolution import SOURCE_ABSENT, from_document
 
-        declarations = service.declarations()
-        intake = Intake(verbose=False, declarations=declarations)
+        loaded = service.landed_documents()
+        plan, withheld = loaded.plan, loaded.withheld
 
-        documents: Dict[str, str] = {}
-        withheld: Dict[str, Any] = {}
         landed: Dict[str, Dict[str, Any]] = {}
-        # Newest first, so where two batches claim one document type the later upload is
-        # the one described — the same rule a re-export follows everywhere else.
-        for record in service.landing.batches():
-            doc_type = record.get("doc_type") or ""
-            if doc_type in landed or service.status_of(record["batch_id"]) == "void":
-                continue
-            frame = service.landed_frame(record)
-            doc = intake.load_frame(
-                frame, source_name=record.get("source_name", record["batch_id"]))
-            if doc.doc_type != doc_type:
-                # Re-classified since it landed. Believe the reading, not the folder.
-                doc_type = doc.doc_type
-                if doc_type in landed:
-                    continue
-            resolved = from_document(doc, frame, declarations=declarations)
-            documents[doc_type] = record.get("source_name", record["batch_id"])
-            missing = unsupplied_capabilities(doc.frame, doc.route.contract)
-            if missing:
-                withheld[doc_type] = missing
+        for doc_type, record in loaded.records.items():
+            resolved = from_document(loaded.documents[doc_type],
+                                     service.landed_frame(record),
+                                     declarations=loaded.declarations)
             landed[doc_type] = {
                 "batch_id": record["batch_id"],
                 "source_name": record.get("source_name", ""),
@@ -391,8 +605,6 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                     for f in resolved.fields if f.required
                 ],
             }
-
-        plan = CapabilityResolver().resolve(documents, withheld=withheld)
 
         capabilities = []
         for name, cap in CAPABILITIES.items():
@@ -432,6 +644,102 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
             "documents": sorted(wanted.values(),
                                 key=lambda d: (not d["required"], d["doc_type"])),
         }
+
+    @app.get("/gates")
+    def gates() -> Dict[str, Any]:
+        """
+        The intake quality gate, over everything landed, before a run is attempted.
+
+        This is the checkpoint worth having here: every silent failure this pipeline has
+        produced was visible at intake and invisible in the report it went on to write.
+        Running it before the plan means a mapping that would have produced a complete
+        page of zeroes is found while the person who uploaded the file is still looking
+        at it.
+
+        **It is one of four, and the page has to say so.** `demand`, `forecast` and
+        `plan` run during the run and cannot run here — they need a time series, a
+        forecast and a position, none of which exist until the pipeline has done the
+        work. So a clean answer here is "nothing at intake stops this", never "the run
+        will pass", and the reply carries the other three by name so that distinction is
+        not left to be inferred.
+
+        Waivers are applied the way the run applies them: through `Declarations.waive`,
+        which downgrades a blocking finding it has been told is a false positive here
+        and leaves it visible, carrying who waived it and until when. The same call, so
+        a finding waived on this screen is waived in the run and not merely hidden on
+        the screen.
+        """
+        from ..quality import GateThresholds
+        from ..quality.checks import gate_intake
+
+        loaded = service.landed_documents()
+        if not loaded.documents:
+            return {
+                "stage": "intake", "ran": False, "findings": [],
+                "passed": None,
+                "note": "Nothing is landed, so there is nothing to check. The intake "
+                        "gate compares the documents against each other — whether "
+                        "their item numbers meet, whether a column is a column — and "
+                        "one document cannot disagree with itself.",
+                "later_stages": _LATER_GATES,
+            }
+
+        report = gate_intake(_IntakeView(loaded.documents), loaded.plan,
+                             GateThresholds.load(service.config_dir))
+        report = loaded.declarations.waive(report)
+
+        return {
+            "stage": "intake",
+            "ran": True,
+            "passed": report.passed,
+            "documents": sorted(loaded.documents),
+            "counts": {
+                "block": len(report.blocking),
+                "severe": len(report.severe),
+                "warn": len(report.warnings),
+            },
+            "findings": [_finding_dict(f) for f in report.ordered],
+            "later_stages": _LATER_GATES,
+        }
+
+    @app.post("/gates/{check}/waivers")
+    def waive_gate(check: str, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Declare one check a false positive on one document, until a date.
+
+        Narrower than `allow_degraded` by construction, which is the whole reason it
+        exists: waiving the SKU-agreement finding on a whole-warehouse stock snapshot
+        does not also wave through an open PO quantity mapped to a money column.
+
+        It lands as an ordinary `gate_waivers` entry in the config directory — the same
+        statement, in the same syntax, in the same place as a hand-written one — so the
+        headless run honours a waiver made by clicking. That is the governing rule of
+        this whole interface, and a waiver stored anywhere else would break it.
+        """
+        from ..store.declarations import GateWaiver
+
+        expires = payload.get("expires")
+        try:
+            when = date.fromisoformat(str(expires)) if expires else None
+        except ValueError:
+            raise HTTPException(400, f"expires must be a date (YYYY-MM-DD), "
+                                     f"not {expires!r}") from None
+        if when is None:
+            raise HTTPException(400, "expires is required — a waiver without an end "
+                                     "date is a permanently disabled check")
+        if when < date.today():
+            raise HTTPException(400, f"{when} is in the past, so the waiver would "
+                                     f"never apply. Pick a date to review this by.")
+        try:
+            path = Declarations.write_waiver(
+                GateWaiver(check=check, doc_type=str(payload.get("doc_type") or ""),
+                           expires=when, reason=str(payload.get("reason") or ""),
+                           by=_actor(payload, f"waiving {check}").name),
+                config_dir=service.config_dir)
+        except DeclarationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"check": check, "expires": when.isoformat(),
+                "doc_type": payload.get("doc_type") or "", "written_to": str(path)}
 
     @app.get("/batches/{batch_id}/summary")
     def summary(batch_id: str) -> Dict[str, Any]:
@@ -577,13 +885,12 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
 
         record = service.find_batch(batch_id)
         valid_time = str(body.get("valid_time", "")).strip()
-        by = str(body.get("by", "")).strip()
         if not valid_time:
             raise HTTPException(
                 400, "`valid_time` is required — the date this data describes, which is "
                      "not the date the file was downloaded and cannot be inferred from it")
-        if not by:
-            raise HTTPException(400, "`by` is required")
+        actor = _actor(body, f"promoting batch {batch_id}")
+        by = actor.name
         if service.status_of(batch_id) != "landed":
             raise HTTPException(
                 409, f"batch {batch_id} is {service.status_of(batch_id)}, not landed")
@@ -635,10 +942,10 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         """
         service.find_batch(batch_id)
         reason = str(body.get("reason", "")).strip()
-        by = str(body.get("by", "")).strip()
-        if not reason or not by:
-            raise HTTPException(400, "voiding a batch needs `reason` and `by`")
-        record = service.ledger.void(batch_id, reason=reason, by=by)
+        if not reason:
+            raise HTTPException(400, "voiding a batch needs a `reason`")
+        actor = _actor(body, f"voiding batch {batch_id}")
+        record = service.ledger.void(batch_id, reason=reason, by=actor.name)
         return {"batch_id": batch_id, "status": "void",
                 "voided_at": record.voided_at, "voided_by": record.voided_by}
 
@@ -699,21 +1006,81 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                 doc_type, as_of=as_of, known_at=known_at, layer=layer)
         return body
 
+    def _reach_of(rules_path: Path) -> Dict[str, Any]:
+        """
+        What these rules last reached, keyed by rule id, or an explanation of why not.
+
+        Keyed rather than ordered: the caller holds the rules and does the join, which
+        means a rule with no entry is visibly a rule with no entry instead of a row
+        that silently slipped one position.
+
+        The explanation is worth as much care as the counts. There are four reasons the
+        page can be blank and they send someone to four different places, so the line
+        says only what the search actually established. "The file has been edited" in
+        particular is a claim about history, and it is only true when every recorded
+        run was examined and none of them was under these bytes.
+        """
+        registry = RunRegistry(service.output_dir)
+        digest = sha256_file(rules_path)
+        run = registry.latest_under_rules(digest, with_hits=True, limit=_REACH_SCAN)
+        if run is not None:
+            return {
+                "hits": {
+                    "run_id": run.get("run_id"),
+                    "run_at": run.get("run_at"),
+                    "input_fingerprint": run.get("input_fingerprint"),
+                    "rules": {h.get("rule_id"): h for h in run.get("rule_hits") or []},
+                },
+                "note": f"Counts are from run {run.get('run_id')} — the newest run "
+                        f"under these exact rules. They move with the facts: a rule "
+                        f"reaches whatever the SKUs of that run made it reach.",
+            }
+        recorded = registry.index()
+        # These rules have run, and that run kept no reach: every run from before the
+        # reach was retained lands here, which on the first look at any existing output
+        # directory is all of them. Reporting that as an edit would send someone to
+        # hunt for a change to a file nobody has touched.
+        ran_without_reach = registry.latest_under_rules(digest, limit=_REACH_SCAN)
+        if ran_without_reach is not None:
+            why = (f"Run {ran_without_reach.get('run_id')} planned under these exact "
+                   f"rules but recorded no per-rule reach — it ran before the reach "
+                   f"was kept, or it stopped before resolving.")
+        elif not recorded:
+            why = f"No runs are recorded under {service.output_dir}."
+        elif len(recorded) > _REACH_SCAN:
+            # The scan is bounded, so a miss inside it is not a miss over the history.
+            why = (f"None of the {_REACH_SCAN} most recent runs planned under these "
+                   f"exact rules. Older runs were not searched, so this does not say "
+                   f"the file has changed.")
+        else:
+            why = ("No run under these exact rules. Every recorded run was searched, "
+                   "so the file has been edited since the last one — and counts from "
+                   "before an edit belong to the rules as they were.")
+        return {
+            "hits": None,
+            "note": why + " Which SKUs a rule reaches is decided against a frame of "
+                          "SKUs, so it takes a run to answer; the next one fills this in.",
+        }
+
     @app.get("/policy")
     def policy() -> Dict[str, Any]:
         """
         The parameter set in force, read-only.
 
-        Read-only is the design, not a stage of it. What a rule needs is review, a diff,
-        a rationale and an owner, and markdown in git gives all four; a form that wrote
-        them into a database would have to rebuild every one. The value an interface adds
-        here is not editing — it is showing which rule reached which SKUs, and what a
-        change to one did to a run, neither of which a text editor can show.
+        Read-only for now, and the value an interface adds here is not the editing
+        anyway — it is showing which rule reached which SKUs, and what a change to one
+        did to a run, neither of which a text editor can show.
+
+        The reach comes from a run, because it has to: a rule's scope is a question
+        about a frame of SKUs, and there is no frame here. So the newest run that
+        planned under *these exact rule bytes* is found in the registry and its counts
+        are shown against the rules they belong to. A run under a different rule set is
+        not a near miss to fall back on — its counts would be attached to rules that
+        never produced them — so when there is none the answer is that there is none.
         """
         from ..policy.parameters import PlanningParameters
 
-        path = ((service.config_dir or Path(__file__).parents[2] / "config")
-                / "planning_parameters.md")
+        path = service.config_dir / "planning_parameters.md"
         try:
             params = PlanningParameters(path)
         except (FileNotFoundError, ValueError) as exc:
@@ -730,13 +1097,65 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
                  "owner": r.owner, "date": r.date}
                 for r in params.rules
             ],
-            # Deliberately absent, and worth saying rather than leaving to be noticed:
-            # a rule's hit count is computed during a run and printed, never stored, so
-            # there is nothing to show here without re-running.
-            "hits": None,
-            "note": "Rule hit counts are computed during a run and not retained, so "
-                    "which SKUs each rule reached cannot be shown without re-running.",
+            "changes": rule_history(service.config_dir, limit=20),
+            **_reach_of(params.path),
         }
+
+    @app.put("/policy/rules")
+    def edit_rules(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Propose a change to the rules, and apply it once the diff has been seen.
+
+        One endpoint carrying the change rather than three shaped like HTTP verbs,
+        which is the contract INTERFACE.md §7 fixed: `{change, reason, by}` in, the diff
+        it would make out, approval applies it. The shape is what has to survive the
+        move to a server, so it is worth more than the REST tidiness of a `DELETE`.
+
+        Writing is opt-in (`apply: true`) and pinned to `basis`, exactly as the macro
+        editor is — a client asking "what would this do" must not have already done it,
+        and what gets approved is the diff that was shown rather than the rule it was
+        shown for.
+
+        The three actions differ in what they need and in what they cost:
+
+        - `edit` takes `changes`, a subset of the rule's fields. Only those are
+          rewritten; every other byte of the rule, including the comments beside its
+          parameters, stays as it was.
+        - `add` takes `rule` and appends it last, which is the only position with a
+          statable meaning: it wins over everything above it.
+        - `remove` takes only the id. Its reason goes to the log rather than the file,
+          because afterwards there is no rule left to carry it.
+        """
+        from ..policy import rules_edit
+
+        root = service.config_dir
+        action = str(payload.get("action") or "edit").strip()
+        rule_id = str(payload.get("rule_id") or "").strip()
+
+        if action == "edit":
+            def proposal_for():
+                return rules_edit.propose_edit(rule_id, payload.get("changes") or {},
+                                               config_dir=root)
+        elif action == "add":
+            def proposal_for():
+                return rules_edit.propose_add(payload.get("rule") or {},
+                                              config_dir=root)
+        elif action == "remove":
+            def proposal_for():
+                return rules_edit.propose_remove(rule_id, config_dir=root)
+        else:
+            raise HTTPException(400, f"action must be edit, add or remove, "
+                                     f"not {action!r}")
+
+        try:
+            if not payload.get("apply"):
+                return {**proposal_for().to_dict(), "applied": False}
+            return rules_edit.apply(
+                proposal_for, reason=payload.get("reason", ""),
+                by=payload.get("by", ""), basis=str(payload.get("basis") or ""),
+                config_dir=root)
+        except EditRefused as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/policy/macro")
     def macro() -> Dict[str, Any]:
@@ -751,12 +1170,25 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         import json as _json
         from ..policy.parameters import PlanningParameters
 
-        root = service.config_dir or Path(__file__).parents[2] / "config"
+        root = service.config_dir
         out: Dict[str, Any] = {"config_dir": str(root), "settings": []}
 
+        from ..policy import macro as macro_edit
+
         def add(name, value, source, note=""):
-            out["settings"].append({"name": name, "value": value,
-                                    "source": source, "note": note})
+            # Editability is attached by name from the one registry that decides it,
+            # rather than inferred from the source file: `fx_rates.json` holds both an
+            # editable scalar and a derived reading, and "it came from a file" is not
+            # the same claim as "a form may write it".
+            setting = macro_edit.BY_NAME.get(name)
+            out["settings"].append({
+                "name": name, "value": value, "source": source, "note": note,
+                "editable": setting is not None,
+                "kind": setting.kind if setting else None,
+                "choices": list(setting.choices) if setting else [],
+                "impact": setting.impact if setting else "",
+                "file": setting.filename if setting else None,
+            })
 
         try:
             node = _json.loads((root / "node_config.json").read_text(encoding="utf-8"))
@@ -788,7 +1220,41 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
             "money in any of these is converted on read"
             if table.currencies else "no rates configured — money is not converted")
 
+        out["changes"] = macro_edit.history(root, limit=20)
         return out
+
+    @app.put("/policy/macro")
+    def edit_macro(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Propose a change to one scalar, and apply it once the diff has been seen.
+
+        The two steps are the same request twice, which is deliberate: a stored
+        proposal would be interface-only state, and INTERFACE.md rules that out for
+        every screen here. What connects them instead is `basis` — the digest of the
+        file the diff was produced against, returned by the proposal and required by
+        the apply. Approving a diff therefore approves *those bytes*, and a file that
+        moved in between is a refusal rather than a surprise.
+
+        Writing is opt-in (`apply: true`). A PUT that writes by default would mean a
+        client asking "what would this do" had already done it, and the one thing this
+        endpoint exists to provide is the chance to look first.
+        """
+        from ..policy.macro import MacroError, apply as apply_macro, propose
+
+        root = service.config_dir
+        name = str(payload.get("name") or "").strip()
+        if "value" not in payload:
+            raise HTTPException(status_code=400, detail="value is required")
+        try:
+            if not payload.get("apply"):
+                proposal = propose(name, payload["value"], config_dir=root)
+                return {**proposal.to_dict(), "applied": False}
+            return apply_macro(
+                name, payload["value"],
+                reason=payload.get("reason", ""), by=payload.get("by", ""),
+                basis=str(payload.get("basis") or ""), config_dir=root).to_dict()
+        except MacroError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/runs")
     def runs(limit: int = Query(50, ge=1, le=500)) -> Dict[str, Any]:
@@ -803,6 +1269,123 @@ def create_app(config_dir=None, store_root=None, output_dir=None):
         if manifest is None:
             raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
         return manifest
+
+    def _output_path(run_id: str, name: str) -> Path:
+        """
+        Where one of a run's outputs is, resolved only from what the manifest recorded.
+
+        The name is matched against the manifest's own list rather than joined onto a
+        directory, which is what keeps this from being a file-read endpoint with a path
+        in it. A name the run did not write is a 404 whether or not such a file exists.
+
+        Two candidate directories, in order: the one the registry was found under, and
+        the one the manifest says the run wrote to. The first wins because it is where
+        the files are *now* — a run copied from another machine carries an absolute path
+        that means nothing here — and the second is the fallback for a registry read
+        from somewhere other than the output directory.
+        """
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+        names = {o.get("name") for o in manifest.get("outputs") or []}
+        if name not in names:
+            raise HTTPException(
+                404, f"run {run_id} did not write {name!r}. It wrote: "
+                     f"{', '.join(sorted(n for n in names if n))}.")
+        for base in (service.output_dir, Path(manifest.get("output_dir") or ".")):
+            candidate = Path(base) / name
+            if candidate.exists():
+                return candidate
+        raise HTTPException(
+            410, f"{name} is recorded by run {run_id} but is not on disk any more. The "
+                 f"manifest still says what was written; the file itself is gone.")
+
+    @app.get("/runs/{run_id}/outputs")
+    def outputs(run_id: str) -> Dict[str, Any]:
+        """
+        What this run wrote, from the manifest, with whether each file is still there.
+
+        The manifest is the index rather than a directory listing: it records what *this
+        run* wrote, where a listing would mix in every other run's files and could not
+        tell them apart once a directory holds a month of them.
+        """
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+
+        listed = []
+        for record in manifest.get("outputs") or []:
+            name = record.get("name") or ""
+            path = None
+            for base in (service.output_dir, Path(manifest.get("output_dir") or ".")):
+                candidate = Path(base) / name
+                if candidate.exists():
+                    path = candidate
+                    break
+            listed.append({
+                "name": name,
+                "bytes": record.get("bytes"),
+                "rows": record.get("rows"),
+                "kind": _output_kind(name),
+                "present": path is not None,
+                "path": str(path) if path else None,
+            })
+        return {
+            "run_id": run_id,
+            "run_at": manifest.get("run_at"),
+            "outputs": listed,
+            "note": "This screen renders these files. It does not recompute anything "
+                    "in them — a second place the figures were formatted and rounded "
+                    "would be a second place they could disagree.",
+        }
+
+    @app.get("/runs/{run_id}/outputs/{name}/sheets")
+    def workbook_sheets(run_id: str, name: str) -> Dict[str, Any]:
+        from ..reporting.read_workbook import WorkbookUnreadable, sheets as read_sheets
+
+        path = _output_path(run_id, name)
+        try:
+            return {"run_id": run_id, "name": name, "sheets": read_sheets(path)}
+        except WorkbookUnreadable as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/runs/{run_id}/outputs/{name}/sheets/{sheet}")
+    def workbook_sheet(run_id: str, name: str, sheet: str,
+                       offset: int = Query(0, ge=0),
+                       limit: int = Query(100, ge=1, le=500)) -> Dict[str, Any]:
+        """One window of one sheet, values as the workbook holds and displays them."""
+        from ..reporting.read_workbook import WorkbookUnreadable, read_sheet
+
+        path = _output_path(run_id, name)
+        try:
+            return read_sheet(path, sheet, offset=offset, limit=limit).to_dict()
+        except WorkbookUnreadable as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/runs/{run_id}/outputs/{name}/text")
+    def output_text(run_id: str, name: str,
+                    limit: int = Query(80_000, ge=1, le=400_000)) -> Dict[str, Any]:
+        """
+        A text output as it was written — the run health note, the suggested rules.
+
+        Verbatim and truncated rather than summarised. These files are already the
+        pipeline's own prose about the run, and a summary of them on this screen would
+        be a second account of what the run found.
+        """
+        path = _output_path(run_id, name)
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise HTTPException(400, f"{name} could not be read: {exc}") from exc
+        return {"run_id": run_id, "name": name, "bytes": len(body.encode("utf-8")),
+                "truncated": len(body) > limit, "text": body[:limit]}
+
+    @app.get("/runs/{run_id}/outputs/{name}/download")
+    def output_download(run_id: str, name: str):
+        """The file itself, so the workbook a meeting runs on is one click from here."""
+        from fastapi.responses import FileResponse
+
+        return FileResponse(_output_path(run_id, name), filename=name)
 
     @app.get("/runs/{run_a}/diff/{run_b}")
     def diff(run_a: str, run_b: str) -> Dict[str, Any]:

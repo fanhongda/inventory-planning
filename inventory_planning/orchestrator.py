@@ -69,10 +69,18 @@ class InventoryPlanner:
     def __init__(self, config_dir: Union[str, Path] = None, output_dir: Union[str, Path] = None,
                  interactive: bool = True, store_root: Union[str, Path] = None,
                  parameters_file: Union[str, Path] = None,
-                 allow_degraded: bool = False):
-        base = Path(__file__).parents[1]
-        self.config_dir = Path(config_dir) if config_dir else base / "config"
-        self.output_dir = Path(output_dir) if output_dir else base / "output"
+                 allow_degraded: bool = False, workspace=None, tenant: str = None):
+        # One resolver for all three directories, even when all three were passed in.
+        # Going through it either way is the point of the seam: there is exactly one
+        # place that decides where a tenant's config, store and output are, so
+        # multi-tenancy is a different workspace rather than a change here and in
+        # twenty-nine other modules (INTERFACE.md §7).
+        from .workspace import Workspace
+
+        self.workspace = workspace or Workspace.resolve(
+            tenant, config_dir=config_dir, store_root=store_root, output_dir=output_dir)
+        self.config_dir = self.workspace.config_dir
+        self.output_dir = self.workspace.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.interactive = interactive
         # The rule set this planner plans under. A scenario is a planner built with a
@@ -105,7 +113,7 @@ class InventoryPlanner:
         self.run = RunManifest.begin(config_dir=self.config_dir, output_dir=self.output_dir,
                                      policy_file=self.parameters_file)
         self._store = None             # built on first use; see `store`
-        self.store_root = store_root   # None -> $INVENTORY_PLANNING_STORE, then XDG
+        self.store_root = self.workspace.store_root
 
         # Readers
         self.sales_reader   = SalesHistoryReader(self.config_dir)
@@ -1273,6 +1281,11 @@ class InventoryPlanner:
             print(crosscheck.summary())
 
         resolved = planning_params.resolve(attributes)
+        # What the rules reached, beside which rules were in force. Recorded here and
+        # not at parse time because it does not exist until there is a frame to match
+        # against; the console printed it and the manifest kept nothing, which is why
+        # the policy screen could only say it had no counts to show.
+        self.run.record_rule_hits(resolved.hits)
         print()
         print(resolved.summary())
 

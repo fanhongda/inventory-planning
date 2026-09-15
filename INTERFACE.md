@@ -208,8 +208,38 @@ Correcting a mapping here writes a `scope: mapping` declaration keyed on **heade
 appended to `config/declarations.yaml` with `by` / `at` / `reason` — the reason field
 required, not optional. Then re-resolve from landing. No re-upload, no adapter re-freeze.
 
-Gate findings render as their three severities (`BLOCK` / `SEVERE` / `WARN`) with the
-per-check waiver available inline, `expires` mandatory as it already is in YAML.
+**The quality gate, since 2026-09-15.** Findings render as their three severities
+(`BLOCK` / `SEVERE` / `WARN`) with the per-check waiver inline, `expires` mandatory as it
+already is in YAML. `GET /gates` runs the intake checkpoint over everything landed;
+`POST /gates/{check}/waivers` writes a `gate_waivers` entry. Three points decided the
+shape:
+
+- **The intake gate, and the page says it is one of four.** `demand`, `forecast` and
+  `plan` need a time series, a forecast and a position, none of which exist before the
+  run — they are not unimplemented here, they are unanswerable here. So a clean result
+  reads "nothing at intake would stop a run", never "the run will pass", and the other
+  three are listed by name so the distinction is not left to be inferred. Nothing landed
+  reads as neither: the gate compares documents against each other, and one document
+  cannot disagree with itself.
+- **The waiver is the same statement a hand-written one is.** It lands in the config
+  directory as `gate_waivers`, so a run driven from a browser and a headless one honour
+  the same declaration — the governing rule, applied to the one surface that could most
+  easily have kept its own copy. Verified end to end: a waiver declared in the browser
+  downgrades the same finding under `load_all`, carrying who declared it and until when.
+- **A waived finding stays on the page.** Downgraded, not hidden, still carrying its
+  `what` / `why` / `fix` and now also who waived it and when that expires. A waiver that
+  removed the finding would be indistinguishable from a check that never fired.
+
+Two things this surfaced rather than fixed. `cli.py` loads the five files individually
+and never builds an `IntakeResult`, so **the intake gate does not run on the CLI's own
+default path** — only under `load_all`. The CLI knows this for one of its checks and
+compensates with a `parser.error` on a missing product family; the rest — SKU agreement,
+semantic failure, dimension spelling — simply do not fire there. Which means this screen
+is currently the only place several of them run at all for anyone driving the pipeline
+by flags. Worth fixing on the CLI side, not here. And the API's reading of what is landed is now
+shared with the requirements checklist (`Service.landed_documents`) rather than scanned
+twice, because two scans are two answers about what is loaded and the gate's is the one
+that decides whether a run may happen.
 
 ### M2 — Macro and policy
 
@@ -222,9 +252,10 @@ the user approves. Git stays the store; the form is a validator with a nicer key
 **Rules** — review period, service level, replenishment method by segment. These stay in
 `config/planning_parameters.md`. DATA_LAYER.md's refusal to move the rule engine into a
 database holds: review, diff, rationale and owner are what a rule needs, and markdown in
-git gives all four for free. The UI's job here is not editing but **impact**: show the
-rule table read-only, and beside each rule the SKUs it hit and the SKUs it skipped —
-`policy/parameters.py` already computes both and throws them away.
+git gives all four for free. §7 revised the half of this that said the UI's job is
+therefore not editing — it edits the file, and all four survive because the storage does
+not move. What the UI adds beyond editing is **impact**: beside each rule, the SKUs it
+hit and the SKUs it skipped.
 
 And the feature that makes the page worth building at all: **a policy change is a diff
 of two runs, not a state view.** Edit a parameter file → run as a scenario → diff
@@ -240,15 +271,86 @@ attributable to the change depends on whether anything else moved. Two runs of t
 under different parameter files come back `scenario`; the same pair with a commit in
 between comes back `mixed`, and refuses to attribute.
 
-Read-only is the design rather than a stage of it, and the page says so. Editing is still
-the file.
+**Macro editing, since 2026-09-15.** The scalars are editable on the page; the rules are
+not yet. Editing is still the file — `policy/macro.py` replaces one value where it sits
+and leaves every other byte alone, so what a person approves is a one-line diff rather
+than a reformatted file. Five things decided the shape:
 
-One thing the page cannot yet show, and says instead of implying: a rule's hit count.
-`policy/parameters.py` computes which SKUs each rule reached and which it skipped, prints
-it, and throws it away — so there is nothing to display without re-running, and an empty
-count would read as "this rule matched nothing", which is a finding rather than an
-absence. Retaining `ParameterSet.hits` on the run manifest is the next piece of this
-screen and the one worth doing.
+- **Two requests, not a stored proposal.** `PUT /policy/macro` without `apply` returns
+  the diff and writes nothing; with `apply` it writes. A proposal held on the server
+  would be interface-only state, which this page rules out everywhere else.
+- **What is approved is a diff against specific bytes.** The proposal returns the digest
+  of the file it read and the apply has to quote it back. A file that moved in between is
+  a refusal, not a surprise — otherwise someone approves one diff and a different edit
+  lands.
+- **Only the settings the engine reads are editable.** `echelon_level` and `parent_node`
+  belong to multi-node planning, which is not built; a form offering them would be the
+  switch that reads as a guarantee and honours nothing. A derived reading — the FX
+  currency list — has no Edit because there is nothing in a file to write back.
+- **Validation is a load, not a second opinion.** The edited text is parsed by the same
+  loader the pipeline uses before anything is written. `quantity_rounding` is checked by
+  `analytics.rounding`, which on a real run is an hour of work past the point the value
+  is set, so the check is moved forward by calling that reader — not by restating what
+  it accepts.
+- **The reason and the owner go to `config/config_changes.jsonl`**, append-only, beside
+  the files it describes. The diff is not stored: it is recoverable from the file's own
+  history, and the reason is the part that is nowhere else.
+
+**Rule editing, since 2026-09-15.** The same contract over a block instead of a value:
+`PUT /policy/rules` takes `{action, …}` and returns the diff, approval applies it, the
+basis pins it. Edit, add and remove, on one endpoint carrying the change rather than
+three shaped like HTTP verbs — the shape is what has to survive the move to a server.
+Four things a rule needed that a scalar did not:
+
+- **The rationale has a home in the file.** A rule already carries `rationale`, `owner`
+  and `date`, so an edit writes them rather than only logging them elsewhere: that is
+  where the next reader looks. `date` is stamped, not asked for.
+- **Only the changed fields are rewritten.** Re-rendering the rule from its parsed form
+  would reflow a rationale nobody touched and put six lines in the diff for a change to
+  one number. A comment written beside a parameter survives an edit to the parameter
+  next to it.
+- **Order is meaning.** Rules apply top to bottom and later ones win, so every proposal
+  reports the order the file will have afterwards, and a new rule is appended last —
+  the only position with a statable meaning.
+- **Reach cannot be predicted from here.** A scope is a question about a frame of SKUs
+  and an interface has no frame. The counts beside a rule belong to the last run under
+  the rules as they were, so an edit says they are detached and that the next run
+  measures the new scope. A guessed count beside a scope is an invitation to write the
+  scope around it.
+
+`rule_id` is not editable: the manifest records each rule's hits against it, so renaming
+one detaches every count ever recorded for it.
+
+**What was considered and left out: a second person's approval.** I had written that
+rule editing would need it where a scalar did not. It would not be one — every `by` on
+this interface is a form field nobody checks, so a second name is a second unverified
+string, and a review step that verifies nothing is worse than an honest absence of one
+because it reads as a control. It arrives with the identity seam below, not before it.
+
+**Per-rule hits, since 2026-09-15.** `policy/parameters.py` computed which SKUs each
+rule reached and which it skipped, printed it, and threw it away; the manifest now keeps
+it, and the page shows it against each rule. Three points decided the shape:
+
+- **The reach comes from a run and is labelled with it.** It is not a property of the
+  rule — the same rule reaches a different number of SKUs next week — so the screen names
+  the run and the facts behind the counts.
+- **Matched on the rules file's digest, not on `policy_fingerprint`**, which folds in the
+  path a run was given. A scenario copy of the same rules is the same rules. Identical
+  bytes also cannot declare a different set of rule ids, which is what makes the counts
+  safe to line up rule by rule. Edit the file and the counts disappear rather than
+  becoming stale: they belonged to the rules as they were.
+- **Three silences are kept apart.** No run under these rules, a scope naming a column
+  the run did not have, and a scope that matched nothing are different problems, and only
+  the last is a reason to go and rewrite a rule. And when the page is blank, the line
+  saying why claims only what the search established: a run under these rules that kept
+  no reach says so, a miss inside a bounded scan says the scan was bounded, and "the file
+  has been edited" is said only when every recorded run was read and none matched.
+
+A rule is also recorded with what was *still standing* at the end of the file, beside
+what it matched. The sample data makes the case: `R-001` gives every A-class SKU a weekly
+review, matches 4, and keeps 2 — the actuator and long-lead rules take the rest. On the
+five-SKU test frame it keeps none at all. `matched` alone would have reported a rule that
+decides nothing as the busiest one on the page.
 
 > **Checked before building this page, and the answer stood.** Two of the settings
 > originally named — calendar versus working days, and a growth target — **do not exist
@@ -284,10 +386,47 @@ canonical frame carries no row number, so the pointer `(batch_id, row_no)` is fo
 only at batch granularity. Adding a row number to the canonical frame crosses into the
 contracts and the adapters, and belongs with P5 rather than here.
 
-**Planning and analysis get no UI.** Excel stays the output, as asked. That is a defence
-as much as a preference: the run's five-sheet workbook is what gets handed round a
-meeting, and a screen that showed the same numbers would immediately become a second
-place they are formatted, rounded and subtly disagreed about.
+### M4 — Results
+
+**Excel stays the output**, as asked, and that is a defence as much as a preference: the
+run's five-sheet workbook is what gets handed round a meeting. What this section used to
+conclude from that — planning and analysis get no UI at all — §7 revised, because the
+objection was to a screen that *re-derives* the figures, and it does not apply to one
+that renders the workbook the run already wrote. One artefact, two renderings.
+
+**Built, 2026-09-15.** `GET /runs/{id}/outputs` lists what the run wrote, from the
+manifest; the workbook's sheets are browsable and its text outputs are shown verbatim.
+The constraint the screen exists under, and the only one that matters:
+
+- **It computes nothing.** No totals, no percentages, no re-sorting, no top-N, no
+  filling of blanks — a blank cell stays blank, because a missing figure and a zero are
+  different findings. The moment something on it is calculated the original objection
+  returns in full and the screen should be deleted rather than argued for.
+- **Numbers are shown under the workbook's own number format.** This is the subtle half
+  of the objection rather than an exception to it: `workbook.py` writes a raw value and
+  a format, and Excel displays the two combined. A screen printing the raw value would
+  disagree with the file on every money column while holding the identical number.
+  Rounding is half away from zero, which is Excel's rule — Python's `round(0.5)` is `0`,
+  and a screen showing `0` where the file shows `1` is the disagreement in its purest
+  form. A format the reader does not understand is shown raw and *named*, never guessed.
+- **The manifest is the index, and the only one.** A file is located by matching the name
+  against what that run recorded writing, not by joining a name onto a directory — so a
+  run's outputs are separable from every other run's in a folder holding a month of
+  them, and the endpoint is not a file read with a path in it. A recorded file that has
+  since been deleted is listed as gone rather than dropped from the list.
+
+What the screen adds over opening the workbook is the two things the file cannot carry
+once it is in someone's downloads folder: which run it came from and what that run was
+resting on, and the rest of that run's outputs beside it — the health note and the gate
+findings a planner opening only the xlsx never sees.
+
+`test_results_screen.py` pins the writer and the reader together: every number format
+`workbook.py` emits must be one the reader renders. Add a fifth there and the test fails,
+which is the only way the two stay in agreement without becoming one file.
+
+**Still out:** resolving a single fact row back to its verbatim row, which needs a row
+number on the canonical frame (P5), and any analysis the workbook does not already
+contain.
 
 ---
 
@@ -491,9 +630,9 @@ now while they are still cheap. What that asks for, against what is there:
 
 | Asked for | Today | Missing |
 |---|---|---|
-| enter macro and policy | read-only | writing back, with a diff |
+| enter macro and policy | both written back with a diff | — |
 | query the data | three named readings, by layer, as-of | — |
-| see the results | the workbook only | a screen over it |
+| see the results | a screen over the workbook | — |
 | the store holds a record | facts, landing, declarations, batch ledger | decisions |
 | C/S: permissions, schema versions | none; a version and a refusal | three seams |
 
@@ -527,36 +666,146 @@ than the conclusion.
 
 Each is cheap while there is one user and expensive once there are many.
 
-**A workspace, not three arguments.** `store_root`, `config_dir` and `output_dir` are
-resolved separately today and passed around independently; `Intake` and the adapters
+**A workspace, not three arguments. Cut 2026-09-15 — `workspace.py`.** `store_root`,
+`config_dir` and `output_dir` were resolved separately and passed around independently; `Intake` and the adapters
 already carry a `tenant`, and nothing else does. Collapsing the three into one object
 resolved from a tenant id makes multi-tenancy "resolve a different workspace" rather than
 a refactor of every call site. It also makes the isolation testable, which the store path
 already is and the other two are not.
 
-**`by` comes from a session, not a form field.** Every declaration, override, void and
-restatement already requires it — the audit trail predates the login, which is the right
-order. What is missing is only that nothing checks it. When an identity layer arrives it
-fills `by` from the token and the form field becomes the single-user fallback.
+**`by` comes from a session, not a form field. Cut 2026-09-15 — `attribution.py`.**
+Every declaration, override, void and restatement already required it — the audit trail
+predates the login, which is the right order, because the reverse gives a system that
+knows who you are and does not record what you did. The real store carries 1,188
+restatements and 30 voids, every one named and reasoned. What was missing is only that
+nothing checks the name.
 
-**A migration path.** TODO.md noted there was a schema version, a refusal, and nothing
-between them, and that the first bump had to bring one. The first migration has now
-happened — 1,188 batches restated by hand, from a reviewed plan — so the shape is known:
-versioned, planned before applied, recorded in the ledger, idempotent. Writing it down as
-a mechanism is cheaper now, with one instance to generalise from, than after the second.
+So the seam is not a login. A name becomes an actor in one place, and the day a token
+arrives it is a substitution there rather than an edit in six endpoints, three CLIs and
+four writers. Three things it carries:
+
+- **The basis, not only the name.** A name from a form field and a name from a verified
+  token are different claims, and a store where they are indistinguishable cannot be
+  asked which kind it holds. The pipeline already ranks its own figures this way —
+  `measured` over `stated` over `defaulted` — and an audit field is the same problem.
+- **Absent means self-asserted, so nothing was written and nothing migrated.** A marker
+  on every record distinguishes nothing, and `self_asserted` is what every record
+  already is. It is serialised only when it is not, which is the only day it means
+  anything. Every existing record is correctly classified by the new reader.
+- **A claim that disagrees with a session is refused**, not resolved one way or the
+  other. A form saying `bob` under a token saying `alice` is a mistake or an attempt,
+  and a change attributed to someone who did not make it is worse than one attributed
+  to nobody. Nothing passes `verified` yet; the rule is written down before it can be
+  got wrong.
+
+It also closed a hole of the same shape as the one the workspace seam found. `by`
+defaulted to `""` on `ledger.restate` and `ledger.void`, so enforcement lived entirely
+at the four entry points and the next caller to go round one of them would have written
+an unattributed record in silence. **The default is the hole**; there is no default now.
+
+**A migration path. Half cut 2026-09-15 — `store/migration.py`.** TODO.md noted there
+was a schema version, a refusal, and nothing between them. The first migration has now
+happened — 1,188 batches restated from a reviewed plan — so the shape is known:
+versioned, planned before applied, recorded in the ledger, idempotent.
+
+**Planned before applied** is the half that was failing today, and it was failing in the
+way the two file editors already knew about. `store restate` printed a plan and then, on
+`--apply`, **selected again from scratch** — so what changed was whatever the predicate
+matched at that second, not what was counted and approved, and shadow write lands
+batches while a plan is being read. Three things decided the fix:
+
+- **The selection is the basis, not the selector.** The candidate that looks right and
+  checks nothing is digesting the selector arguments: `--loaded-before X --layer
+  canonical` digests identically at both moments and selects differently, which is the
+  failure wearing a safety check's clothes. The digest covers the sorted batch ids, the
+  operation and the target layer.
+- **Applying replays the plan; it never re-selects.** Re-selecting and comparing would
+  still rest on the selector behaving identically twice. A fixed list rests on nothing,
+  and what is checked at apply time becomes "are these batches still as the plan assumed"
+  — a question about the store rather than about the query.
+- **A refusal names what moved.** "Stale" sends someone to re-run the command and hope.
+  *`20260915_201350-d26005` has been restated since the plan was made — applying would
+  overwrite somebody else's correction* does not.
+
+`--apply` over a predicate now needs `--plan`. Selecting by `--batch` alone is exempt: a
+list of ids names the batches rather than describing them, so it cannot match something
+else tomorrow.
+
+**Still missing, and now the whole of this seam:** a migration has no identity. The 1,188
+lines share a reason string, so a store cannot be asked *which* migrations have run
+against it — only grepped. And the two kinds are still conflated: a layout change bumps
+`SCHEMA_VERSION` and old code must refuse, while a restatement leaves the version alone
+and changes the store anyway. The first migration that actually happened was the second
+kind, which the stamp does not cover, and the refusal it would print names a `migrate`
+command that does not exist.
 
 ### Order
 
-1. **Retain per-rule hits** on the run manifest. Smallest, and everything else on the
-   policy screen is weaker without it: editing a rule without seeing what it reached is a
-   form with no feedback.
-2. **Macro editing**, then **rule editing**. Scalars first because they are a form over
-   JSON with a diff; rules second because they need the proposal-and-approve contract
-   above.
-3. **The results screen**, over the workbook, located from the manifest.
-4. **The workspace seam**, then **the identity seam**, then **the migration mechanism**.
+1. **Retain per-rule hits** on the run manifest. **Done, 2026-09-15** — the manifest
+   carries what each rule matched, what was still standing after the later rules, the
+   columns a skipped rule wanted and the sample SKUs; `GET /policy` serves them from the
+   newest run under the same rule bytes and the screen shows them per rule. Details
+   under §2. Smallest, and everything else on the policy screen is weaker without it:
+   editing a rule without seeing what it reached is a form with no feedback.
+2. **Macro editing, then rule editing** — **both done, 2026-09-15**. Scalars first
+   because they are a form over JSON with a diff: a registry of the settings the engine
+   reads, a surgical one-line edit, validation by loading, the rationale in an
+   append-only log beside the files. Rules second, over the same propose-and-approve
+   contract — the digest of the file is what ties an approval to the diff it was shown
+   — with edit, add and remove, and the rule's own rationale, owner and date moving with
+   the change. `policy/edits.py` holds what the two share, so there is one place the
+   basis is checked and one log. Details under §2. What I said rule editing would still
+   need — review by someone other than the author — it does not, and §2 says why.
+3. **The results screen**, over the workbook, located from the manifest. **Done,
+   2026-09-15** — it renders the run's own files and computes nothing, down to using
+   the workbook's own number formats so the page and the file cannot disagree. Details
+   under §2, M4.
+4. **The workspace seam** and **the identity seam** — both **done, 2026-09-15**; the
+   **migration mechanism** half done, plan-to-apply binding built and migration identity
+   still open. `workspace.py` resolves all three directories from a
+   tenant id in one place; every entry point takes `--tenant`. The default tenant moves
+   no path, which the tests assert directly. Two things came out of doing it: the
+   isolation §7 called untestable now has a `contains()` to assert against, and a real
+   defect surfaced — `--output` defaulted to the string `"output"`, so argparse handed
+   it over as an explicit argument on every run and it outranked the tenant. A tenant's
+   outputs went to the shared directory the results screen reads while config and store
+   were correctly isolated. The same literal was in the API service and its server. A
+   default is not an argument, and the entry points now pass `None` for what they were
+   not given.
 5. **Decisions in the store (P6)** — and not before. The results screen does not need it;
    feedback learning does, and that is the thing to build it for.
+
+   **Revised 2026-09-15, on looking at it.** Feedback learning had never run: 2,430
+   decision snapshots, 63 MB, not one ever scored, and `collector.py`, `loss.py` and
+   `drift.py` with no caller anywhere in the package. Building a substrate for a
+   consumer that has never run is the thing this document rules out elsewhere, so the
+   loop was closed first — `feedback/actuals.py` and `python -m inventory_planning.feedback`.
+   The reason it had never closed was in the signature: `record_actuals(sales_df,
+   inventory_df)` asked a person to assemble two frames by hand a month later, and the
+   store already held both.
+
+   Three things the closing decided, which the substrate now has to preserve rather than
+   be designed around:
+
+   - **The decision record is never written to.** Actuals are read at scoring time, so
+     there is nothing to write back. Both `FeedbackCollector` and `LossCalculator.compute`
+     were writing into the snapshot, which made a decision mutable — and a record that
+     can be edited afterwards cannot say what was decided at the time, which is the only
+     question it is kept for. The score is its own record under `<store>/scores/`.
+   - **The scoring period comes from `as_of`, not `planning_month`.** A snapshot carries
+     both: the first is the newest date in the data the run anchored to, the second is
+     the wall clock when it executed. `forecast_next_period` is the forecast for the
+     period after `as_of`. Scoring by the wall clock would compare a 2024-08 forecast
+     against 2026-09 demand and report a confident number.
+   - **The extract is named, not searched for.** `FactQuery.current` refuses on sales
+     history — the stored batches carry no `so_line_number`, so the key is incomplete —
+     and reading every batch would multiply-count one extract by the number of times it
+     was imported. A score names the batch it was computed against, the way a run
+     manifest names the facts it planned on, and that batch id is in the score record.
+
+   What this leaves for the substrate is narrower and better understood: `run_id` is in
+   the snapshot's *filename* and not its body, and there is no query layer over 2,430
+   JSON files. Both are worth fixing; neither was the reason the loop was open.
 
 Still out: multi-node planning, editable facts, and moving the rule engine into a database
 before C/S actually requires it.
@@ -565,7 +814,8 @@ before C/S actually requires it.
 
 - Editable fact rows. Unchanged from DATA_LAYER.md.
 - Re-keying an ERP export into a template.
-- A planning or analysis UI. Excel is the output.
+- A planning or analysis UI. Excel is the output, and the results screen renders
+  that workbook rather than becoming one — it computes nothing (§2, M4).
 - Settings whose semantics do not exist yet, exposed as switches.
 - UI-only state of any kind — sessions, drafts, saved filters that change a result.
 - A "continue anyway" button. `allow_degraded` exists for a judgement a threshold got

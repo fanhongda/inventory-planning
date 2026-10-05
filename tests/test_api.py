@@ -1644,3 +1644,49 @@ class TestTheMacroScreenIsGraded:
         assert body["inventory_target_value"]["unset"] is True
         # A convention has no unset state, so the flag must not fire on one.
         assert body["days_per_year"]["unset"] is False
+
+
+class TestStartingARunFromTheScreen:
+    """
+    The endpoint the policy screen could not reach. Everything that can refuse refuses
+    on this request rather than inside the thread, so a caller holding a run id knows
+    the run began — a gate failure surfacing a minute later would arrive as a failed
+    run and read as a defect in the planning rather than as documents never fit to plan
+    from.
+    """
+
+    def test_an_empty_workspace_refuses_with_a_reason_a_screen_can_show(self, client):
+        posted = client.post("/runs", json={})
+        assert posted.status_code == 409
+        assert "nothing is landed" in posted.json()["detail"]["reason"]
+
+    def test_what_is_landed_may_not_add_up_and_the_gap_is_named(self, client):
+        _upload(client)                       # inventory only
+        posted = client.post("/runs", json={})
+        assert posted.status_code == 409
+        detail = posted.json()["detail"]
+        assert detail["landed"] == ["inventory"]
+        assert [m["capability"] for m in detail["missing"]]
+        assert all(m["why"] for m in detail["missing"]), "a gap with no consequence"
+
+    def test_a_date_without_a_value_is_refused_before_anything_is_read(self, client):
+        posted = client.post("/runs", json={"target_date": "2026-12-31"})
+        assert posted.status_code == 400
+        assert "nothing" in posted.json()["detail"]
+
+    def test_a_date_it_would_misread_is_refused(self, client):
+        posted = client.post("/runs", json={"target_value": 1,
+                                            "target_date": "31/12/2026"})
+        assert posted.status_code == 400
+
+    def test_nothing_in_flight_is_a_state_rather_than_a_404(self, client):
+        body = client.get("/runs/in-flight").json()
+        assert body["status"] == "none" and body["running"] is False
+
+    def test_in_flight_is_not_read_as_a_run_id(self, client):
+        """
+        Starlette matches in registration order, and `in-flight` is a perfectly good
+        run id as far as the path converter knows.
+        """
+        assert client.get("/runs/in-flight").json()["status"] == "none"
+        assert client.get("/runs/in-flight").status_code == 200

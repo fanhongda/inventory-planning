@@ -517,6 +517,53 @@ class Intake:
 
                 claims.setdefault(doc.doc_type, []).append(doc)
 
+        return self._settle(result, claims, unrecognised)
+
+    def load_frames(
+        self,
+        frames: List[Tuple[pd.DataFrame, str]],
+    ) -> IntakeResult:
+        """
+        The same intake over frames that have already been read, for a run driven from
+        the fact store rather than from a folder.
+
+        Everything after routing is identical and is shared, because the cross-document
+        checks are the half of intake that matters most and a second copy of them would
+        be a second answer: SKU agreement, key shape, PO overlap and the capability plan
+        decide whether a run may happen at all, and a store-driven run that skipped any
+        of them would be the one path into the pipeline with no gate on it.
+
+        No `doc_type_hint`, for the reason the summary endpoint gives: handing back the
+        type a batch was landed under pins the first decision permanently, and a hint
+        routes at a flat 1.0 where this should report what it measured.
+        """
+        result = IntakeResult()
+        unrecognised: List[str] = []
+        claims: Dict[str, List[LoadedDocument]] = {}
+
+        for raw, source_name in frames:
+            tabular, reason = is_tabular(raw)
+            if not tabular:
+                result.failures.append((source_name, f"skipped: {reason}"))
+                unrecognised.append(source_name)
+                continue
+            try:
+                doc = self.load_frame(raw, source_name=source_name)
+            except Exception as exc:
+                result.failures.append((source_name, f"could not process: {exc}"))
+                unrecognised.append(source_name)
+                continue
+            claims.setdefault(doc.doc_type, []).append(doc)
+
+        return self._settle(result, claims, unrecognised)
+
+    def _settle(
+        self,
+        result: IntakeResult,
+        claims: Dict[str, List[LoadedDocument]],
+        unrecognised: List[str],
+    ) -> IntakeResult:
+        """Everything after routing: whoever wins each contract, and what that leaves."""
         loaded: Dict[str, str] = {}
         withheld: Dict[str, set] = {}
         for doc_type, docs in claims.items():

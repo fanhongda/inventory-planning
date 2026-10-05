@@ -480,6 +480,93 @@ function rulesCard(body, reload) {
     changesCard(body.changes, "Rule changes made here"));
 }
 
+// ── Starting a run ──────────────────────────────────────────────────────────
+//
+// The button this page existed without. Everything above it changes what a run would
+// do, and until now finding out meant opening a terminal — so the screen that knew the
+// most about a change was the one place its consequence could not be seen.
+//
+// There is deliberately no "run anyway" box beside it. A gate refusal is shown with its
+// findings and a pointer to the quality screen, where a waiver carries a reason, an
+// owner and an expiry. A checkbox here would be `allow_degraded=True` with manners.
+
+function refusal(detail) {
+  if (!detail || typeof detail !== "object") {
+    return el("p", { class: "status bad" }, String(detail || "refused"));
+  }
+  const findings = (detail.findings || []).map((f) => el("div", { class: "finding" },
+    el("p", {}, el("strong", {}, f.check), f.severity ? ` · ${f.severity}` : ""),
+    f.what ? el("p", {}, f.what) : null,
+    f.fix ? el("p", { class: "note" }, `Fix: ${f.fix}`) : null));
+  const missing = (detail.missing || []).map((m) => el("li", {},
+    el("code", {}, m.capability), m.why ? ` — ${m.why}` : ""));
+
+  return el("div", { class: "card stop" },
+    el("p", {}, detail.reason || "The run was refused."),
+    missing.length ? el("ul", { class: "impacts" }, missing) : null,
+    findings.length ? el("div", {}, findings) : null,
+    detail.landed && detail.landed.length
+      ? el("p", { class: "note" }, `Landed: ${detail.landed.join(", ")}`) : null);
+}
+
+function runNowCard(reload) {
+  const out = el("div", {});
+  const target = el("input", { placeholder: "optional — plan down to this value",
+                               inputmode: "decimal" });
+  const by = el("input", { placeholder: "optional — YYYY-MM-DD" });
+  const button = el("button", { class: "primary" }, "Plan from what is landed");
+  let timer = null;
+
+  const poll = async () => {
+    const state = await api("/runs/in-flight");
+    mount(out, el("p", { class: state.status === "failed" ? "status bad" : "note" },
+      state.status === "failed"
+        ? `Run ${state.run_id} failed: ${state.error}`
+        : `Run ${state.run_id} — ${state.stage}`
+          + (state.documents.length ? ` · ${state.documents.length} documents, `
+             + `${state.batch_ids.length} batches` : "")));
+    if (state.running) { timer = setTimeout(poll, 2000); return; }
+    button.disabled = false;
+    clearTimeout(timer);
+    // Re-read the whole page rather than appending the new run to the list: the run
+    // may have changed what the rules reached, and a list patched in place would be
+    // the interface telling itself what happened instead of asking.
+    if (state.status === "done") reload(`Run ${state.run_id} finished.`);
+  };
+
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    mount(out, el("p", { class: "note" }, "Starting…"));
+    try {
+      const body = {};
+      if (target.value.trim()) body.target_value = Number(target.value.trim());
+      if (by.value.trim()) body.target_date = by.value.trim();
+      await api("/runs", { method: "POST",
+                           headers: { "content-type": "application/json" },
+                           body: JSON.stringify(body) });
+      poll();
+    } catch (err) {
+      button.disabled = false;
+      mount(out, refusal(err.detail !== undefined ? err.detail : err.message));
+    }
+  });
+
+  return el("section", { class: "card ask" },
+    el("h2", {}, "Run"),
+    el("p", { class: "sub" },
+       "Plans from the batches landed on the import review screen, under the rules "
+       + "above as they stand now. The run records which batches it read, so two runs "
+       + "over the same ones can be told apart from two runs that only look alike."),
+    el("div", { class: "row2" },
+      el("div", {}, el("label", {}, "Inventory target for this run only"), target),
+      el("div", {}, el("label", {}, "Reach it by"), by)),
+    el("p", { class: "note" },
+       "Left empty, the standing target in targets.json applies — or none, if none is "
+       + "set. Filling these does not change it."),
+    el("div", {}, button),
+    out);
+}
+
 function runsCard(runs, onDiff) {
   if (!runs.length) {
     return el("section", { class: "card" },
@@ -569,6 +656,7 @@ export async function mountPolicy(applied = "") {
         note: "The band boundaries the rules are written against.",
       }),
       rulesCard(policy, reload),
+      runNowCard(reload),
       runsCard(runs.runs, onDiff),
       diffHost);
   } catch (err) {

@@ -216,6 +216,7 @@ class Service:
         # writes to, so the interface reads the runs the CLI produced rather than
         # keeping a second record that could disagree with it.
         self.output_dir = self.workspace.output_dir
+        self._runner = None
         self.contracts = default_registry()
 
     @property
@@ -297,6 +298,21 @@ class Service:
         plan = CapabilityResolver().resolve(names, withheld=withheld)
         return LandedIntake(documents=documents, plan=plan, records=records,
                             declarations=declarations, withheld=withheld)
+
+    @property
+    def runner(self):
+        """
+        The single-slot runner for this workspace, made on first use.
+
+        One per `Service`, which is one per server, which is one per workspace — the
+        same scope the output directory and the run registry have, and those are what
+        two concurrent runs would interleave.
+        """
+        if self._runner is None:
+            from .runner import Runner
+
+            self._runner = Runner(self)
+        return self._runner
 
     def status_of(self, batch_id: str) -> str:
         """
@@ -1293,6 +1309,66 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                 basis=str(payload.get("basis") or ""), config_dir=root).to_dict()
         except MacroError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/runs")
+    def start_run(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+        """
+        Plan from what is landed, in the background, and hand back the state to poll.
+
+        Until this existed the interface could change everything a run depends on and
+        could not start one: a planner signing a change to `transit_share_of_lt` on the
+        policy screen had to open a terminal to find out what it did.
+
+        The three refusals are checked on this request rather than inside the thread,
+        so a caller holding a run id knows the run began. A gate failure discovered a
+        minute later would arrive as a failed run and read as a defect in the planning
+        rather than as documents that were never fit to plan from.
+
+        `target_value` here is run-scoped, like `--target` on the command line: it
+        overrides the standing target in `targets.json` for this run and does not edit
+        it. Omitted, the standing target applies.
+        """
+        from ..policy.target import StatedTargetError
+        from .runner import RunRefused
+
+        target = body.get("target_value")
+        deadline = None
+        if body.get("target_date"):
+            from datetime import datetime as _dt
+            try:
+                deadline = _dt.strptime(str(body["target_date"]).strip(),
+                                        "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(
+                    400, f"target_date must be YYYY-MM-DD — "
+                         f"{body['target_date']!r} is not.") from None
+        if deadline is not None and target is None:
+            raise HTTPException(
+                400, "target_date needs target_value; on its own there is nothing "
+                     "to date.")
+        try:
+            state = service.runner.start(
+                target_value=float(target) if target is not None else None,
+                deadline=deadline)
+        except RunRefused as refused:
+            # 409 rather than 400: the request is well formed and the workspace is not
+            # in a state to serve it, which is a different thing for a caller to show.
+            raise HTTPException(
+                409, {"reason": refused.reason, **refused.detail}) from refused
+        except StatedTargetError as refused:
+            raise HTTPException(400, str(refused)) from refused
+        return state.to_dict()
+
+    @app.get("/runs/in-flight")
+    def run_in_flight() -> Dict[str, Any]:
+        """
+        Where the run this server started got to, or that none has been.
+
+        Registered before `/runs/{run_id}` because Starlette matches in order and
+        `in-flight` is a perfectly good run id as far as the path converter knows.
+        """
+        state = service.runner.state
+        return state.to_dict() if state else {"status": "none", "running": False}
 
     @app.get("/runs")
     def runs(limit: int = Query(50, ge=1, le=500)) -> Dict[str, Any]:

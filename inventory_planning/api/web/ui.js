@@ -46,7 +46,20 @@ const firstSentence = (text, cap = 96) => {
 async function api(path, options) {
   const response = await fetch(path, options);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || `${response.status} ${path}`);
+  if (!response.ok) {
+    // A refusal is sometimes a sentence and sometimes a structure — the run gate sends
+    // back the findings that stopped it, and `String()` on those is "[object Object]".
+    // The message stays the sentence so every existing caller reads the same; the
+    // detail is carried alongside for the callers that can show more than one line.
+    const detail = body.detail;
+    const message = typeof detail === "string" && detail
+      ? detail
+      : (detail && detail.reason) || `${response.status} ${path}`;
+    const error = new Error(message);
+    if (detail !== undefined && typeof detail !== "string") error.detail = detail;
+    error.status = response.status;
+    throw error;
+  }
   return body;
 }
 

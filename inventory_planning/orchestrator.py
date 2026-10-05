@@ -554,7 +554,7 @@ class InventoryPlanner:
             self._store = False
         return self._store or None
 
-    def absorb_intake(self, loaded: dict) -> dict:
+    def absorb_intake(self, loaded: dict, batches: dict = None) -> dict:
         """
         Take what an intake pass found, so this run can report it later.
 
@@ -571,7 +571,7 @@ class InventoryPlanner:
         self._intake_plan = loaded.pop("_intake_plan", None) or self._intake_plan
         self._fx = loaded.pop("_fx", None) or self._fx
         if self._intake is not None:
-            self.run.record_intake(self._intake)
+            self.run.record_intake(self._intake, batches=batches)
         return loaded
 
     def uom_for(self, *frames):

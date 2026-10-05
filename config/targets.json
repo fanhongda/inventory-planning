@@ -1,0 +1,50 @@
+{
+  "_what_this_is": [
+    "What good looks like, as opposed to how to compute it.",
+    "",
+    "Every other file in this directory is a convention — how a figure is worked out.",
+    "`planning_parameters.md` decides whether cycle stock is D×R or D×R/2, whether DIOH",
+    "divides by 365 or by working days. None of them say what the answer should be.",
+    "",
+    "So the run could measure a gap between what stock is and what it should be, and had",
+    "nothing to say about whether that gap was acceptable. `TargetPlanner` has existed",
+    "since the should-be engine did, and nothing could start it: no flag, no setting, no",
+    "field. The ordered set of moves it produces was unreachable from any surface a",
+    "person uses."
+  ],
+
+  "_not_here_yet": [
+    "Inventory turnover and an on-time-delivery target belong beside the one below and",
+    "are deliberately absent rather than stubbed. A key nothing reads is worse than a",
+    "missing one: it reads as configured, and the first person to set it would be",
+    "entitled to believe the run had taken it into account.",
+    "",
+    "OTD in particular is not ready to be a target. The KPI review already refuses to",
+    "score one: where request-date discipline is poor it says so and declines, because a",
+    "target set against a number half of whose lines carry a date nobody meant is a",
+    "target met or missed by order entry. It is a measuring stick first, and the",
+    "attribution — how much of the gap stock could close at all — comes before any",
+    "number here."
+  ],
+
+  "_how_the_target_is_used": [
+    "`inventory_target_value` is a balance-sheet figure in the reporting currency, and",
+    "it produces an ordered set of actions rather than a number: free and reversible",
+    "first (stop buying, push out inbound), then recurring cost, then service. What was",
+    "deliberately not recommended is part of the output.",
+    "",
+    "`inventory_target_date` is what makes it honest. Excess stock converts to cash only",
+    "as fast as demand consumes it, so a SKU with 300 days of cover cannot contribute",
+    "its full excess by December — only the part that will actually be consumed. A",
+    "target with no date is accepted and planned without that limit, which reads as a",
+    "larger reduction than the calendar can deliver; the frontier says so where it",
+    "applies.",
+    "",
+    "Both may be null. Null is not zero: no target is stated, no frontier is computed,",
+    "and the run reports what stock should be without an opinion about what it must be.",
+    "A target of 0 is a target."
+  ],
+
+  "inventory_target_value": null,
+  "inventory_target_date": null
+}

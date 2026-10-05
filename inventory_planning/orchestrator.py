@@ -231,7 +231,7 @@ class InventoryPlanner:
         from .policy.levers import LeverAnalyzer
         from .policy.should_be import ShouldBeCalculator
         from .policy.suggestions import SuggestionBuilder
-        from .policy.target import TargetPlanner
+        from .policy.target import TargetPlanner, stated_target
 
         print("\n[8/8] Policy analysis — should-be, levers, target...")
 
@@ -333,7 +333,16 @@ class InventoryPlanner:
             "frontier": None,
         }
 
+        # The standing target, unless this run was given one. An argument beats the
+        # file for the same reason it does everywhere else here: a planner asking
+        # "what if we had to reach $4M" is asking about this run, not editing policy.
+        stated = stated_target(self.config_dir)
+        if target_value is None:
+            target_value, deadline = stated.value, stated.deadline
         if target_value is not None:
+            if deadline is None:
+                print("    target has no date — planned without the burn-down limit, "
+                      "so the reduction shown is more than the calendar can deliver")
             holding_rate = float(resolved.defaults.get("holding_cost_rate", 0.22))
             frontier = TargetPlanner(holding_rate).plan(
                 should_be, target_value=target_value, deadline=deadline,
@@ -342,6 +351,12 @@ class InventoryPlanner:
             print()
             print(frontier.summary())
             out["frontier"] = frontier
+        else:
+            # Said rather than left silent. A run with no frontier and a run whose
+            # frontier was dropped look identical in the output, and the second is what
+            # happens when a target is set somewhere this does not read.
+            print(f"    no inventory target stated ({stated.source}) — should-be is "
+                  f"reported without an opinion about what it must be")
 
         # Rewritten now that the policy stage has produced the half of the workbook the
         # planning stage could not: should-be, the suggestions, the S&IOP projection.
@@ -459,6 +474,13 @@ class InventoryPlanner:
         print(forward.summary())
 
         frontier = policy.get("frontier")
+        if frontier is None and target_value is None:
+            # Same fall-back as the policy stage, for the case this is called without
+            # one having run: a standing target the report ignored would be a target
+            # the planner believes is in force and cannot see.
+            from .policy.target import stated_target as _stated
+            stated = _stated(self.config_dir)
+            target_value, deadline = stated.value, stated.deadline
         if frontier is None and target_value is not None:
             from .policy.target import TargetPlanner
             holding = float(policy["parameters"].defaults.get("holding_cost_rate", 0.22))
@@ -532,7 +554,7 @@ class InventoryPlanner:
             self._store = False
         return self._store or None
 
-    def absorb_intake(self, loaded: dict) -> dict:
+    def absorb_intake(self, loaded: dict, batches: dict = None) -> dict:
         """
         Take what an intake pass found, so this run can report it later.
 
@@ -549,7 +571,7 @@ class InventoryPlanner:
         self._intake_plan = loaded.pop("_intake_plan", None) or self._intake_plan
         self._fx = loaded.pop("_fx", None) or self._fx
         if self._intake is not None:
-            self.run.record_intake(self._intake)
+            self.run.record_intake(self._intake, batches=batches)
         return loaded
 
     def uom_for(self, *frames):

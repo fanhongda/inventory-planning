@@ -114,6 +114,52 @@ def _actor(body: Dict[str, Any], what: str):
         raise HTTPException(400, str(exc)) from exc
 
 
+# What an item grid shows, out of the 113 columns the Parameters sheet carries. Chosen
+# rather than paged through because a grid wide enough to need scrolling sideways is a
+# grid whose first screen decides what gets read, and that decision should be made here
+# and on purpose. The drill-down carries the rest.
+_ITEM_COLUMNS = (
+    "sku", "product_family", "abc_class", "stocking_class", "demand_pattern",
+    "policy_in_force", "policy_implied", "policy_implied_because", "policy_agrees",
+    "actual_value", "should_be_value", "gap_value", "coverage_ratio",
+    "changes_suggested", "ss_delta_value_suggested",
+    "service_level", "review_period_days", "lead_time_days", "demand_cv",
+)
+
+
+def _number(value: Any) -> Optional[float]:
+    """A cell as a number, or None. Workbook cells arrive as text where formatted."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _disagreements(row: Dict[str, Any]) -> List[str]:
+    """
+    Which of this run's own disagreements this item is in, named, not scored.
+
+    Restating columns the run wrote rather than judging anything: `policy_agrees` is its
+    verdict, `changes_suggested` is the suggestion engine's sentence, and a gap is
+    should-be against actual. Nothing is recomputed and nothing is thresholded — a
+    cutoff here would be a number invented by the interface, and the screen sorts by
+    money instead.
+    """
+    flags = []
+    agrees = row.get("policy_agrees")
+    if agrees is not None and str(agrees).strip().lower() in ("false", "0", "no"):
+        flags.append("policy")
+    gap = _number(row.get("gap_value"))
+    if gap:
+        flags.append("position")
+    changes = row.get("changes_suggested")
+    if changes and str(changes).strip().lower() not in ("none", "nan", ""):
+        flags.append("parameters")
+    return flags
+
+
 def _output_kind(name: str) -> str:
     """
     How the screen should offer one output: a workbook to browse, text to read, or a
@@ -216,6 +262,7 @@ class Service:
         # writes to, so the interface reads the runs the CLI produced rather than
         # keeping a second record that could disagree with it.
         self.output_dir = self.workspace.output_dir
+        self._runner = None
         self.contracts = default_registry()
 
     @property
@@ -297,6 +344,21 @@ class Service:
         plan = CapabilityResolver().resolve(names, withheld=withheld)
         return LandedIntake(documents=documents, plan=plan, records=records,
                             declarations=declarations, withheld=withheld)
+
+    @property
+    def runner(self):
+        """
+        The single-slot runner for this workspace, made on first use.
+
+        One per `Service`, which is one per server, which is one per workspace — the
+        same scope the output directory and the run registry have, and those are what
+        two concurrent runs would interleave.
+        """
+        if self._runner is None:
+            from .runner import Runner
+
+            self._runner = Runner(self)
+        return self._runner
 
     def status_of(self, batch_id: str) -> str:
         """
@@ -783,6 +845,10 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
 
         return {"batch_id": batch_id, "doc_type": doc.doc_type,
                 "documents": documents,
+                # What the currency form may offer. Beside the resting figures rather
+                # than inside them: the ledger is an ingest-layer structure that knows
+                # nothing of the FX table, and should not learn.
+                "currencies": _currency_options(service.config_dir),
                 "resting_on": _resting(service, doc, declarations).to_dict()}
 
     @app.get("/batches/{batch_id}/canonical")
@@ -1188,6 +1254,10 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                 "choices": list(setting.choices) if setting else [],
                 "impact": setting.impact if setting else "",
                 "file": setting.filename if setting else None,
+                # How often this is a planner's decision. A reading nothing may write
+                # is derived whatever file it came out of.
+                "group": setting.group if setting else macro_edit.DERIVED,
+                "unset": setting is not None and setting.clearable and value is None,
             })
 
         try:
@@ -1220,6 +1290,36 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             "money in any of these is converted on read"
             if table.currencies else "no rates configured — money is not converted")
 
+        # The targets, through the reader the run uses. Listed even when unset, which
+        # is the whole reason they are here: a screen that asked only how to compute a
+        # figure, and never what it should be, is how `TargetPlanner` went unstartable.
+        # A refusal is shown rather than swallowed — a target the run will reject is
+        # worth more on screen than a blank that looks like nobody set one.
+        from ..policy.target import StatedTargetError, stated_target
+
+        try:
+            stated = stated_target(root)
+            note = ("" if stated else "no target stated — the run offers no opinion "
+                                      "about what stock must be")
+            add("inventory_target_value", stated.value, "targets.json", note)
+            add("inventory_target_date",
+                stated.deadline.isoformat() if stated.deadline else None, "targets.json",
+                "planned without the burn-down limit" if stated.undated else "")
+        except StatedTargetError as refused:
+            add("inventory_target_value", None, "targets.json", str(refused))
+            add("inventory_target_date", None, "targets.json", str(refused))
+
+        # Ordered by how often a planner has to decide, not by which file it lives in.
+        # The file is the one dimension a reader does not care about, and sorting by it
+        # left the two settings nobody had set sitting between a label and a calendar
+        # convention, in the same typeface.
+        order = {name: i for i, name in enumerate(macro_edit.GROUPS)}
+        out["settings"].sort(key=lambda s: order.get(s["group"], len(order)))
+        out["groups"] = [
+            {"name": name, "settings": [s["name"] for s in out["settings"]
+                                        if s["group"] == name]}
+            for name in macro_edit.GROUPS
+        ]
         out["changes"] = macro_edit.history(root, limit=20)
         return out
 
@@ -1255,6 +1355,66 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                 basis=str(payload.get("basis") or ""), config_dir=root).to_dict()
         except MacroError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/runs")
+    def start_run(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+        """
+        Plan from what is landed, in the background, and hand back the state to poll.
+
+        Until this existed the interface could change everything a run depends on and
+        could not start one: a planner signing a change to `transit_share_of_lt` on the
+        policy screen had to open a terminal to find out what it did.
+
+        The three refusals are checked on this request rather than inside the thread,
+        so a caller holding a run id knows the run began. A gate failure discovered a
+        minute later would arrive as a failed run and read as a defect in the planning
+        rather than as documents that were never fit to plan from.
+
+        `target_value` here is run-scoped, like `--target` on the command line: it
+        overrides the standing target in `targets.json` for this run and does not edit
+        it. Omitted, the standing target applies.
+        """
+        from ..policy.target import StatedTargetError
+        from .runner import RunRefused
+
+        target = body.get("target_value")
+        deadline = None
+        if body.get("target_date"):
+            from datetime import datetime as _dt
+            try:
+                deadline = _dt.strptime(str(body["target_date"]).strip(),
+                                        "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(
+                    400, f"target_date must be YYYY-MM-DD — "
+                         f"{body['target_date']!r} is not.") from None
+        if deadline is not None and target is None:
+            raise HTTPException(
+                400, "target_date needs target_value; on its own there is nothing "
+                     "to date.")
+        try:
+            state = service.runner.start(
+                target_value=float(target) if target is not None else None,
+                deadline=deadline)
+        except RunRefused as refused:
+            # 409 rather than 400: the request is well formed and the workspace is not
+            # in a state to serve it, which is a different thing for a caller to show.
+            raise HTTPException(
+                409, {"reason": refused.reason, **refused.detail}) from refused
+        except StatedTargetError as refused:
+            raise HTTPException(400, str(refused)) from refused
+        return state.to_dict()
+
+    @app.get("/runs/in-flight")
+    def run_in_flight() -> Dict[str, Any]:
+        """
+        Where the run this server started got to, or that none has been.
+
+        Registered before `/runs/{run_id}` because Starlette matches in order and
+        `in-flight` is a perfectly good run id as far as the path converter knows.
+        """
+        state = service.runner.state
+        return state.to_dict() if state else {"status": "none", "running": False}
 
     @app.get("/runs")
     def runs(limit: int = Query(50, ge=1, le=500)) -> Dict[str, Any]:
@@ -1337,6 +1497,159 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             "note": "This screen renders these files. It does not recompute anything "
                     "in them — a second place the figures were formatted and rounded "
                     "would be a second place they could disagree.",
+        }
+
+    @app.get("/runs/{run_id}/items")
+    def run_items(run_id: str, view: str = Query("disagreement"),
+                  limit: int = Query(200, ge=1, le=2000)) -> Dict[str, Any]:
+        """
+        The items worth looking at, which is not the same as all of them.
+
+        A flat table of every SKU, sorted by item number, asks a planner to find the
+        exceptions in it — and a page nobody finishes reading produces the belief that
+        it was read. So the default is the rows where this run disagrees with the
+        organisation it is planning for, which is the thing the pipeline exists to do.
+
+        Nothing here is computed. Every figure is a cell the run wrote, and the three
+        groupings restate columns it wrote too: `policy_agrees` is the run's own verdict
+        on whether the policy in force is the one the evidence implies, `changes` is the
+        sentence the suggestion engine produced, and `gap_value` is should-be against
+        actual. The ordering is by money, for the reason the resting-on list is: an
+        assumption governing every line of the stock snapshot and one governing four
+        rows of a sample, printed in the same typeface, spend the reader's attention
+        uniformly on figures that are not uniformly expensive.
+
+        No threshold decides what counts. A cutoff would be a number invented here, and
+        the sort already puts the expensive end first — which is the same information
+        without a line drawn across it by nobody in particular.
+        """
+        from ..reporting.read_workbook import WorkbookUnreadable, read_sheet
+
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+        workbook = next((r.get("name") for r in manifest.get("outputs") or []
+                         if str(r.get("name") or "").startswith("planning_")
+                         and _output_kind(r.get("name") or "") == "workbook"), None)
+        if workbook is None:
+            raise HTTPException(404, f"run {run_id!r} wrote no planning workbook.")
+
+        try:
+            # Read whole, then projected. These sheets are one row per item and the
+            # sort is over all of them, so a paged read would order the page rather
+            # than the catalogue — which is the one thing this endpoint is for.
+            sheet = read_sheet(_output_path(run_id, workbook), "Parameters",
+                               limit=100_000)
+        except WorkbookUnreadable as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+        at = {name: i for i, name in enumerate(sheet.columns)}
+        wanted = [c for c in _ITEM_COLUMNS if c in at]
+        rows = []
+        for values in sheet.rows:
+            row = {c: values[at[c]] for c in wanted}
+            row["flags"] = _disagreements(row)
+            rows.append(row)
+
+        groups = {
+            "policy": [r for r in rows if "policy" in r["flags"]],
+            "position": [r for r in rows if "position" in r["flags"]],
+            "parameters": [r for r in rows if "parameters" in r["flags"]],
+        }
+        money = lambda r: abs(_number(r.get("gap_value")) or 0.0)   # noqa: E731
+        for name in groups:
+            groups[name] = sorted(groups[name], key=money, reverse=True)[:limit]
+
+        return {
+            "run_id": run_id, "run_at": manifest.get("run_at"), "workbook": workbook,
+            "columns": wanted,
+            "total": len(rows),
+            "flagged": sum(1 for r in rows if r["flags"]),
+            "view": view,
+            "groups": groups,
+            "all": sorted(rows, key=money, reverse=True)[:limit] if view == "all" else [],
+        }
+
+    @app.get("/runs/{run_id}/skus/{sku}")
+    def sku_detail(run_id: str, sku: str) -> Dict[str, Any]:
+        """
+        One item, as this run saw it: what it did, what it is expected to do, and the
+        policy that follows.
+
+        Read out of the run's own workbook, like the results screen and under the same
+        constraint — nothing here is computed. The `Forecast` sheet already carries the
+        history beside the forecast on one row, which is what makes this cheap; a screen
+        that re-forecast to draw a chart would be a second forecast, and the first time
+        the two disagreed the planner would have no way to tell which was the plan.
+
+        What this cannot show is said rather than left to be noticed. There is no
+        cleansed history, because nothing in this pipeline cleanses demand history — the
+        only outlier trim anywhere is on lead time, in `ingest_bridge._prepare_po_history`
+        — so a chart drawing "history as the model saw it" would be drawing the same
+        line twice and implying a step that does not happen.
+        """
+        from ..reporting.read_workbook import WorkbookUnreadable, read_row
+
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+        workbook = next((r.get("name") for r in manifest.get("outputs") or []
+                         if _output_kind(r.get("name") or "") == "workbook"
+                         and str(r.get("name") or "").startswith("planning_")), None)
+        if workbook is None:
+            raise HTTPException(
+                404, f"run {run_id!r} wrote no planning workbook, so there is nothing "
+                     f"per item to show. A run that stopped before the forecast leaves "
+                     f"its gate findings and nothing else.")
+        path = _output_path(run_id, workbook)
+
+        def row(sheet):
+            try:
+                return read_row(path, sheet, "sku", sku)
+            except WorkbookUnreadable:
+                return None
+
+        forecast, parameters = row("Forecast"), row("Parameters")
+        if forecast is None and parameters is None:
+            raise HTTPException(
+                404, f"{sku!r} is not in this run. It may have been added since, or "
+                     f"carry a different item number in the export this run read.")
+
+        series, model = [], {}
+        for name, value in (forecast or {}).items():
+            if name.startswith("hist "):
+                series.append({"period": name[5:], "kind": "history", "value": value})
+            elif name.startswith("fcst "):
+                series.append({"period": name[5:], "kind": "forecast", "value": value})
+            elif name != "sku":
+                model[name] = value
+
+        # In force beside suggested, from the one sheet that already holds both. The
+        # suffix is the workbook's, not invented here: `collect_sheets` merges the
+        # suggestions in under `_suggested`, so the pairing is the run's own.
+        in_force, suggested = {}, {}
+        for name, value in (parameters or {}).items():
+            if name.endswith("_suggested"):
+                suggested[name[: -len("_suggested")]] = value
+            elif name != "sku":
+                in_force[name] = value
+
+        return {
+            "run_id": run_id, "run_at": manifest.get("run_at"), "sku": sku,
+            "workbook": workbook,
+            "series": series,
+            "model": model,
+            "in_force": in_force,
+            "suggested": suggested,
+            "not_shown": [
+                "No cleansed history: nothing in this pipeline cleanses demand history, "
+                "so the line the model saw is the line above it. The only outlier trim "
+                "anywhere is on lead time.",
+                "No forecast interval of the model's own. `forecast_rmse` is on the row "
+                "and a band can be drawn from it, but that band is a normal assumption "
+                "laid over a measured dispersion — it is not something any of these "
+                "models produced.",
+            ],
         }
 
     @app.get("/runs/{run_id}/outputs/{name}/sheets")
@@ -1447,11 +1760,36 @@ def _jsonable(frame) -> List[Dict[str, Any]]:
     return out
 
 
+def _config_root(config_dir) -> Path:
+    """Where this tenant's config is read from, falling back to the package's own."""
+    return Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
+
+
+def _currency_options(config_dir) -> List[Dict[str, Any]]:
+    """
+    The codes the FX table can convert, and which of them are stand-ins rather than rates.
+
+    Served rather than written into the page because the two drifted apart in both
+    directions. The list `review.js` carried offered JPY and HKD, which `fx_rates.json`
+    has no rate for — picking one blanked the money and said nothing — and omitted INR,
+    which has had a measured seed rate since 2026-08-16. A planner could declare a
+    currency the run cannot convert and could not declare one it can.
+
+    `/policy/macro` already reads this through `FxTable` rather than parsing the file,
+    for the reason stated there. This is the same read, for the form that needs it.
+    """
+    from ..fx import FxTable
+
+    table = FxTable.load(_config_root(config_dir))
+    return [{"code": code, "placeholder": table.is_placeholder(code)}
+            for code in table.currencies]
+
+
 def _reporting_currency(config_dir) -> str:
     """The currency the run reports in, from the node config the pipeline reads."""
     import json
 
-    root = Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
+    root = _config_root(config_dir)
     try:
         return str(json.loads((root / "node_config.json").read_text(
             encoding="utf-8")).get("currency") or "USD")

@@ -1510,3 +1510,222 @@ class TestReadingOneLayerByName:
     def test_an_unknown_layer_name_is_rejected_by_the_signature(self, client):
         assert client.get("/facts/inventory",
                           params={"layer": "whatever"}).status_code == 422
+
+
+class TestTheCurrencyFormOffersWhatTheRunCanConvert:
+    """
+    The dropdown was a list written into `review.js`, and it had drifted from
+    `fx_rates.json` in both directions at once: it offered JPY and HKD, which the table
+    has no rate for, and withheld INR, which has carried a measured seed rate since
+    2026-08-16. So a planner could declare a currency the run could not convert, and
+    could not declare one it could — on the screen whose whole job is to stop a document
+    being read in the wrong money.
+    """
+
+    @staticmethod
+    def _rates(workspace, *codes):
+        import json as _json
+
+        config, _ = workspace
+        (config / "fx_rates.json").write_text(_json.dumps({
+            "reporting_currency": "USD",
+            "rates": {c: [{"effective_from": "2018-01-01", "rate": 0.5,
+                           "placeholder": c == "CNY"}] for c in codes},
+        }), encoding="utf-8")
+
+    def test_the_options_are_the_table_s_codes_and_nothing_else(self, client, workspace):
+        self._rates(workspace, "INR", "GBP", "CNY")
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        body = client.get(f"/batches/{batch_id}/summary").json()
+        # USD without being listed: the reporting currency converts to itself, which
+        # `FxTable` states rather than leaves to a config that forgets to write it down.
+        assert [c["code"] for c in body["currencies"]] == ["CNY", "GBP", "INR", "USD"]
+
+    def test_a_stand_in_rate_is_marked_as_one(self, client, workspace):
+        """
+        `placeholder: true` in `fx_rates.json` means the magnitude is right and the rate
+        is not measured. Offering it unmarked beside a seeded rate says the two are the
+        same kind of claim.
+        """
+        self._rates(workspace, "INR", "CNY")
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        marked = {c["code"]: c["placeholder"]
+                  for c in client.get(f"/batches/{batch_id}/summary").json()["currencies"]}
+        assert marked == {"CNY": True, "INR": False, "USD": False}
+
+    def test_no_rate_file_offers_the_reporting_currency_and_no_remembered_list(
+            self, client, workspace):
+        """
+        A config with no `fx_rates.json` converts nothing, so the only code it can
+        honestly offer is the one that converts to itself. The page used to offer eight
+        here, none of which this run could have applied.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        offered = client.get(f"/batches/{batch_id}/summary").json()["currencies"]
+        assert [c["code"] for c in offered] == ["USD"]
+
+    def test_an_unrated_code_can_still_be_declared(self, client, workspace):
+        """
+        The form keeps an `Other` entry, and this is the half of it that must hold on the
+        server. A code with no rate leaves the money blank and the run reports how many
+        lines that cost; left as the reporting currency it is silently wrong by the
+        exchange rate instead. Refusing the declaration would force the second.
+        """
+        self._rates(workspace, "GBP")
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        posted = client.post(f"/batches/{batch_id}/declarations",
+                             json={"scope": "value", "field": "currency", "value": "THB",
+                                   "by": "jfanhon", "reason": "Thai entity books in baht"})
+        assert posted.status_code == 200
+        resting = client.get(f"/batches/{batch_id}/summary").json()["resting_on"]
+        assert resting["resting_on"][0]["value"] == "THB"
+
+    def test_the_page_names_no_currency_of_its_own(self):
+        """
+        The regression that matters. A list in the page is a second answer to a question
+        `fx_rates.json` already answers, and the first one drifted silently for weeks.
+        """
+        import re
+
+        page = (Path(__file__).parents[1]
+                / "inventory_planning/api/web/review.js").read_text(encoding="utf-8")
+        listed = re.findall(r'\[\s*"[A-Z]{3}"(?:\s*,\s*"[A-Z]{3}")+\s*,?\s*\]', page)
+        assert listed == [], f"currency codes written into the page: {listed}"
+
+
+class TestTheMacroScreenIsGraded:
+    """
+    The payload the grouped screen reads. Order and membership are the server's, so the
+    page cannot hold an opinion about which settings matter that the engine does not.
+    """
+
+    @staticmethod
+    def _seed(workspace):
+        """
+        The repository's own config. The default fixture's is empty, and an empty one
+        has no conventions and no labels to grade — which is the one shape of this
+        screen that cannot show the problem being fixed.
+        """
+        import shutil
+
+        config, _ = workspace
+        for path in (Path(__file__).parents[1] / "config").glob("*"):
+            if path.is_file():
+                shutil.copy2(path, config / path.name)
+
+    def test_groups_come_back_in_reading_order(self, client, workspace):
+        from inventory_planning.policy import macro
+
+        self._seed(workspace)
+        body = client.get("/policy/macro").json()
+        assert [g["name"] for g in body["groups"]] == list(macro.GROUPS)
+
+    def test_a_target_is_listed_before_a_label(self, client, workspace):
+        self._seed(workspace)
+        body = client.get("/policy/macro").json()
+        names = [s["name"] for s in body["settings"]]
+        assert names.index("inventory_target_value") < names.index("location_name")
+
+    def test_a_reading_nothing_may_write_is_derived_whatever_file_it_came_from(
+            self, client, workspace):
+        """
+        `fx_rates.json` holds both an editable scalar and a derived reading, so "it came
+        from a file" was never the same claim as "a form may write it".
+        """
+        self._seed(workspace)
+        body = {s["name"]: s for s in client.get("/policy/macro").json()["settings"]}
+        assert body["fx_currencies"]["group"] == "derived"
+        assert body["reporting_currency"]["group"] == "structure"
+
+    def test_an_unset_target_is_flagged_rather_than_printed_as_null(
+            self, client, workspace):
+        self._seed(workspace)
+        body = {s["name"]: s for s in client.get("/policy/macro").json()["settings"]}
+        assert body["inventory_target_value"]["unset"] is True
+        # A convention has no unset state, so the flag must not fire on one.
+        assert body["days_per_year"]["unset"] is False
+
+
+class TestStartingARunFromTheScreen:
+    """
+    The endpoint the policy screen could not reach. Everything that can refuse refuses
+    on this request rather than inside the thread, so a caller holding a run id knows
+    the run began — a gate failure surfacing a minute later would arrive as a failed
+    run and read as a defect in the planning rather than as documents never fit to plan
+    from.
+    """
+
+    def test_an_empty_workspace_refuses_with_a_reason_a_screen_can_show(self, client):
+        posted = client.post("/runs", json={})
+        assert posted.status_code == 409
+        assert "nothing is landed" in posted.json()["detail"]["reason"]
+
+    def test_what_is_landed_may_not_add_up_and_the_gap_is_named(self, client):
+        _upload(client)                       # inventory only
+        posted = client.post("/runs", json={})
+        assert posted.status_code == 409
+        detail = posted.json()["detail"]
+        assert detail["landed"] == ["inventory"]
+        assert [m["capability"] for m in detail["missing"]]
+        assert all(m["why"] for m in detail["missing"]), "a gap with no consequence"
+
+    def test_a_date_without_a_value_is_refused_before_anything_is_read(self, client):
+        posted = client.post("/runs", json={"target_date": "2026-12-31"})
+        assert posted.status_code == 400
+        assert "nothing" in posted.json()["detail"]
+
+    def test_a_date_it_would_misread_is_refused(self, client):
+        posted = client.post("/runs", json={"target_value": 1,
+                                            "target_date": "31/12/2026"})
+        assert posted.status_code == 400
+
+    def test_nothing_in_flight_is_a_state_rather_than_a_404(self, client):
+        body = client.get("/runs/in-flight").json()
+        assert body["status"] == "none" and body["running"] is False
+
+    def test_in_flight_is_not_read_as_a_run_id(self, client):
+        """
+        Starlette matches in registration order, and `in-flight` is a perfectly good
+        run id as far as the path converter knows.
+        """
+        assert client.get("/runs/in-flight").json()["status"] == "none"
+        assert client.get("/runs/in-flight").status_code == 200
+
+
+class TestOneItemAsARunSawIt:
+    """
+    The item screen's endpoint. It reads the run's own workbook, so most of what can go
+    wrong is a question of what it refuses: a run with no workbook, and an item that run
+    never saw, are different answers and a screen has to be able to tell them apart.
+    """
+
+    def test_a_run_that_wrote_no_workbook_says_so(self, client, tmp_path):
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        run = RunManifest.begin(output_dir=tmp_path)
+        RunRegistry(client.app.state.service.output_dir).save(run)
+        answered = client.get(f"/runs/{run.run_id}/skus/SKU-1")
+        assert answered.status_code == 404
+        assert "no planning workbook" in answered.json()["detail"]
+
+    def test_an_unknown_run_is_not_confused_with_an_unknown_item(self, client):
+        answered = client.get("/runs/nope/skus/SKU-1")
+        assert answered.status_code == 404
+        assert "no run" in answered.json()["detail"]
+
+
+class TestTheItemGridShowsDisagreementsFirst:
+
+    def test_an_unknown_run_is_a_404_not_an_empty_grid(self, client):
+        answered = client.get("/runs/nope/items")
+        assert answered.status_code == 404
+        assert "no run" in answered.json()["detail"]
+
+    def test_a_run_with_no_workbook_says_so(self, client, tmp_path):
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        run = RunManifest.begin(output_dir=tmp_path)
+        RunRegistry(client.app.state.service.output_dir).save(run)
+        answered = client.get(f"/runs/{run.run_id}/items")
+        assert answered.status_code == 404
+        assert "no planning workbook" in answered.json()["detail"]

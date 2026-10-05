@@ -96,11 +96,23 @@ class InputRecord:
     # verdict is recorded so a later store knows these rows cannot be superseded.
     key_verdict: Optional[str] = None
     storable: Optional[bool] = None
+    # Set when the run read the fact store rather than a folder. A landed batch has no
+    # path and no file to hash, and `name` is the source file it came from — which two
+    # months of re-exports all share. Without this every store-driven run would carry
+    # the same input fingerprint as every other, and `input_fingerprint` claims the
+    # opposite: that two runs sharing it read the same bytes.
+    batch_id: Optional[str] = None
 
     @property
     def identity(self) -> str:
         """What makes this input *this* input — content, or failing that, its name."""
-        return self.sha256 or f"<unhashed:{self.name}>"
+        if self.sha256:
+            return self.sha256
+        if self.batch_id:
+            # Appended rather than hashed: a batch id is already unique, and the one
+            # thing worth being able to do with a manifest by eye is find the batch.
+            return f"<batch:{self.batch_id}>"
+        return f"<unhashed:{self.name}>"
 
 
 @dataclass
@@ -238,8 +250,16 @@ class RunManifest:
         self.inputs.append(rec)
         return rec
 
-    def record_intake(self, intake_result) -> None:
-        """Enrich the inputs with what the contract layer worked out about them."""
+    def record_intake(self, intake_result, batches: Dict[str, str] = None) -> None:
+        """
+        Enrich the inputs with what the contract layer worked out about them.
+
+        `batches` maps doc_type to the batch it was read from, for a run driven from the
+        fact store. Those inputs have no path and no bytes to hash, so without it the
+        manifest would record every one of them as `<frame>` and two runs over entirely
+        different batches would share an input fingerprint.
+        """
+        batches = batches or {}
         documents = getattr(intake_result, "documents", None) or {}
         # `IntakeResult.documents` is keyed by doc_type; accept a plain sequence too so
         # a caller holding just the documents does not have to wrap them.
@@ -249,9 +269,13 @@ class RunManifest:
             route = getattr(doc, "route", None)
             adapter = getattr(route, "adapter", None) if route is not None else None
             frame = getattr(doc, "frame", None)
+            doc_type = getattr(doc, "doc_type", "")
             self.record_input(
                 getattr(doc, "source_path", None),
-                doc_type=getattr(doc, "doc_type", ""),
+                doc_type=doc_type,
+                batch_id=batches.get(doc_type),
+                # The export it came from, where there is no file to take a name from.
+                name=getattr(doc, "source_name", None) if batches.get(doc_type) else None,
                 rows=len(frame) if frame is not None else None,
                 adapter=getattr(adapter, "slug", None),
                 key_verdict=status.verdict if status is not None else None,

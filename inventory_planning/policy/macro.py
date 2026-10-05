@@ -60,6 +60,23 @@ MacroError = EditRefused
 JSON = "json"
 YAML_BLOCK = "yaml_block"       # a `key: value` line inside a fenced block in markdown
 
+# How often a planner is the one who has to decide, which is not the same as how often
+# the value changes. These sit here rather than in the page for the reason the currency
+# list did not: a second answer kept beside the first drifts from it silently, and a
+# screen that invents its own importance is a screen that disagrees with the engine
+# about what matters.
+#
+# The order is the order they are worth reading in. A flat list of thirteen settings
+# sorted by which file they live in asks a planner to triage, using the one dimension
+# they do not care about, a page whose whole job was to do the triage for them.
+TARGET = "target"           # what good looks like — asked every planning cycle
+CONVENTION = "convention"   # how every figure is worked out — set once, restates all
+STRUCTURE = "structure"     # what this node is — set when the workspace is made
+LABEL = "label"             # names on the output — no figure moves
+DERIVED = "derived"         # read, not set; here so it can be seen, not changed
+
+GROUPS: Tuple[str, ...] = (TARGET, CONVENTION, STRUCTURE, LABEL, DERIVED)
+
 
 @dataclass(frozen=True)
 class MacroSetting:
@@ -69,7 +86,15 @@ class MacroSetting:
     filename: str
     syntax: str
     kind: str                   # text | number | choice
+    # Which of GROUPS above this belongs to: how often it is a planner's decision.
+    group: str = CONVENTION
     choices: Tuple[str, ...] = ()
+    # Whether "not set" is one of this setting's states. Every setting here until the
+    # targets was always set — a convention has no unset value, since the engine takes
+    # one branch or another either way. A target does: null means nobody has said what
+    # the balance should be, which is different from saying it should be zero, and the
+    # difference is the whole of what the frontier does or does not compute.
+    clearable: bool = False
     note: str = ""
     # What a change to this does to the numbers. Shown beside the field, because the
     # cost of these settings is wildly uneven: `location_name` is a label and
@@ -79,22 +104,22 @@ class MacroSetting:
 
 SETTINGS: Tuple[MacroSetting, ...] = (
     MacroSetting(
-        "location_id", "node_config.json", JSON, "text",
+        "location_id", "node_config.json", JSON, "text", group=LABEL,
         note="the node these figures are planned for",
         impact="a label on the output — no figure moves"),
     MacroSetting(
-        "location_name", "node_config.json", JSON, "text",
+        "location_name", "node_config.json", JSON, "text", group=LABEL,
         impact="a label on the output — no figure moves"),
     MacroSetting(
-        "currency", "node_config.json", JSON, "text",
+        "currency", "node_config.json", JSON, "text", group=STRUCTURE,
         note="the node's own currency",
         impact="what the node books in; conversion is the FX table's job"),
     MacroSetting(
-        "planning_cycle", "node_config.json", JSON, "choice",
+        "planning_cycle", "node_config.json", JSON, "choice", group=STRUCTURE,
         choices=("monthly", "weekly"),
         impact="the cadence the plan is written for"),
     MacroSetting(
-        "reporting_currency", "fx_rates.json", JSON, "text",
+        "reporting_currency", "fx_rates.json", JSON, "text", group=STRUCTURE,
         note="every figure is restated into this",
         impact="restates every money figure in the run, and any currency without a "
                "rate into the new one is blanked rather than assumed"),
@@ -129,6 +154,24 @@ SETTINGS: Tuple[MacroSetting, ...] = (
         choices=("integer", "none"),
         note="convention — changes every figure",
         impact="whether a countable quantity is reported as a whole unit"),
+    # The first two settings here that are not conventions. A convention decides how a
+    # figure is worked out; these decide what it ought to be, and move no figure at all
+    # — they decide which actions the run recommends and whether it recommends any.
+    MacroSetting(
+        "inventory_target_value", "targets.json", JSON, "number", group=TARGET, clearable=True,
+        note="target — changes what is recommended, not what is measured",
+        impact="the balance to plan down to, in the reporting currency. Setting it "
+               "produces an ordered set of moves that reaches it — free and reversible "
+               "first, service last — and says what was deliberately not recommended. "
+               "Cleared, no frontier is computed and the run offers no opinion about "
+               "what stock must be"),
+    MacroSetting(
+        "inventory_target_date", "targets.json", JSON, "text", group=TARGET, clearable=True,
+        note="target — what bounds the burn-down",
+        impact="YYYY-MM-DD. Excess converts to cash only as fast as demand consumes "
+               "it, so a SKU with 300 days of cover cannot contribute its full excess "
+               "by December. Cleared, the target is planned without that limit, which "
+               "reads as a larger reduction than the calendar can deliver"),
 )
 
 BY_NAME: Dict[str, MacroSetting] = {s.name: s for s in SETTINGS}
@@ -247,6 +290,10 @@ def _render(value: Any, setting: MacroSetting) -> str:
     by people and a value that grew fifteen digits on being saved would be the most
     visible thing in the diff and the least meaningful.
     """
+    if setting.clearable and value is None:
+        # `null`, not `""` or `0`. Both would load, and both would be read back as a
+        # target somebody set.
+        return "null" if setting.syntax == JSON else "null"
     if setting.kind == "number":
         number = _as_number(value, setting)
         return repr(number) if isinstance(number, float) else str(number)
@@ -273,6 +320,11 @@ def _as_number(value: Any, setting: MacroSetting):
         raise MacroError(f"{setting.name} must be a number — {value!r} is not") from None
 
 
+def _is_cleared(value: Any) -> bool:
+    """An empty field, or the word a person types when they mean to clear one."""
+    return value is None or str(value).strip().lower() in ("", "none", "null")
+
+
 def _coerce(value: Any, setting: MacroSetting) -> Any:
     """
     The value in the type the file should hold, before anything is rendered.
@@ -281,6 +333,8 @@ def _coerce(value: Any, setting: MacroSetting) -> Any:
     one class of mistake the engine cannot catch for us: `pipeline_basis: incoterm_awre`
     parses, loads, and silently changes which branch every SKU takes.
     """
+    if setting.clearable and _is_cleared(value):
+        return None
     if setting.kind == "number":
         return _as_number(value, setting)
     text = str(value).strip()
@@ -312,6 +366,8 @@ def _validate(text: str, setting: MacroSetting, config_dir: Path) -> None:
             raise MacroError(f"the edit leaves {setting.filename} invalid: {exc}") from exc
         if setting.filename == "fx_rates.json":
             _validate_via(_load_fx, text, setting, config_dir)
+        if setting.filename == "targets.json":
+            _validate_via(_load_targets, text, setting, config_dir)
         return
 
     _validate_via(_load_parameters, text, setting, config_dir)
@@ -321,6 +377,18 @@ def _load_fx(path: Path):
     from ..fx import FxTable
 
     return FxTable.load(path.parent)
+
+
+def _load_targets(path: Path):
+    """
+    The reader the run uses, so a date it would refuse cannot be saved here.
+
+    It raises on a date it cannot parse and on a date with no value beside it, which
+    valid JSON does not catch: `"2026-13-40"` is a perfectly good string.
+    """
+    from .target import stated_target
+
+    return stated_target(path.parent)
 
 
 def _load_parameters(path: Path):

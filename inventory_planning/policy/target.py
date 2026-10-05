@@ -27,9 +27,11 @@ Three things separate this from a sorted list of excess:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field as dc_field
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -39,6 +41,83 @@ from .should_be import ShouldBeResult
 
 # Ordering of pain. Actions are ranked by this first, value second.
 PAIN_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
+
+TARGETS_FILE = "targets.json"
+
+
+class StatedTargetError(ValueError):
+    """`targets.json` says something the planner cannot act on."""
+
+
+@dataclass(frozen=True)
+class StatedTarget:
+    """The standing target, as the config file holds it."""
+
+    value: Optional[float] = None
+    deadline: Optional[date] = None
+    source: str = "not stated"
+
+    def __bool__(self) -> bool:
+        return self.value is not None
+
+    @property
+    def undated(self) -> bool:
+        """A target with no deadline: planned, but without the burn-down limit."""
+        return self.value is not None and self.deadline is None
+
+
+def stated_target(config_dir: Union[str, Path, None]) -> StatedTarget:
+    """
+    Read the standing inventory target, or report that none is stated.
+
+    Null is not zero, and the difference matters more here than anywhere else in the
+    config: null means nobody has said what the balance should be, so no frontier is
+    computed and the run offers no opinion about what stock must be. Zero is a target,
+    and a reachable one for a catalogue being discontinued.
+
+    A malformed target refuses rather than defaults. Every other reading in this package
+    degrades — a missing rate blanks a column, a missing adapter is drafted — because
+    the degraded answer is still an answer about the data. There is no degraded reading
+    of "cut inventory to $5M": a target nobody can parse, silently dropped, produces a
+    run that looks exactly like a run nobody set a target on.
+    """
+    root = Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
+    path = root / TARGETS_FILE
+    if not path.exists():
+        return StatedTarget(source=f"no {TARGETS_FILE}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise StatedTargetError(f"{path} could not be read: {exc}") from exc
+
+    value, deadline = raw.get("inventory_target_value"), raw.get("inventory_target_date")
+    if value is None:
+        if deadline is not None:
+            raise StatedTargetError(
+                f"{path} gives inventory_target_date ({deadline}) but no "
+                f"inventory_target_value. A date on its own plans nothing, and "
+                f"ignoring it would hide a target somebody meant to set. Give a value, "
+                f"or clear the date too — to withdraw a target, clear the date first "
+                f"and the value second, since the state in between is this one.")
+        return StatedTarget(source=str(path))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StatedTargetError(
+            f"{path}: inventory_target_value must be a number in the reporting "
+            f"currency — {value!r} is not.")
+    return StatedTarget(value=float(value), deadline=_as_date(deadline, path),
+                        source=str(path))
+
+
+def _as_date(raw: Any, path: Path) -> Optional[date]:
+    if raw is None:
+        return None
+    try:
+        return datetime.strptime(str(raw).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise StatedTargetError(
+            f"{path}: inventory_target_date must be YYYY-MM-DD — {raw!r} is not. The "
+            f"deadline is what bounds the burn-down, so a date read loosely would move "
+            f"how much of the excess counts as reachable.") from None
 
 
 @dataclass

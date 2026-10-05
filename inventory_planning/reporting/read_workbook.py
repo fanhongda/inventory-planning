@@ -191,6 +191,52 @@ def read_sheet(path, sheet: str, offset: int = 0, limit: int = 200) -> Sheet:
         book.close()
 
 
+def read_row(path, sheet: str, key_column: str, key: str) -> Optional[Dict[str, Any]]:
+    """
+    One row, by the value in one column, as the workbook displays it.
+
+    Scanned rather than indexed because these sheets are one row per SKU and a planner
+    opens one item at a time; an index would be a second copy of the workbook, kept
+    somewhere, going stale.
+
+    Values come back through the same `_cell_value` as the paged read, so a figure on a
+    per-item screen and the same figure on the sheet above it cannot differ — which is
+    the whole of what the results screen promises, held one layer down.
+    """
+    book = _open(path)
+    try:
+        if sheet not in book.sheetnames:
+            raise WorkbookUnreadable(
+                f"{Path(path).name} has no sheet {sheet!r}. It has: "
+                f"{', '.join(book.sheetnames)}.")
+        worksheet = book[sheet]
+        rows = worksheet.iter_rows()
+        try:
+            header = [str(c.value) if c.value is not None else "" for c in next(rows)]
+        except StopIteration:
+            return None
+        if key_column not in header:
+            raise WorkbookUnreadable(
+                f"sheet {sheet!r} has no {key_column!r} column. It has: "
+                f"{', '.join(h for h in header if h)}.")
+
+        at = header.index(key_column)
+        wanted = str(key).strip()
+        for row in rows:
+            if at >= len(row):
+                continue
+            # Compared as text. A material number is an identifier that happens to be
+            # digits often enough that Excel will have made some of them numbers, and
+            # `1003524 == "1003524"` is False in every language this is read in.
+            if str(_cell_value(row[at]) if row[at].value is not None else "").strip() != wanted:
+                continue
+            return {name: _cell_value(cell)
+                    for name, cell in zip(header, row) if name}
+        return None
+    finally:
+        book.close()
+
+
 def _open(path):
     """
     Read-only, values and formats, no formula evaluation.

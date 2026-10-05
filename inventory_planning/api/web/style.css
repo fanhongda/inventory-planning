@@ -182,3 +182,28 @@ button.tab.on { background: var(--card); color: var(--ink); font-weight: 600; }
 .controls input, .controls select { width: auto; min-width: 150px; }
 .card h3 { font-size: 13px; margin: 16px 0 4px; color: var(--muted); font-weight: 600; }
 form.declare .row2 input { width: 100%; }
+
+/* The item series. Drawn as an SVG rather than with a chart library: two lines and a
+   band is not a dependency's worth of work, and a library would bring its own opinions
+   about rounding and interpolation into a screen whose whole claim is that it plots the
+   workbook's own cells and nothing else. */
+svg.series { width: 100%; height: auto; margin: 10px 0 2px; }
+svg.series .grid { stroke: var(--line); stroke-width: 1; }
+svg.series .tick { fill: var(--muted); font-size: 11px; text-anchor: end; }
+svg.series .tick.mid { text-anchor: middle; }
+svg.series .line { fill: none; stroke-width: 2; }
+/* History is the measured line and reads as the solid one. The forecast is dashed for
+   the same reason a figure the run assumed is marked: the eye should not have to be
+   told twice which half of this chart already happened. */
+svg.series .line.history { stroke: var(--accent); }
+svg.series .line.forecast { stroke: var(--accent); stroke-dasharray: 5 4; opacity: .85; }
+svg.series .band { fill: var(--accent); opacity: .10; stroke: none; }
+
+p.legend { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+p.legend .key { margin-right: 16px; }
+p.legend .key::before {
+  content: ""; display: inline-block; width: 14px; height: 2px;
+  margin-right: 6px; vertical-align: middle; background: var(--accent);
+}
+p.legend .key.forecast::before { height: 0; border-top: 2px dashed var(--accent); }
+p.legend .key.band::before { height: 10px; opacity: .25; }

@@ -1690,3 +1690,25 @@ class TestStartingARunFromTheScreen:
         """
         assert client.get("/runs/in-flight").json()["status"] == "none"
         assert client.get("/runs/in-flight").status_code == 200
+
+
+class TestOneItemAsARunSawIt:
+    """
+    The item screen's endpoint. It reads the run's own workbook, so most of what can go
+    wrong is a question of what it refuses: a run with no workbook, and an item that run
+    never saw, are different answers and a screen has to be able to tell them apart.
+    """
+
+    def test_a_run_that_wrote_no_workbook_says_so(self, client, tmp_path):
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        run = RunManifest.begin(output_dir=tmp_path)
+        RunRegistry(client.app.state.service.output_dir).save(run)
+        answered = client.get(f"/runs/{run.run_id}/skus/SKU-1")
+        assert answered.status_code == 404
+        assert "no planning workbook" in answered.json()["detail"]
+
+    def test_an_unknown_run_is_not_confused_with_an_unknown_item(self, client):
+        answered = client.get("/runs/nope/skus/SKU-1")
+        assert answered.status_code == 404
+        assert "no run" in answered.json()["detail"]

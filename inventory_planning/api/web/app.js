@@ -1,4 +1,4 @@
-// The shell: four screens, one client.
+// The shell: five screens, one client.
 //
 // The results screen was argued against and then built, and the reasoning is worth
 // keeping here because it is what constrains it. A page showing the same numbers would
@@ -12,12 +12,14 @@ import { mountReview } from "/review.js";
 import { mountBrowse } from "/browse.js";
 import { mountPolicy } from "/policy.js";
 import { mountResults } from "/results.js";
+import { mountItem } from "/item.js";
 
 const SCREENS = {
   review: { label: "Import review", start: mountReview },
   browse: { label: "Stored facts", start: mountBrowse },
   policy: { label: "Policy & runs", start: mountPolicy },
   results: { label: "Results", start: mountResults },
+  item: { label: "Item", start: mountItem },
 };
 
 let started = {};

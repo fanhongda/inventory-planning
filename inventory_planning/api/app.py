@@ -1453,6 +1453,88 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                     "would be a second place they could disagree.",
         }
 
+    @app.get("/runs/{run_id}/skus/{sku}")
+    def sku_detail(run_id: str, sku: str) -> Dict[str, Any]:
+        """
+        One item, as this run saw it: what it did, what it is expected to do, and the
+        policy that follows.
+
+        Read out of the run's own workbook, like the results screen and under the same
+        constraint — nothing here is computed. The `Forecast` sheet already carries the
+        history beside the forecast on one row, which is what makes this cheap; a screen
+        that re-forecast to draw a chart would be a second forecast, and the first time
+        the two disagreed the planner would have no way to tell which was the plan.
+
+        What this cannot show is said rather than left to be noticed. There is no
+        cleansed history, because nothing in this pipeline cleanses demand history — the
+        only outlier trim anywhere is on lead time, in `ingest_bridge._prepare_po_history`
+        — so a chart drawing "history as the model saw it" would be drawing the same
+        line twice and implying a step that does not happen.
+        """
+        from ..reporting.read_workbook import WorkbookUnreadable, read_row
+
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+        workbook = next((r.get("name") for r in manifest.get("outputs") or []
+                         if _output_kind(r.get("name") or "") == "workbook"
+                         and str(r.get("name") or "").startswith("planning_")), None)
+        if workbook is None:
+            raise HTTPException(
+                404, f"run {run_id!r} wrote no planning workbook, so there is nothing "
+                     f"per item to show. A run that stopped before the forecast leaves "
+                     f"its gate findings and nothing else.")
+        path = _output_path(run_id, workbook)
+
+        def row(sheet):
+            try:
+                return read_row(path, sheet, "sku", sku)
+            except WorkbookUnreadable:
+                return None
+
+        forecast, parameters = row("Forecast"), row("Parameters")
+        if forecast is None and parameters is None:
+            raise HTTPException(
+                404, f"{sku!r} is not in this run. It may have been added since, or "
+                     f"carry a different item number in the export this run read.")
+
+        series, model = [], {}
+        for name, value in (forecast or {}).items():
+            if name.startswith("hist "):
+                series.append({"period": name[5:], "kind": "history", "value": value})
+            elif name.startswith("fcst "):
+                series.append({"period": name[5:], "kind": "forecast", "value": value})
+            elif name != "sku":
+                model[name] = value
+
+        # In force beside suggested, from the one sheet that already holds both. The
+        # suffix is the workbook's, not invented here: `collect_sheets` merges the
+        # suggestions in under `_suggested`, so the pairing is the run's own.
+        in_force, suggested = {}, {}
+        for name, value in (parameters or {}).items():
+            if name.endswith("_suggested"):
+                suggested[name[: -len("_suggested")]] = value
+            elif name != "sku":
+                in_force[name] = value
+
+        return {
+            "run_id": run_id, "run_at": manifest.get("run_at"), "sku": sku,
+            "workbook": workbook,
+            "series": series,
+            "model": model,
+            "in_force": in_force,
+            "suggested": suggested,
+            "not_shown": [
+                "No cleansed history: nothing in this pipeline cleanses demand history, "
+                "so the line the model saw is the line above it. The only outlier trim "
+                "anywhere is on lead time.",
+                "No forecast interval of the model's own. `forecast_rmse` is on the row "
+                "and a band can be drawn from it, but that band is a normal assumption "
+                "laid over a measured dispersion — it is not something any of these "
+                "models produced.",
+            ],
+        }
+
     @app.get("/runs/{run_id}/outputs/{name}/sheets")
     def workbook_sheets(run_id: str, name: str) -> Dict[str, Any]:
         from ..reporting.read_workbook import WorkbookUnreadable, sheets as read_sheets

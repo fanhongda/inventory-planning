@@ -60,6 +60,23 @@ MacroError = EditRefused
 JSON = "json"
 YAML_BLOCK = "yaml_block"       # a `key: value` line inside a fenced block in markdown
 
+# How often a planner is the one who has to decide, which is not the same as how often
+# the value changes. These sit here rather than in the page for the reason the currency
+# list did not: a second answer kept beside the first drifts from it silently, and a
+# screen that invents its own importance is a screen that disagrees with the engine
+# about what matters.
+#
+# The order is the order they are worth reading in. A flat list of thirteen settings
+# sorted by which file they live in asks a planner to triage, using the one dimension
+# they do not care about, a page whose whole job was to do the triage for them.
+TARGET = "target"           # what good looks like — asked every planning cycle
+CONVENTION = "convention"   # how every figure is worked out — set once, restates all
+STRUCTURE = "structure"     # what this node is — set when the workspace is made
+LABEL = "label"             # names on the output — no figure moves
+DERIVED = "derived"         # read, not set; here so it can be seen, not changed
+
+GROUPS: Tuple[str, ...] = (TARGET, CONVENTION, STRUCTURE, LABEL, DERIVED)
+
 
 @dataclass(frozen=True)
 class MacroSetting:
@@ -69,6 +86,8 @@ class MacroSetting:
     filename: str
     syntax: str
     kind: str                   # text | number | choice
+    # Which of GROUPS above this belongs to: how often it is a planner's decision.
+    group: str = CONVENTION
     choices: Tuple[str, ...] = ()
     # Whether "not set" is one of this setting's states. Every setting here until the
     # targets was always set — a convention has no unset value, since the engine takes
@@ -85,22 +104,22 @@ class MacroSetting:
 
 SETTINGS: Tuple[MacroSetting, ...] = (
     MacroSetting(
-        "location_id", "node_config.json", JSON, "text",
+        "location_id", "node_config.json", JSON, "text", group=LABEL,
         note="the node these figures are planned for",
         impact="a label on the output — no figure moves"),
     MacroSetting(
-        "location_name", "node_config.json", JSON, "text",
+        "location_name", "node_config.json", JSON, "text", group=LABEL,
         impact="a label on the output — no figure moves"),
     MacroSetting(
-        "currency", "node_config.json", JSON, "text",
+        "currency", "node_config.json", JSON, "text", group=STRUCTURE,
         note="the node's own currency",
         impact="what the node books in; conversion is the FX table's job"),
     MacroSetting(
-        "planning_cycle", "node_config.json", JSON, "choice",
+        "planning_cycle", "node_config.json", JSON, "choice", group=STRUCTURE,
         choices=("monthly", "weekly"),
         impact="the cadence the plan is written for"),
     MacroSetting(
-        "reporting_currency", "fx_rates.json", JSON, "text",
+        "reporting_currency", "fx_rates.json", JSON, "text", group=STRUCTURE,
         note="every figure is restated into this",
         impact="restates every money figure in the run, and any currency without a "
                "rate into the new one is blanked rather than assumed"),
@@ -139,7 +158,7 @@ SETTINGS: Tuple[MacroSetting, ...] = (
     # figure is worked out; these decide what it ought to be, and move no figure at all
     # — they decide which actions the run recommends and whether it recommends any.
     MacroSetting(
-        "inventory_target_value", "targets.json", JSON, "number", clearable=True,
+        "inventory_target_value", "targets.json", JSON, "number", group=TARGET, clearable=True,
         note="target — changes what is recommended, not what is measured",
         impact="the balance to plan down to, in the reporting currency. Setting it "
                "produces an ordered set of moves that reaches it — free and reversible "
@@ -147,7 +166,7 @@ SETTINGS: Tuple[MacroSetting, ...] = (
                "Cleared, no frontier is computed and the run offers no opinion about "
                "what stock must be"),
     MacroSetting(
-        "inventory_target_date", "targets.json", JSON, "text", clearable=True,
+        "inventory_target_date", "targets.json", JSON, "text", group=TARGET, clearable=True,
         note="target — what bounds the burn-down",
         impact="YYYY-MM-DD. Excess converts to cash only as fast as demand consumes "
                "it, so a SKU with 300 days of cover cannot contribute its full excess "

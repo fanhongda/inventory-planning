@@ -141,16 +141,58 @@ function editor(s, done) {
   });
 }
 
-function macroCard(body, reload) {
-  const rows = body.settings.map((s) => {
+// How often each group is a planner's decision, and why it is its own group. The text
+// is here and the membership is in `macro.py`: a page that decided for itself which
+// settings matter would be a second opinion kept beside the engine's, and the currency
+// list is what that looks like after a few weeks.
+const GROUPS = {
+  target: {
+    title: "What good looks like",
+    sub: "Yours to decide, every planning cycle. Nothing else on this page says what "
+       + "the answer should be — the rest say how it is worked out.",
+    open: true,
+  },
+  convention: {
+    title: "How every figure is worked out",
+    sub: "Set once and rarely revisited, but each of these restates the whole "
+       + "workbook. Read the consequence before changing one.",
+    open: true,
+  },
+  structure: {
+    title: "What this node is",
+    sub: "Set when the workspace was made. Changing one of these is changing which "
+       + "site is being planned, or the money it is reported in.",
+    open: false,
+  },
+  label: {
+    title: "Names on the output",
+    sub: "No figure moves.",
+    open: false,
+  },
+  derived: {
+    title: "Read here, not editable here",
+    sub: "Two different reasons, deliberately not separated into two groups for two "
+       + "entries: `fx_currencies` is derived from the rate table rather than set, "
+       + "and a list like `continuous_uom` is a setting this form has no widget for. "
+       + "Both are shown because a value you cannot see is one you cannot check.",
+    open: false,
+  },
+};
+
+function macroRows(settings, reload) {
+  return settings.map((s) => {
+    const shown = Array.isArray(s.value) ? s.value.join(", ") : String(s.value);
     const row = el("tr", {},
       el("td", {}, el("code", {}, s.name)),
-      el("td", {}, Array.isArray(s.value) ? s.value.join(", ") : String(s.value)),
-      el("td", {}, s.source),
-      el("td", { class: "k" }, s.note || ""),
+      // "not set" rather than "null". Null is a state a planner chooses and the page
+      // used to print it as the word the file holds, in the same grey as a label.
+      el("td", {}, s.unset ? el("em", { class: "unset" }, "not set") : shown),
+      // The consequence, on the row. It used to be inside the Edit drawer, which put
+      // the thing that decides whether to edit behind the decision to edit.
+      el("td", { class: "k" }, s.impact || s.note || ""),
       el("td", {}));
     if (!s.editable) return [row];
-    const host = el("td", { colspan: "5" });
+    const host = el("td", { colspan: "4" });
     const drawer = el("tr", { hidden: true }, host);
     row.lastChild.append(el("button", { class: "link",
       onclick: () => {
@@ -158,20 +200,42 @@ function macroCard(body, reload) {
         mount(host, drawer.hidden ? [] : editor(s, reload));
       } }, "Edit"));
     return [row, drawer];
-  });
+  }).flat();
+}
+
+function macroGroup(name, settings, reload) {
+  const meta = GROUPS[name] || { title: name, sub: "", open: true };
+  const unset = settings.filter((s) => s.unset).length;
+  const table = el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {},
+      ["setting", "value", "what it moves", ""].map((h) => el("th", {}, h)))),
+    el("tbody", {}, macroRows(settings, reload))));
+
+  return el("details", { class: "group", open: meta.open || unset > 0 },
+    el("summary", {},
+      meta.title,
+      el("span", { class: "k" }, ` · ${settings.length}`),
+      unset ? el("span", { class: "badge todo" }, `${unset} not set`) : null),
+    meta.sub ? el("p", { class: "note" }, meta.sub) : null,
+    table);
+}
+
+function macroCard(body, reload) {
+  const byName = new Map(body.settings.map((s) => [s.name, s]));
+  const groups = (body.groups || []).filter((g) => g.settings.length);
 
   return el("section", { class: "card" },
     el("h2", {}, "Settings the engine reads"),
     el("p", { class: "sub" },
        `From ${body.config_dir}. Only what the pipeline actually consumes — a switch `
-       + `nothing honours reads as a guarantee, which is worse than no switch.`),
-    el("div", { class: "scroll" }, el("table", {},
-      el("thead", {}, el("tr", {},
-        ["setting", "value", "from", "", ""].map((h) => el("th", {}, h)))),
-      el("tbody", {}, rows.flat()))),
+       + `nothing honours reads as a guarantee, which is worse than no switch. Grouped `
+       + `by how often it is yours to decide, because sorting thirteen of them by `
+       + `which file they live in asks you to triage the page yourself.`),
+    groups.map((g) => macroGroup(
+      g.name, g.settings.map((n) => byName.get(n)).filter(Boolean), reload)),
     el("p", { class: "note" },
        "Editing writes the file, which stays the store — the form is a validator with "
-       + "a nicer keyboard. A derived reading has no Edit because it is not a setting."),
+       + "a nicer keyboard."),
     changesCard(body.changes, "Settings changed here"));
 }
 

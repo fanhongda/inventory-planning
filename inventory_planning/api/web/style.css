@@ -96,6 +96,24 @@ pre.diff {
 }
 details > summary { cursor: pointer; font-size: 13px; color: var(--muted); margin-top: 10px; }
 
+/* A settings group. The disclosure above is a footnote the reader may open; these are
+   the headings of the page, so they are not styled like one. The whole point of the
+   grouping is that the first thing read is which group a setting is in. */
+details.group { border-top: 1px solid var(--line); padding-top: 4px; }
+details.group:first-of-type { border-top: 0; }
+details.group > summary {
+  font-size: 14px; font-weight: 600; color: var(--fg); margin: 14px 0 0;
+}
+details.group > summary .k { font-weight: 400; }
+details.group > summary .badge {
+  float: right; font-size: 12px; font-weight: 500; padding: 2px 10px;
+  border-radius: 10px; border: 1px solid #e8d9ae;
+  background: var(--warn-bg); color: var(--warn);
+}
+/* Not the same grey as a value somebody chose. A target nobody has set is the most
+   actionable thing on the page, and it used to print as the word `null`. */
+.unset { color: var(--warn); font-style: normal; }
+
 /* One gate finding. Separated by a rule rather than boxed: on a bad export there are
    several, and a page of nested boxes reads as decoration where a list reads as a list. */
 .finding { border-top: 1px solid var(--line); padding: 10px 0 2px; }

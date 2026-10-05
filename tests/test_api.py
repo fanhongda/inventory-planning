@@ -1591,3 +1591,56 @@ class TestTheCurrencyFormOffersWhatTheRunCanConvert:
                 / "inventory_planning/api/web/review.js").read_text(encoding="utf-8")
         listed = re.findall(r'\[\s*"[A-Z]{3}"(?:\s*,\s*"[A-Z]{3}")+\s*,?\s*\]', page)
         assert listed == [], f"currency codes written into the page: {listed}"
+
+
+class TestTheMacroScreenIsGraded:
+    """
+    The payload the grouped screen reads. Order and membership are the server's, so the
+    page cannot hold an opinion about which settings matter that the engine does not.
+    """
+
+    @staticmethod
+    def _seed(workspace):
+        """
+        The repository's own config. The default fixture's is empty, and an empty one
+        has no conventions and no labels to grade — which is the one shape of this
+        screen that cannot show the problem being fixed.
+        """
+        import shutil
+
+        config, _ = workspace
+        for path in (Path(__file__).parents[1] / "config").glob("*"):
+            if path.is_file():
+                shutil.copy2(path, config / path.name)
+
+    def test_groups_come_back_in_reading_order(self, client, workspace):
+        from inventory_planning.policy import macro
+
+        self._seed(workspace)
+        body = client.get("/policy/macro").json()
+        assert [g["name"] for g in body["groups"]] == list(macro.GROUPS)
+
+    def test_a_target_is_listed_before_a_label(self, client, workspace):
+        self._seed(workspace)
+        body = client.get("/policy/macro").json()
+        names = [s["name"] for s in body["settings"]]
+        assert names.index("inventory_target_value") < names.index("location_name")
+
+    def test_a_reading_nothing_may_write_is_derived_whatever_file_it_came_from(
+            self, client, workspace):
+        """
+        `fx_rates.json` holds both an editable scalar and a derived reading, so "it came
+        from a file" was never the same claim as "a form may write it".
+        """
+        self._seed(workspace)
+        body = {s["name"]: s for s in client.get("/policy/macro").json()["settings"]}
+        assert body["fx_currencies"]["group"] == "derived"
+        assert body["reporting_currency"]["group"] == "structure"
+
+    def test_an_unset_target_is_flagged_rather_than_printed_as_null(
+            self, client, workspace):
+        self._seed(workspace)
+        body = {s["name"]: s for s in client.get("/policy/macro").json()["settings"]}
+        assert body["inventory_target_value"]["unset"] is True
+        # A convention has no unset state, so the flag must not fire on one.
+        assert body["days_per_year"]["unset"] is False

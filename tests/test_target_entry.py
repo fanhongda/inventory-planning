@@ -202,3 +202,37 @@ class TestTheRunReachesIt:
 
     def test_an_undated_target_says_what_it_cost(self):
         assert "burn-down limit" in self._source("run_policy_analysis")
+
+
+class TestTheSettingsAreGradedByWhoHasToDecide:
+    """
+    Thirteen settings in one flat table, sorted by which file they live in, asked a
+    planner to triage the page the page existed to triage for them. `location_name` is
+    a label and `cycle_stock_basis` restates every should-be figure in the workbook,
+    and they were rendered identically — as were the two targets nobody had set.
+
+    The grading lives in `macro.py` beside the settings, not in the page. A screen that
+    decided for itself which settings matter would be a second opinion kept beside the
+    engine's, and the hardcoded currency list is what that looks like after a few weeks.
+    """
+
+    def test_every_setting_is_graded(self):
+        assert all(s.group in macro.GROUPS for s in macro.SETTINGS)
+
+    def test_a_target_outranks_a_convention_which_outranks_a_label(self):
+        order = {name: i for i, name in enumerate(macro.GROUPS)}
+        by_name = {s.name: order[s.group] for s in macro.SETTINGS}
+        assert by_name["inventory_target_value"] < by_name["cycle_stock_basis"]
+        assert by_name["cycle_stock_basis"] < by_name["location_name"]
+
+    def test_the_page_decides_no_membership_of_its_own(self):
+        """
+        The same guard the currency list needed. A page naming settings would drift
+        from the registry silently, which is the defect this grading came out of.
+        """
+        import re
+
+        page = (Path(__file__).parents[1]
+                / "inventory_planning/api/web/policy.js").read_text(encoding="utf-8")
+        named = [s.name for s in macro.SETTINGS if f'"{s.name}"' in page]
+        assert named == [], f"settings named in the page: {named}"

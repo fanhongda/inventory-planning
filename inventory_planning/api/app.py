@@ -1192,6 +1192,10 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                 "choices": list(setting.choices) if setting else [],
                 "impact": setting.impact if setting else "",
                 "file": setting.filename if setting else None,
+                # How often this is a planner's decision. A reading nothing may write
+                # is derived whatever file it came out of.
+                "group": setting.group if setting else macro_edit.DERIVED,
+                "unset": setting is not None and setting.clearable and value is None,
             })
 
         try:
@@ -1243,6 +1247,17 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             add("inventory_target_value", None, "targets.json", str(refused))
             add("inventory_target_date", None, "targets.json", str(refused))
 
+        # Ordered by how often a planner has to decide, not by which file it lives in.
+        # The file is the one dimension a reader does not care about, and sorting by it
+        # left the two settings nobody had set sitting between a label and a calendar
+        # convention, in the same typeface.
+        order = {name: i for i, name in enumerate(macro_edit.GROUPS)}
+        out["settings"].sort(key=lambda s: order.get(s["group"], len(order)))
+        out["groups"] = [
+            {"name": name, "settings": [s["name"] for s in out["settings"]
+                                        if s["group"] == name]}
+            for name in macro_edit.GROUPS
+        ]
         out["changes"] = macro_edit.history(root, limit=20)
         return out
 

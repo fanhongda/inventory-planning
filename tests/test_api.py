@@ -1510,3 +1510,84 @@ class TestReadingOneLayerByName:
     def test_an_unknown_layer_name_is_rejected_by_the_signature(self, client):
         assert client.get("/facts/inventory",
                           params={"layer": "whatever"}).status_code == 422
+
+
+class TestTheCurrencyFormOffersWhatTheRunCanConvert:
+    """
+    The dropdown was a list written into `review.js`, and it had drifted from
+    `fx_rates.json` in both directions at once: it offered JPY and HKD, which the table
+    has no rate for, and withheld INR, which has carried a measured seed rate since
+    2026-08-16. So a planner could declare a currency the run could not convert, and
+    could not declare one it could — on the screen whose whole job is to stop a document
+    being read in the wrong money.
+    """
+
+    @staticmethod
+    def _rates(workspace, *codes):
+        import json as _json
+
+        config, _ = workspace
+        (config / "fx_rates.json").write_text(_json.dumps({
+            "reporting_currency": "USD",
+            "rates": {c: [{"effective_from": "2018-01-01", "rate": 0.5,
+                           "placeholder": c == "CNY"}] for c in codes},
+        }), encoding="utf-8")
+
+    def test_the_options_are_the_table_s_codes_and_nothing_else(self, client, workspace):
+        self._rates(workspace, "INR", "GBP", "CNY")
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        body = client.get(f"/batches/{batch_id}/summary").json()
+        # USD without being listed: the reporting currency converts to itself, which
+        # `FxTable` states rather than leaves to a config that forgets to write it down.
+        assert [c["code"] for c in body["currencies"]] == ["CNY", "GBP", "INR", "USD"]
+
+    def test_a_stand_in_rate_is_marked_as_one(self, client, workspace):
+        """
+        `placeholder: true` in `fx_rates.json` means the magnitude is right and the rate
+        is not measured. Offering it unmarked beside a seeded rate says the two are the
+        same kind of claim.
+        """
+        self._rates(workspace, "INR", "CNY")
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        marked = {c["code"]: c["placeholder"]
+                  for c in client.get(f"/batches/{batch_id}/summary").json()["currencies"]}
+        assert marked == {"CNY": True, "INR": False, "USD": False}
+
+    def test_no_rate_file_offers_the_reporting_currency_and_no_remembered_list(
+            self, client, workspace):
+        """
+        A config with no `fx_rates.json` converts nothing, so the only code it can
+        honestly offer is the one that converts to itself. The page used to offer eight
+        here, none of which this run could have applied.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        offered = client.get(f"/batches/{batch_id}/summary").json()["currencies"]
+        assert [c["code"] for c in offered] == ["USD"]
+
+    def test_an_unrated_code_can_still_be_declared(self, client, workspace):
+        """
+        The form keeps an `Other` entry, and this is the half of it that must hold on the
+        server. A code with no rate leaves the money blank and the run reports how many
+        lines that cost; left as the reporting currency it is silently wrong by the
+        exchange rate instead. Refusing the declaration would force the second.
+        """
+        self._rates(workspace, "GBP")
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        posted = client.post(f"/batches/{batch_id}/declarations",
+                             json={"scope": "value", "field": "currency", "value": "THB",
+                                   "by": "jfanhon", "reason": "Thai entity books in baht"})
+        assert posted.status_code == 200
+        resting = client.get(f"/batches/{batch_id}/summary").json()["resting_on"]
+        assert resting["resting_on"][0]["value"] == "THB"
+
+    def test_the_page_names_no_currency_of_its_own(self):
+        """
+        The regression that matters. A list in the page is a second answer to a question
+        `fx_rates.json` already answers, and the first one drifted silently for weeks.
+        """
+        import re
+
+        page = (Path(__file__).parents[1]
+                / "inventory_planning/api/web/review.js").read_text(encoding="utf-8")
+        listed = re.findall(r'\[\s*"[A-Z]{3}"(?:\s*,\s*"[A-Z]{3}")+\s*,?\s*\]', page)
+        assert listed == [], f"currency codes written into the page: {listed}"

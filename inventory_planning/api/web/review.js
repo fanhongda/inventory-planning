@@ -15,6 +15,10 @@
 
 import { $, el, mount, num, pct, firstSentence, api } from "/ui.js";
 
+// The value of the currency dropdown's last option. A sentinel rather than "", which is
+// already the unanswered state, and lower case so it cannot collide with an ISO code.
+const OTHER = "other";
+
 // The checklist, grouped. Nine documents in one flat list is a wall, and translating
 // nine contract descriptions would put a second copy of the schema's prose in here to
 // go stale. So the plain-language explanation lives at the section — six of them, each
@@ -215,7 +219,7 @@ function routingCard(res) {
 // Every figure the run could not measure, largest exposure first. The currency case
 // gets a dropdown rather than a default, because "what is this booked in" is business
 // knowledge this reader has and a 7x error is not something they can spot afterwards.
-function restingCard(resting, batch, refresh) {
+function restingCard(resting, currencies, batch, refresh) {
   const items = resting.resting_on || [];
   if (!items.length) return null;
 
@@ -247,14 +251,42 @@ function restingCard(resting, batch, refresh) {
         ["Field", "Reading as", "Source", "Rows", "What rests on it"]
           .map((h) => el("th", {}, h)))),
       el("tbody", {}, rows))),
-    currency ? currencyForm(batch, currency, refresh) : null);
+    currency ? currencyForm(batch, currency, currencies, refresh) : null);
 }
 
-function currencyForm(batch, item, refresh) {
-  const select = el("select", { id: "cur" },
+// The codes the FX table can convert, as the server read them. Not a list kept here:
+// the one that was drifted from `fx_rates.json` in both directions, offering two
+// currencies with no rate and withholding one that had a measured rate.
+//
+// `Other` stays, because a code with no rate is still worth declaring. An unrated
+// currency leaves the money blank and the run reports how many lines that cost, which
+// is recoverable; a file left reading as the reporting currency is silently wrong by
+// the exchange rate, which is not. The form says which of the two a choice buys.
+function currencyForm(batch, item, currencies, refresh) {
+  const rated = (currencies || []).map((c) => c.code);
+  const note = el("p", { class: "note" });
+  const other = el("input", { hidden: true, maxlength: 8,
+                              placeholder: "ISO code, e.g. THB",
+                              oninput: () => { note.textContent = say(chosen()); } });
+  const select = el("select", { onchange: () => {
+    other.hidden = select.value !== OTHER;
+    if (!other.hidden) other.focus();
+    note.textContent = say(chosen());
+  } },
     el("option", { value: "" }, "Choose \u2014"),
-    ["CNY", "USD", "EUR", "SGD", "JPY", "HKD", "GBP", "AUD"].map(
-      (c) => el("option", { value: c }, c)));
+    (currencies || []).map((c) => el("option", { value: c.code },
+      c.placeholder ? `${c.code} \u2014 rate is a stand-in, not a measurement` : c.code)),
+    el("option", { value: OTHER }, "Other \u2014 a code the FX table has no rate for"));
+
+  const chosen = () => (select.value === OTHER
+    ? other.value.trim().toUpperCase() : select.value);
+  const say = (code) =>
+    !code || rated.includes(code) ? ""
+      : `No rate for ${code}, so money on this document is left blank and the run `
+        + "reports how many lines that cost. Blank is still the better reading: left "
+        + "as the reporting currency it would be wrong by the exchange rate, and "
+        + "nothing downstream could tell.";
+
   const reason = el("textarea", { placeholder:
     "Why this currency? e.g. the plant books at standard cost in CNY only, and the "
     + "export template carries no currency column." });
@@ -264,11 +296,12 @@ function currencyForm(batch, item, refresh) {
   return el("form", { class: "declare", onsubmit: async (e) => {
     e.preventDefault();
     out.className = "note";
-    if (!select.value) { out.textContent = "Choose a currency first."; return; }
+    const code = chosen();
+    if (!code) { out.textContent = "Choose a currency first."; return; }
     try {
       const body = await api(`/batches/${batch.batch_id}/declarations`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ scope: "value", field: "currency", value: select.value,
+        body: JSON.stringify({ scope: "value", field: "currency", value: code,
                                reason: reason.value, by: by.value }),
       });
       out.className = "changed";
@@ -279,7 +312,7 @@ function currencyForm(batch, item, refresh) {
   } },
     el("label", {},
        `What currency is the money in this file booked in? Read as ${item.value} now.`),
-    select,
+    select, other, note,
     el("label", {},
        "Why (required \u2014 the only account of what this rested on)"), reason,
     el("div", { class: "row2" },
@@ -407,7 +440,7 @@ async function showBatch(batch, container, openFields = false) {
   mount(container,
     doc ? totalsCard(doc, batch, () => showBatch(batch, container, true)) : null,
     routingCard(resolution),
-    restingCard(summary.resting_on, batch, refresh),
+    restingCard(summary.resting_on, summary.currencies, batch, refresh),
     fieldsCard(resolution, batch, refresh, openFields),
     rowsCard(rows));
 }

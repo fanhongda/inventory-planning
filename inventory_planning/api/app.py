@@ -783,6 +783,10 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
 
         return {"batch_id": batch_id, "doc_type": doc.doc_type,
                 "documents": documents,
+                # What the currency form may offer. Beside the resting figures rather
+                # than inside them: the ledger is an ingest-layer structure that knows
+                # nothing of the FX table, and should not learn.
+                "currencies": _currency_options(service.config_dir),
                 "resting_on": _resting(service, doc, declarations).to_dict()}
 
     @app.get("/batches/{batch_id}/canonical")
@@ -1447,11 +1451,36 @@ def _jsonable(frame) -> List[Dict[str, Any]]:
     return out
 
 
+def _config_root(config_dir) -> Path:
+    """Where this tenant's config is read from, falling back to the package's own."""
+    return Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
+
+
+def _currency_options(config_dir) -> List[Dict[str, Any]]:
+    """
+    The codes the FX table can convert, and which of them are stand-ins rather than rates.
+
+    Served rather than written into the page because the two drifted apart in both
+    directions. The list `review.js` carried offered JPY and HKD, which `fx_rates.json`
+    has no rate for — picking one blanked the money and said nothing — and omitted INR,
+    which has had a measured seed rate since 2026-08-16. A planner could declare a
+    currency the run cannot convert and could not declare one it can.
+
+    `/policy/macro` already reads this through `FxTable` rather than parsing the file,
+    for the reason stated there. This is the same read, for the form that needs it.
+    """
+    from ..fx import FxTable
+
+    table = FxTable.load(_config_root(config_dir))
+    return [{"code": code, "placeholder": table.is_placeholder(code)}
+            for code in table.currencies]
+
+
 def _reporting_currency(config_dir) -> str:
     """The currency the run reports in, from the node config the pipeline reads."""
     import json
 
-    root = Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
+    root = _config_root(config_dir)
     try:
         return str(json.loads((root / "node_config.json").read_text(
             encoding="utf-8")).get("currency") or "USD")

@@ -17,6 +17,7 @@ but **"does the alias table the CLI reads through still agree with the contracts
 which is asked directly below and would have failed the day the gap opened.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,19 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 from inventory_planning.cli import _READABLE, _expand, build_parser  # noqa: E402
 
 REPO = Path(__file__).parents[1]
+
+
+def tenant_path(name: str) -> str:
+    """
+    `tenants/<name>` written the way this platform writes it.
+
+    The assertions below read a resolved path back out of stdout. Spelling the
+    separator `/` asserted a POSIX convention against a string the OS had already
+    chosen, so six of them failed on Windows against output that was entirely correct —
+    `tenants\\acme`. What is being checked is that the tenant reached the resolver, not
+    which slash the platform prints.
+    """
+    return os.path.join("tenants", name)
 
 
 class TestTheContractsAndTheLegacyTableAgree:
@@ -236,7 +250,7 @@ class TestTheSubcommandCLIsAcceptTheFlagsEitherWay:
         from inventory_planning.feedback.__main__ import main
 
         main(argv)
-        assert "tenants/acme" in capsys.readouterr().out
+        assert tenant_path("acme") in capsys.readouterr().out
 
     @pytest.mark.parametrize("argv", [
         ["--tenant", "acme", "show"],
@@ -246,14 +260,14 @@ class TestTheSubcommandCLIsAcceptTheFlagsEitherWay:
         from inventory_planning.store.__main__ import main
 
         main(argv)
-        assert "tenants/acme" in capsys.readouterr().out
+        assert tenant_path("acme") in capsys.readouterr().out
 
     def test_the_subcommand_wins_when_both_are_given(self, capsys):
         from inventory_planning.store.__main__ import main
 
         main(["--tenant", "one", "show", "--tenant", "two"])
         out = capsys.readouterr().out
-        assert "tenants/two" in out and "tenants/one" not in out
+        assert tenant_path("two") in out and tenant_path("one") not in out
 
     def test_a_parent_flag_alone_is_not_overwritten_by_the_subcommand_default(
             self, capsys):
@@ -265,4 +279,4 @@ class TestTheSubcommandCLIsAcceptTheFlagsEitherWay:
         from inventory_planning.store.__main__ import main
 
         main(["--tenant", "acme", "show"])
-        assert "tenants/acme" in capsys.readouterr().out
+        assert tenant_path("acme") in capsys.readouterr().out

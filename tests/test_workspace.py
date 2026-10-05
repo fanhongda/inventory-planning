@@ -168,7 +168,15 @@ class TestIsolation:
         outside.mkdir()
         workspace.config_dir.mkdir(parents=True)
         link = workspace.config_dir / "shortcut"
-        link.symlink_to(outside, target_is_directory=True)
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as refused:
+            # Windows refuses a symlink to an unprivileged account unless Developer
+            # Mode is on — `[WinError 1314] A required privilege is not held`. The
+            # resolution this asserts is the same on both platforms, but it cannot be
+            # asserted without a symlink to resolve, so the case is reported as skipped
+            # rather than passing on a link that was never created.
+            pytest.skip(f"symlinks are not permitted for this account: {refused}")
 
         assert workspace.contains(workspace.config_dir / "rules.md")
         assert not workspace.contains(link / "rules.md")

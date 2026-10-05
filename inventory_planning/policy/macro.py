@@ -70,6 +70,12 @@ class MacroSetting:
     syntax: str
     kind: str                   # text | number | choice
     choices: Tuple[str, ...] = ()
+    # Whether "not set" is one of this setting's states. Every setting here until the
+    # targets was always set — a convention has no unset value, since the engine takes
+    # one branch or another either way. A target does: null means nobody has said what
+    # the balance should be, which is different from saying it should be zero, and the
+    # difference is the whole of what the frontier does or does not compute.
+    clearable: bool = False
     note: str = ""
     # What a change to this does to the numbers. Shown beside the field, because the
     # cost of these settings is wildly uneven: `location_name` is a label and
@@ -129,6 +135,24 @@ SETTINGS: Tuple[MacroSetting, ...] = (
         choices=("integer", "none"),
         note="convention — changes every figure",
         impact="whether a countable quantity is reported as a whole unit"),
+    # The first two settings here that are not conventions. A convention decides how a
+    # figure is worked out; these decide what it ought to be, and move no figure at all
+    # — they decide which actions the run recommends and whether it recommends any.
+    MacroSetting(
+        "inventory_target_value", "targets.json", JSON, "number", clearable=True,
+        note="target — changes what is recommended, not what is measured",
+        impact="the balance to plan down to, in the reporting currency. Setting it "
+               "produces an ordered set of moves that reaches it — free and reversible "
+               "first, service last — and says what was deliberately not recommended. "
+               "Cleared, no frontier is computed and the run offers no opinion about "
+               "what stock must be"),
+    MacroSetting(
+        "inventory_target_date", "targets.json", JSON, "text", clearable=True,
+        note="target — what bounds the burn-down",
+        impact="YYYY-MM-DD. Excess converts to cash only as fast as demand consumes "
+               "it, so a SKU with 300 days of cover cannot contribute its full excess "
+               "by December. Cleared, the target is planned without that limit, which "
+               "reads as a larger reduction than the calendar can deliver"),
 )
 
 BY_NAME: Dict[str, MacroSetting] = {s.name: s for s in SETTINGS}
@@ -247,6 +271,10 @@ def _render(value: Any, setting: MacroSetting) -> str:
     by people and a value that grew fifteen digits on being saved would be the most
     visible thing in the diff and the least meaningful.
     """
+    if setting.clearable and value is None:
+        # `null`, not `""` or `0`. Both would load, and both would be read back as a
+        # target somebody set.
+        return "null" if setting.syntax == JSON else "null"
     if setting.kind == "number":
         number = _as_number(value, setting)
         return repr(number) if isinstance(number, float) else str(number)
@@ -273,6 +301,11 @@ def _as_number(value: Any, setting: MacroSetting):
         raise MacroError(f"{setting.name} must be a number — {value!r} is not") from None
 
 
+def _is_cleared(value: Any) -> bool:
+    """An empty field, or the word a person types when they mean to clear one."""
+    return value is None or str(value).strip().lower() in ("", "none", "null")
+
+
 def _coerce(value: Any, setting: MacroSetting) -> Any:
     """
     The value in the type the file should hold, before anything is rendered.
@@ -281,6 +314,8 @@ def _coerce(value: Any, setting: MacroSetting) -> Any:
     one class of mistake the engine cannot catch for us: `pipeline_basis: incoterm_awre`
     parses, loads, and silently changes which branch every SKU takes.
     """
+    if setting.clearable and _is_cleared(value):
+        return None
     if setting.kind == "number":
         return _as_number(value, setting)
     text = str(value).strip()
@@ -312,6 +347,8 @@ def _validate(text: str, setting: MacroSetting, config_dir: Path) -> None:
             raise MacroError(f"the edit leaves {setting.filename} invalid: {exc}") from exc
         if setting.filename == "fx_rates.json":
             _validate_via(_load_fx, text, setting, config_dir)
+        if setting.filename == "targets.json":
+            _validate_via(_load_targets, text, setting, config_dir)
         return
 
     _validate_via(_load_parameters, text, setting, config_dir)
@@ -321,6 +358,18 @@ def _load_fx(path: Path):
     from ..fx import FxTable
 
     return FxTable.load(path.parent)
+
+
+def _load_targets(path: Path):
+    """
+    The reader the run uses, so a date it would refuse cannot be saved here.
+
+    It raises on a date it cannot parse and on a date with no value beside it, which
+    valid JSON does not catch: `"2026-13-40"` is a perfectly good string.
+    """
+    from .target import stated_target
+
+    return stated_target(path.parent)
 
 
 def _load_parameters(path: Path):

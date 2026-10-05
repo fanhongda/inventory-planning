@@ -1224,6 +1224,25 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             "money in any of these is converted on read"
             if table.currencies else "no rates configured — money is not converted")
 
+        # The targets, through the reader the run uses. Listed even when unset, which
+        # is the whole reason they are here: a screen that asked only how to compute a
+        # figure, and never what it should be, is how `TargetPlanner` went unstartable.
+        # A refusal is shown rather than swallowed — a target the run will reject is
+        # worth more on screen than a blank that looks like nobody set one.
+        from ..policy.target import StatedTargetError, stated_target
+
+        try:
+            stated = stated_target(root)
+            note = ("" if stated else "no target stated — the run offers no opinion "
+                                      "about what stock must be")
+            add("inventory_target_value", stated.value, "targets.json", note)
+            add("inventory_target_date",
+                stated.deadline.isoformat() if stated.deadline else None, "targets.json",
+                "planned without the burn-down limit" if stated.undated else "")
+        except StatedTargetError as refused:
+            add("inventory_target_value", None, "targets.json", str(refused))
+            add("inventory_target_date", None, "targets.json", str(refused))
+
         out["changes"] = macro_edit.history(root, limit=20)
         return out
 

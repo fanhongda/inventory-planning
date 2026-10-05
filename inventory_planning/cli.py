@@ -74,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Create this workspace's three directories and seed its "
                              "config, then stop. Safe to repeat: an existing config is "
                              "never overwritten.")
+    parser.add_argument(
+        "--target", type=float, default=None, metavar="VALUE",
+        help="Plan down to this balance-sheet value instead of the standing target in "
+             "config/targets.json. A run-scoped what-if: it does not edit the target.")
+    parser.add_argument(
+        "--target-by", default=None, metavar="YYYY-MM-DD",
+        help="The deadline the burn-down is measured against. Only read with --target; "
+             "without it the standing target keeps its own date.")
     parser.add_argument("--tenant", default=None,
                         help="Which workspace to plan in. Names a tenant's config, "
                              "store and output together rather than pointing at three "
@@ -102,6 +110,29 @@ def _expand(inputs) -> list:
         else:
             out.append(str(path))
     return out
+
+
+def _target_date(args):
+    """
+    `--target-by` as a date, refusing rather than planning on a date it misread.
+
+    Refused here rather than parsed loosely because the deadline is what bounds the
+    burn-down: a date read as something else moves how much of the excess counts as
+    reachable, and the run would print a reduction nobody could deliver without saying
+    which day it thought it was planning to.
+    """
+    from datetime import datetime
+
+    if not args.target_by:
+        return None
+    if args.target is None:
+        build_parser().error(
+            "--target-by needs --target; on its own there is nothing to date.")
+    try:
+        return datetime.strptime(args.target_by.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        build_parser().error(
+            f"--target-by must be YYYY-MM-DD — {args.target_by!r} is not.")
 
 
 def _legacy_warning() -> str:
@@ -210,6 +241,7 @@ def main():
             open_po_df=loaded.get("open_po_df"),
             item_master_df=loaded.get("item_master_df"),
             planning_master_df=loaded.get("planning_master_df"),
+            target_value=args.target, deadline=_target_date(args),
         )
         return
 
@@ -279,6 +311,7 @@ def main():
     planner.run_policy_analysis(
         results, inventory_df=inv_df, open_po_df=open_po_df,
         item_master_df=item_master_df, planning_master_df=planning_master_df,
+        target_value=args.target, deadline=_target_date(args),
     )
 
 

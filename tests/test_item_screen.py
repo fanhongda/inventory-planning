@@ -126,3 +126,60 @@ class TestTheScreenSaysWhatItCannotShow:
         assert len(out) == 2, "the row survives"
         assert pd.isna(out.loc[1, "lead_time_days"]), "the implausible lead time is gone"
         assert out.loc[1, "po_qty"] == 20, "and nothing else on the line is implicated"
+
+
+class TestWhatCountsAsADisagreement:
+    """
+    The grid's default view. Every flag restates a column the run wrote — its own
+    verdict on the policy, the suggestion engine's sentence, should-be against actual —
+    because a screen that decided for itself which items matter would be a second
+    opinion kept beside the engine's, and nothing would be comparing the two.
+
+    No threshold anywhere. A cutoff would be a number invented by the interface, and
+    the one thing this repository is consistent about is not inventing numbers.
+    """
+
+    @staticmethod
+    def _flags(**row):
+        from inventory_planning.api.app import _disagreements
+
+        return _disagreements(row)
+
+    def test_the_run_s_own_verdict_decides_the_policy_flag(self):
+        assert "policy" in self._flags(policy_agrees="False")
+        assert "policy" not in self._flags(policy_agrees="True")
+
+    def test_a_workbook_boolean_may_arrive_as_text(self):
+        """
+        Cells come back through the workbook reader, which renders under the sheet's
+        own number formats — so `False` is the string "False" by the time it is here,
+        and `if not value` would have flagged every item in the catalogue.
+        """
+        for falsey in ("False", "false", "FALSE", "no", "0"):
+            assert "policy" in self._flags(policy_agrees=falsey), falsey
+
+    def test_an_absent_verdict_is_not_a_disagreement(self):
+        """A run that wrote no policy column has not disagreed about anything."""
+        assert self._flags(sku="A") == []
+        assert self._flags(policy_agrees=None) == []
+
+    def test_a_gap_of_zero_is_not_a_position_finding(self):
+        assert "position" not in self._flags(gap_value=0)
+        assert "position" in self._flags(gap_value=-75405.5)
+
+    def test_the_word_none_is_not_a_suggested_change(self):
+        """
+        `changes_suggested` is a sentence, and a sheet writes an absent one as the text
+        "None". Taken literally that is every item in the catalogue needing attention.
+        """
+        assert "parameters" not in self._flags(changes_suggested="None")
+        assert "parameters" not in self._flags(changes_suggested="")
+        assert "parameters" in self._flags(changes_suggested="review 7d → 30d")
+
+    def test_a_number_survives_the_formatting_the_workbook_applied(self):
+        from inventory_planning.api.app import _number
+
+        assert _number("-75,405.55") == pytest.approx(-75405.55)
+        assert _number("95%") == pytest.approx(95.0)
+        assert _number("periodic") is None
+        assert _number(True) is None, "a flag is not a quantity"

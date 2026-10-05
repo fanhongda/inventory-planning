@@ -207,3 +207,10 @@ p.legend .key::before {
 }
 p.legend .key.forecast::before { height: 0; border-top: 2px dashed var(--accent); }
 p.legend .key.band::before { height: 10px; opacity: .25; }
+
+/* A gap, with its sign carried by colour as well as by the minus. Short of should-be
+   and over it are different problems — one is a service risk and the other is cash on
+   a shelf — and a column of signed numbers makes the reader do that sorting by eye. */
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.num.short { color: var(--warn); }
+td.num.over { color: var(--muted); }

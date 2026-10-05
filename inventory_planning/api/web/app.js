@@ -19,7 +19,7 @@ const SCREENS = {
   browse: { label: "Stored facts", start: mountBrowse },
   policy: { label: "Policy & runs", start: mountPolicy },
   results: { label: "Results", start: mountResults },
-  item: { label: "Item", start: mountItem },
+  item: { label: "Items", start: mountItem },
 };
 
 let started = {};

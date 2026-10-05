@@ -114,6 +114,52 @@ def _actor(body: Dict[str, Any], what: str):
         raise HTTPException(400, str(exc)) from exc
 
 
+# What an item grid shows, out of the 113 columns the Parameters sheet carries. Chosen
+# rather than paged through because a grid wide enough to need scrolling sideways is a
+# grid whose first screen decides what gets read, and that decision should be made here
+# and on purpose. The drill-down carries the rest.
+_ITEM_COLUMNS = (
+    "sku", "product_family", "abc_class", "stocking_class", "demand_pattern",
+    "policy_in_force", "policy_implied", "policy_implied_because", "policy_agrees",
+    "actual_value", "should_be_value", "gap_value", "coverage_ratio",
+    "changes_suggested", "ss_delta_value_suggested",
+    "service_level", "review_period_days", "lead_time_days", "demand_cv",
+)
+
+
+def _number(value: Any) -> Optional[float]:
+    """A cell as a number, or None. Workbook cells arrive as text where formatted."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _disagreements(row: Dict[str, Any]) -> List[str]:
+    """
+    Which of this run's own disagreements this item is in, named, not scored.
+
+    Restating columns the run wrote rather than judging anything: `policy_agrees` is its
+    verdict, `changes_suggested` is the suggestion engine's sentence, and a gap is
+    should-be against actual. Nothing is recomputed and nothing is thresholded — a
+    cutoff here would be a number invented by the interface, and the screen sorts by
+    money instead.
+    """
+    flags = []
+    agrees = row.get("policy_agrees")
+    if agrees is not None and str(agrees).strip().lower() in ("false", "0", "no"):
+        flags.append("policy")
+    gap = _number(row.get("gap_value"))
+    if gap:
+        flags.append("position")
+    changes = row.get("changes_suggested")
+    if changes and str(changes).strip().lower() not in ("none", "nan", ""):
+        flags.append("parameters")
+    return flags
+
+
 def _output_kind(name: str) -> str:
     """
     How the screen should offer one output: a workbook to browse, text to read, or a
@@ -1451,6 +1497,77 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             "note": "This screen renders these files. It does not recompute anything "
                     "in them — a second place the figures were formatted and rounded "
                     "would be a second place they could disagree.",
+        }
+
+    @app.get("/runs/{run_id}/items")
+    def run_items(run_id: str, view: str = Query("disagreement"),
+                  limit: int = Query(200, ge=1, le=2000)) -> Dict[str, Any]:
+        """
+        The items worth looking at, which is not the same as all of them.
+
+        A flat table of every SKU, sorted by item number, asks a planner to find the
+        exceptions in it — and a page nobody finishes reading produces the belief that
+        it was read. So the default is the rows where this run disagrees with the
+        organisation it is planning for, which is the thing the pipeline exists to do.
+
+        Nothing here is computed. Every figure is a cell the run wrote, and the three
+        groupings restate columns it wrote too: `policy_agrees` is the run's own verdict
+        on whether the policy in force is the one the evidence implies, `changes` is the
+        sentence the suggestion engine produced, and `gap_value` is should-be against
+        actual. The ordering is by money, for the reason the resting-on list is: an
+        assumption governing every line of the stock snapshot and one governing four
+        rows of a sample, printed in the same typeface, spend the reader's attention
+        uniformly on figures that are not uniformly expensive.
+
+        No threshold decides what counts. A cutoff would be a number invented here, and
+        the sort already puts the expensive end first — which is the same information
+        without a line drawn across it by nobody in particular.
+        """
+        from ..reporting.read_workbook import WorkbookUnreadable, read_sheet
+
+        manifest = RunRegistry(service.output_dir).get(run_id)
+        if manifest is None:
+            raise HTTPException(404, f"no run {run_id!r} under {service.output_dir}")
+        workbook = next((r.get("name") for r in manifest.get("outputs") or []
+                         if str(r.get("name") or "").startswith("planning_")
+                         and _output_kind(r.get("name") or "") == "workbook"), None)
+        if workbook is None:
+            raise HTTPException(404, f"run {run_id!r} wrote no planning workbook.")
+
+        try:
+            # Read whole, then projected. These sheets are one row per item and the
+            # sort is over all of them, so a paged read would order the page rather
+            # than the catalogue — which is the one thing this endpoint is for.
+            sheet = read_sheet(_output_path(run_id, workbook), "Parameters",
+                               limit=100_000)
+        except WorkbookUnreadable as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+        at = {name: i for i, name in enumerate(sheet.columns)}
+        wanted = [c for c in _ITEM_COLUMNS if c in at]
+        rows = []
+        for values in sheet.rows:
+            row = {c: values[at[c]] for c in wanted}
+            row["flags"] = _disagreements(row)
+            rows.append(row)
+
+        groups = {
+            "policy": [r for r in rows if "policy" in r["flags"]],
+            "position": [r for r in rows if "position" in r["flags"]],
+            "parameters": [r for r in rows if "parameters" in r["flags"]],
+        }
+        money = lambda r: abs(_number(r.get("gap_value")) or 0.0)   # noqa: E731
+        for name in groups:
+            groups[name] = sorted(groups[name], key=money, reverse=True)[:limit]
+
+        return {
+            "run_id": run_id, "run_at": manifest.get("run_at"), "workbook": workbook,
+            "columns": wanted,
+            "total": len(rows),
+            "flagged": sum(1 for r in rows if r["flags"]),
+            "view": view,
+            "groups": groups,
+            "all": sorted(rows, key=money, reverse=True)[:limit] if view == "all" else [],
         }
 
     @app.get("/runs/{run_id}/skus/{sku}")

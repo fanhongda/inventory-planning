@@ -1712,3 +1712,20 @@ class TestOneItemAsARunSawIt:
         answered = client.get("/runs/nope/skus/SKU-1")
         assert answered.status_code == 404
         assert "no run" in answered.json()["detail"]
+
+
+class TestTheItemGridShowsDisagreementsFirst:
+
+    def test_an_unknown_run_is_a_404_not_an_empty_grid(self, client):
+        answered = client.get("/runs/nope/items")
+        assert answered.status_code == 404
+        assert "no run" in answered.json()["detail"]
+
+    def test_a_run_with_no_workbook_says_so(self, client, tmp_path):
+        from inventory_planning.provenance import RunManifest, RunRegistry
+
+        run = RunManifest.begin(output_dir=tmp_path)
+        RunRegistry(client.app.state.service.output_dir).save(run)
+        answered = client.get(f"/runs/{run.run_id}/items")
+        assert answered.status_code == 404
+        assert "no planning workbook" in answered.json()["detail"]

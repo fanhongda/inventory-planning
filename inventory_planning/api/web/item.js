@@ -145,32 +145,127 @@ function detail(body) {
   ];
 }
 
+// ── The grid ────────────────────────────────────────────────────────────────
+//
+// Default view is the rows this run disagrees with the organisation about, not every
+// item. A flat table of the whole catalogue asks the planner to find the exceptions in
+// it, and a page nobody finishes reading produces the belief that it was read.
+//
+// The three groups are the run's own verdicts, restated: `policy_agrees`, the
+// suggestion engine's sentence, and should-be against actual. Sorted by money, with no
+// threshold — a cutoff would be a number invented by this screen.
+
+const GROUPS = {
+  policy: {
+    title: "The policy in force is not the one the evidence implies",
+    sub: "This run's own verdict, with the reason it gave. The most expensive "
+       + "disagreement on the page, because it is not a parameter being off by a "
+       + "margin — it is the wrong kind of item.",
+    columns: ["sku", "policy_in_force", "policy_implied", "policy_implied_because",
+              "gap_value"],
+  },
+  parameters: {
+    title: "The rules would set different parameters",
+    sub: "What this item's parameters would be under the rules as they stand, beside "
+       + "what the run used. Nothing is applied.",
+    columns: ["sku", "abc_class", "changes_suggested", "ss_delta_value_suggested",
+              "gap_value"],
+  },
+  position: {
+    title: "Stock away from should-be, by money",
+    sub: "Not a filter: nearly every item is some distance from should-be, so this is "
+       + "the ranking rather than a shortlist. Negative is short of should-be.",
+    columns: ["sku", "abc_class", "actual_value", "should_be_value", "gap_value",
+              "coverage_ratio"],
+  },
+};
+
+const LABELS = {
+  sku: "item", policy_in_force: "in force", policy_implied: "implied",
+  policy_implied_because: "because", gap_value: "gap",
+  changes_suggested: "would change", ss_delta_value_suggested: "safety stock Δ",
+  abc_class: "class", actual_value: "actual", should_be_value: "should be",
+  coverage_ratio: "coverage",
+};
+
+function cell(name, value) {
+  if (value === null || value === undefined || value === "") return el("td", {}, "—");
+  if (name === "gap_value") {
+    const n = Number(String(value).replace(/,/g, ""));
+    return el("td", { class: Number.isNaN(n) ? "" : (n < 0 ? "num short" : "num over") },
+              num(n));
+  }
+  if (typeof value === "number") return el("td", { class: "num" }, num(value, 2));
+  return el("td", {}, String(value));
+}
+
+function grid(name, rows, open) {
+  const meta = GROUPS[name];
+  if (!rows.length) return null;
+  return el("details", { class: "group", open: name === "policy" },
+    el("summary", {}, meta.title, el("span", { class: "k" }, ` · ${rows.length}`)),
+    el("p", { class: "note" }, meta.sub),
+    el("div", { class: "scroll" }, el("table", {},
+      el("thead", {}, el("tr", {},
+        meta.columns.map((c) => el("th", {}, LABELS[c] || c)), el("th", {}, ""))),
+      el("tbody", {}, rows.map((r) => el("tr", {},
+        meta.columns.map((c) => cell(c, r[c])),
+        el("td", {}, el("button", { class: "link", onclick: () => open(r.sku) },
+                        "Open"))))))));
+}
+
 export async function mountItem() {
   const host = $("#item-body");
   const box = el("input", { placeholder: "item number, e.g. SKU-001", id: "sku-box" });
   const out = el("div", {});
+  const gridHost = el("div", {});
   let runs = [];
 
-  const picker = el("select", {});
-  const look = async () => {
-    const sku = box.value.trim();
-    if (!sku) { mount(out, el("p", { class: "note" }, "Name an item.")); return; }
-    if (!picker.value) {
-      mount(out, el("p", { class: "note" },
-        "No run to read. The item screen renders a run's workbook, so there has to "
-        + "be one — start a run on the policy screen."));
-      return;
-    }
-    mount(out, el("p", { class: "note" }, "Reading…"));
+  const picker = el("select", { onchange: () => { loadGrid(); mount(out); } });
+
+  const open = async (sku) => {
+    box.value = sku;
+    mount(out, el("p", { class: "note" }, "Reading\u2026"));
     try {
       mount(out, detail(await api(
         `/runs/${encodeURIComponent(picker.value)}/skus/${encodeURIComponent(sku)}`)));
+      out.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (err) {
       mount(out, el("p", { class: "status bad" }, String(err.message)));
     }
   };
 
-  mount(host, el("p", { class: "note" }, "Loading…"));
+  const look = () => {
+    const sku = box.value.trim();
+    if (!sku) { mount(out, el("p", { class: "note" }, "Name an item.")); return; }
+    if (!picker.value) {
+      mount(out, el("p", { class: "note" },
+        "No run to read. This screen renders a run's workbook, so there has to be "
+        + "one \u2014 start a run on the policy screen."));
+      return;
+    }
+    open(sku);
+  };
+
+  const loadGrid = async () => {
+    if (!picker.value) { mount(gridHost); return; }
+    mount(gridHost, el("p", { class: "note" }, "Reading the run\u2026"));
+    try {
+      const body = await api(`/runs/${encodeURIComponent(picker.value)}/items`);
+      mount(gridHost, el("section", { class: "card" },
+        el("h2", {}, "What this run disagrees with",
+           el("span", { class: "badge" }, `${body.flagged} of ${body.total}`)),
+        el("p", { class: "sub" },
+           `From ${body.workbook}. Nothing here is recalculated \u2014 the groups `
+           + `restate columns the run wrote, ordered by the money behind each row.`),
+        Object.keys(GROUPS).map((name) =>
+          grid(name, body.groups[name] || [], open))));
+    } catch (err) {
+      mount(gridHost, el("p", { class: "status bad" }, String(err.message)));
+    }
+  };
+
+  mount(host, el("p", { class: "note" }, "Loading\u2026"));
   try {
     runs = (await api("/runs")).runs || [];
   } catch (err) {
@@ -191,7 +286,9 @@ export async function mountItem() {
              + "has to be one first."),
       runs.length ? el("div", {}, el("button", { class: "primary", onclick: look },
                                      "Look it up")) : null),
+    gridHost,
     out);
 
   box.addEventListener("keydown", (e) => { if (e.key === "Enter") look(); });
+  loadGrid();
 }

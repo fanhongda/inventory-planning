@@ -115,10 +115,41 @@ class TestProfiler:
     def test_recognises_period_headers(self, header, expected):
         assert str(parse_period_header(header)) == expected
 
-    @pytest.mark.parametrize("header", ["SKU", "Item Code", "2026", "M1", "Qty", "Total"])
+    @pytest.mark.parametrize("header,expected", [
+        ("2026年1月", "2026-01"), ("2026年01月", "2026-01"), ("2026年1月份", "2026-01"),
+        ("26年1月", "2026-01"), ("2026年12月", "2026-12"),
+        ("2026年Q1", "2026-01"), ("2026年第2季度", "2026-04"), ("2026年3季度", "2026-07"),
+    ])
+    def test_recognises_chinese_period_headers(self, header, expected):
+        """
+        A planner's demand matrix out of a Chinese ERP heads its columns this way, and
+        none of the Latin patterns can match it. The file then profiled as `long`, fell
+        through to alias scoring, and was routed to whichever contract its two metadata
+        columns happened to resemble — on the sample set, `inventory` at 39%, where it
+        lost to the real stock report and was dropped as a duplicate claim. The planner's
+        whole time series disappeared and the run forecast from sales history instead,
+        which inverts the precedence `demand_signal` declares.
+        """
+        assert str(parse_period_header(header)) == expected
+
+    @pytest.mark.parametrize("header", ["SKU", "Item Code", "2026", "M1", "Qty", "Total",
+                                        "2026年", "八月", "2026年13月", "年月"])
     def test_rejects_non_period_headers(self, header):
         """Conservative on purpose — a bare year or code must not trigger a reshape."""
         assert parse_period_header(header) is None
+
+    def test_a_chinese_demand_matrix_is_routed_as_one(self):
+        """End to end: the header change is only worth anything if the routing follows."""
+        import pandas as pd
+
+        frame = pd.DataFrame({
+            "Item": [f"SKU-{i:03d}" for i in range(12)],
+            "Description": ["part"] * 12,
+            **{f"2026年{m}月": list(range(m, m + 12)) for m in range(1, 13)},
+        })
+        profile = profile_frame(frame, "需求矩阵.xlsx")
+        assert profile.shape == "wide_periods"
+        assert len(profile.period_columns) == 12
 
     def test_detects_wide_timeseries(self, planner_timeseries):
         profile = profile_frame(planner_timeseries, "demand.xlsx")

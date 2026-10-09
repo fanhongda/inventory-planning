@@ -543,6 +543,179 @@ function gatesCard(body, refresh) {
     later);
 }
 
+// ── What has been uploaded, and taking it back ───────────────────────────────
+//
+// The screen had no way back. Every upload landed and stayed: in the requirements
+// checklist, in the quality gate, and — because the server reads the *newest* batch per
+// document type — as the document a run would actually read. So a file uploaded by
+// mistake was not clutter, it was the answer, and the only correction on offer was to
+// upload something else and hope it won. "Nothing here enters a planning run" was true
+// and did not mean nothing could be undone; there was simply no undo.
+//
+// Two different things, kept apart, because withdrawing them means two different
+// things. A **landed** batch has entered nothing, so removing it is undoing an upload
+// and asks for a name and no justification. A **promoted** batch is a fact a run may
+// have read, so it is withdrawn on the Stored facts screen with a reason — this card
+// names it and sends the reader there rather than offering a button that would be the
+// wrong button.
+
+const STATUS = {
+  landed: { cls: "ok", label: "uploaded, not promoted" },
+  promoted: { cls: "", label: "in the facts" },
+  void: { cls: "", label: "withdrawn" },
+};
+
+// Survives the re-render. A withdrawal rebuilds this card from the server, which threw
+// away both the outcome message and the name just typed — so the confirmation for the
+// removal flashed and vanished, and removing three files meant typing the name three
+// times. The name is not stored anywhere: it is in this tab until the page reloads.
+const uploads = { by: "", said: null, bad: false };
+
+function uploadsCard(batches, refresh) {
+  const live = batches.filter((b) => b.status !== "void");
+  if (!live.length) {
+    return el("section", { class: "card" },
+      el("h2", {}, "What you have uploaded"),
+      el("p", { class: "sub" },
+         "Nothing is loaded. Each file you upload appears here, with a way to take it "
+         + "back \u2014 the checklist above is answered by this list, so removing a file "
+         + "from it is how the checklist changes its mind."),
+      // The outcome of the removal that emptied it. Without this, clearing everything
+      // answers with a blank card, which reads the same as a card that never worked.
+      uploads.said
+        ? el("p", { class: uploads.bad ? "status bad" : "changed" }, uploads.said)
+        : null);
+  }
+
+  // Which batch each document type is actually being read from. The server takes the
+  // newest per type, so a second upload of the same kind silently supersedes the
+  // first — visible here rather than inferable from two timestamps.
+  const inForce = new Map();
+  for (const b of live) {
+    if (b.status === "void") continue;
+    const seen = inForce.get(b.doc_type);
+    if (!seen || String(b.landed_at) > String(seen.landed_at)) inForce.set(b.doc_type, b);
+  }
+
+  const by = el("input", { type: "text", placeholder: "your name",
+                           value: uploads.by,
+                           oninput: (e) => { uploads.by = e.target.value; } });
+  const out = el("div", {},
+    uploads.said
+      ? el("p", { class: uploads.bad ? "status bad" : "changed" }, uploads.said)
+      : null);
+
+  const say = (text, bad = false) => {
+    uploads.said = text;
+    uploads.bad = bad;
+    mount(out, el("p", { class: bad ? "status bad" : "changed" }, text));
+  };
+
+  const named = () => {
+    // Read off the field as well as off the remembered value: a browser autofill and a
+    // paste both set `value` without firing `input`.
+    uploads.by = by.value.trim() || uploads.by;
+    if (uploads.by.trim()) return true;
+    say("Name yourself first \u2014 a withdrawal is recorded like every other change "
+        + "here.", true);
+    return false;
+  };
+
+  const withdraw = async (batch) => {
+    if (!named()) return;
+    try {
+      const body = await api(`/batches/${batch.batch_id}/void`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ by: uploads.by }),
+      });
+      say(`${batch.source_name} withdrawn. The rows are untouched and the withdrawal `
+          + `is appended, so it can be read back and undone.`
+          + (body.was === "promoted" ? " It was already in the facts." : ""));
+      refresh();
+    } catch (err) {
+      say(String(err.message), true);
+    }
+  };
+
+  const resetAll = async () => {
+    if (!named()) return;
+    try {
+      const body = await api("/uploads/reset", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ by: uploads.by }),
+      });
+      say(body.note);
+      refresh();
+    } catch (err) {
+      say(String(err.message), true);
+    }
+  };
+
+  const row = (b) => {
+    const st = STATUS[b.status] || STATUS.landed;
+    const superseded = b.status === "landed"
+      && inForce.get(b.doc_type) && inForce.get(b.doc_type).batch_id !== b.batch_id;
+    return el("tr", { class: superseded ? "attention" : null },
+      el("td", {}, b.source_name || el("code", {}, b.batch_id),
+         b.sheet && b.sheet !== "0"
+           ? el("span", { class: "k" }, ` \u00b7 sheet ${b.sheet}`) : null),
+      el("td", {}, el("code", {}, b.doc_type || "(unrouted)")),
+      el("td", { class: "num" }, num(b.rows)),
+      el("td", {}, String(b.landed_at || "").replace("T", " ").slice(0, 16)),
+      el("td", {},
+         el("span", { class: `tag ${b.status === "promoted" ? "declared" : "mapped"}` },
+            st.label),
+         superseded
+           ? el("div", { class: "k" },
+                "superseded \u2014 a newer upload of this document is the one being read")
+           : null),
+      el("td", {},
+         b.status === "promoted"
+           ? el("span", { class: "k" }, "withdraw it on Stored facts, with a reason")
+           : el("button", { class: "link", type: "button",
+                            onclick: () => withdraw(b) }, "Remove")));
+  };
+
+  const promoted = live.filter((b) => b.status === "promoted").length;
+  return el("section", { class: "card" },
+    el("h2", {}, "What you have uploaded",
+       el("span", { class: "badge" }, `${live.length} file(s)`)),
+    el("p", { class: "sub" },
+       "Where two uploads claim the same document, the newest one is read and the "
+       + "others are marked superseded. Removing a file is appended like every other "
+       + "change \u2014 the rows stay on disk and the withdrawal can itself be read "
+       + "back."),
+    el("div", { class: "scroll" }, el("table", {},
+      el("thead", {}, el("tr", {},
+        ["file", "read as", "rows", "uploaded", "state", ""].map((h) => el("th", {}, h)))),
+      el("tbody", {}, live.map(row)))),
+    el("form", { class: "declare", onsubmit: (e) => e.preventDefault() },
+      el("div", { class: "row2" },
+        el("div", {}, el("label", {}, "who is removing it"), by),
+        el("div", {}, el("label", {}, " "),
+           el("button", { type: "button", onclick: resetAll },
+              "Start over \u2014 remove every upload not yet promoted"))),
+      promoted
+        ? el("p", { class: "note" },
+             `${promoted} of these are already in the facts. "Start over" leaves those `
+             + `alone: a fact a run has read is withdrawn deliberately, one at a time, `
+             + `with a reason.`)
+        : null,
+      out));
+}
+
+async function showUploads() {
+  const host = $("#uploads");
+  try {
+    mount(host, uploadsCard(await api("/batches"), () => {
+      showUploads(); showRequirements(); showGates();
+      $("#results").replaceChildren();
+    }));
+  } catch (err) {
+    mount(host, el("p", { class: "status bad" }, String(err.message)));
+  }
+}
+
 async function showGates() {
   const host = $("#gates");
   try {
@@ -586,6 +759,7 @@ async function upload(file) {
       await showBatch(landed, section);
     }
     await showRequirements();
+    await showUploads();
     await showGates();
   } catch (err) {
     status.className = "status bad";
@@ -596,6 +770,7 @@ async function upload(file) {
 
 export function mountReview() {
   showRequirements();
+  showUploads();
   showGates();
   const drop = $("#drop");
   $("#pick").addEventListener("click", () => $("#file").click());

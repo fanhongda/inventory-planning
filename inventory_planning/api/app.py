@@ -124,6 +124,8 @@ def _output_kind(name: str) -> str:
     suffix = Path(name).suffix.lower()
     if suffix in (".xlsx", ".xlsm"):
         return "workbook"
+    if suffix in (".html", ".htm"):
+        return "report"
     if suffix in (".md", ".txt"):
         return "text"
     if suffix in (".csv", ".json"):
@@ -939,15 +941,71 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         """
         Withdraw a batch. The rows are not touched — a void is appended, like everything
         else, so it is itself reversible and itself attributable.
+
+        The reason is required of a batch that reached the facts and not of one that is
+        only landed, and the difference is not a convenience. A promoted batch has been
+        read by a run, so withdrawing it changes an answer somebody may be holding and
+        the reason is the only account of why. A landed batch has entered nothing — the
+        import screen says so on every upload — so undoing an upload is undoing an
+        upload, and demanding a written justification for it is how a screen with no
+        way back gets one that nobody uses.
         """
         service.find_batch(batch_id)
+        promoted = service.status_of(batch_id) == "promoted"
         reason = str(body.get("reason", "")).strip()
-        if not reason:
-            raise HTTPException(400, "voiding a batch needs a `reason`")
+        if promoted and not reason:
+            raise HTTPException(
+                400, f"{batch_id} has been promoted into the facts, so withdrawing it "
+                     f"changes what a run would read. That needs a `reason`.")
         actor = _actor(body, f"voiding batch {batch_id}")
-        record = service.ledger.void(batch_id, reason=reason, by=actor.name)
-        return {"batch_id": batch_id, "status": "void",
+        record = service.ledger.void(
+            batch_id,
+            reason=reason or "withdrawn on the import screen before promotion",
+            by=actor.name)
+        return {"batch_id": batch_id, "status": "void", "was": "promoted" if promoted
+                else "landed",
                 "voided_at": record.voided_at, "voided_by": record.voided_by}
+
+    @app.post("/uploads/reset")
+    def reset_uploads(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+        """
+        Start the import over: withdraw every landed batch that was never promoted.
+
+        The screen had no way back at all. An export uploaded by mistake, or a second
+        one that should have replaced the first, stayed in the requirements checklist
+        and in the quality gate for good — and because `landed_documents` takes the
+        newest batch per document type, a wrong file was not merely clutter: it was the
+        document a run would have read. "Upload again and hope" is not a correction.
+
+        Promoted batches are left alone and named in the reply. Those are facts, and
+        clearing them is the void above, one at a time, with a reason each.
+        """
+        actor = _actor(body, "resetting the import screen")
+        withdrawn, kept = [], []
+        for record in service.landing.batches():
+            batch_id = record["batch_id"]
+            status = service.status_of(batch_id)
+            if status == "void":
+                continue
+            if status == "promoted":
+                kept.append({"batch_id": batch_id,
+                             "doc_type": record.get("doc_type", ""),
+                             "source_name": record.get("source_name", "")})
+                continue
+            service.ledger.void(
+                batch_id, reason="import screen reset before promotion", by=actor.name)
+            withdrawn.append({"batch_id": batch_id,
+                              "doc_type": record.get("doc_type", ""),
+                              "source_name": record.get("source_name", ""),
+                              "rows": record.get("rows", 0)})
+        return {
+            "withdrawn": withdrawn,
+            "kept_promoted": kept,
+            "note": (f"{len(withdrawn)} upload(s) withdrawn. "
+                     + (f"{len(kept)} batch(es) are already in the facts and were left "
+                        f"alone — those are withdrawn one at a time, with a reason."
+                        if kept else "Nothing had been promoted.")),
+        }
 
     # ── Deliberately not built yet ───────────────────────────────────────────
 
@@ -1386,6 +1444,29 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         from fastapi.responses import FileResponse
 
         return FileResponse(_output_path(run_id, name), filename=name)
+
+    @app.get("/runs/{run_id}/outputs/{name}/view")
+    def output_view(run_id: str, name: str):
+        """
+        The visual review, served to be rendered rather than saved.
+
+        Separate from `/download` because that one sets a filename and therefore an
+        attachment disposition — right for a workbook, and for the one output that is a
+        page it means the planner gets a file in their downloads folder instead of the
+        charts. The file is self-contained: inline SVG, no script, no external asset,
+        because it has to open from a network share. The screen frames it sandboxed
+        anyway, on the rule that a rendered artefact is still an artefact.
+
+        Only `.html` outputs, and only ones this run's manifest names — anything else
+        would make this a file-read endpoint that happens to serve HTML.
+        """
+        from fastapi.responses import FileResponse
+
+        path = _output_path(run_id, name)
+        if path.suffix.lower() not in (".html", ".htm"):
+            raise HTTPException(
+                400, f"{name} is not a page; ask for it from /download instead.")
+        return FileResponse(path, media_type="text/html")
 
     @app.get("/runs/{run_a}/diff/{run_b}")
     def diff(run_a: str, run_b: str) -> Dict[str, Any]:

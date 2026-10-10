@@ -233,7 +233,7 @@ class InventoryPlanner:
         from .policy.suggestions import SuggestionBuilder
         from .policy.target import TargetPlanner, stated_target
 
-        print("\n[8/8] Policy analysis — should-be, levers, target...")
+        print("\n[8/9] Policy analysis — should-be, levers, target...")
 
         inventory_df = consolidate_to_planning_grain(
             inventory_df, planning_location=self.inv_reader.location_id, verbose=False
@@ -414,7 +414,7 @@ class InventoryPlanner:
         from .policy.service import ServiceAnalyzer, latest_observed_date
         from .reporting.kpi_report import KPIReport
 
-        print("\n[8/8] KPI attribution — service, ordering, forward risk...")
+        print("\n[9/9] KPI attribution — service, ordering, forward risk...")
 
         inventory_df = consolidate_to_planning_grain(
             inventory_df, planning_location=self.inv_reader.location_id, verbose=False
@@ -502,18 +502,36 @@ class InventoryPlanner:
 
         stamp = self.run.run_id
         path = self.output_dir / f"kpi_review_{stamp}.html"
-        KPIReport(title).render(
-            service=service, should_be=should_be, ordering=ordering,
-            cadence=cadence, forward=forward, levers=policy.get("levers"),
-            frontier=frontier, fx=self._fx, service_target=service_target,
-            attributes=attributes, recommendations=policy.get("recommendations"),
-            open_po=open_po_df, suggestions=policy.get("suggestions"),
-            health=self.run_health(),
-            siop=policy.get("siop"),
-            accuracy=policy.get("forecast_accuracy"),
-            inventory_health=policy.get("inventory_health"),
-            as_of=as_of, output_path=path,
-        )
+        # Recorded on the manifest like every other output. Without this the file was
+        # on disk and absent from the run's own index, so the results screen — which
+        # reads the manifest rather than listing the directory, deliberately — could
+        # not show the one output that is a picture.
+        try:
+            KPIReport(title).render(
+                service=service, should_be=should_be, ordering=ordering,
+                cadence=cadence, forward=forward, levers=policy.get("levers"),
+                frontier=frontier, fx=self._fx, service_target=service_target,
+                attributes=attributes, recommendations=policy.get("recommendations"),
+                open_po=open_po_df, suggestions=policy.get("suggestions"),
+                health=self.run_health(),
+                siop=policy.get("siop"),
+                accuracy=policy.get("forecast_accuracy"),
+                inventory_health=policy.get("inventory_health"),
+                as_of=as_of, output_path=path,
+            )
+        except Exception as exc:                   # pragma: no cover - reported, not raised
+            # The charts are a rendering of figures the workbook already carries. A
+            # failure here costs the picture and nothing else, and it runs last, after
+            # everything a planner acts on is written — so it is reported where the
+            # person can see it and the run still ends having produced a plan.
+            print(f"\n  Warning: KPI review not rendered ({exc})")
+            print("  The workbook and the CSVs are unaffected.")
+            return {
+                "service": service, "ordering": ordering, "cadence": cadence,
+                "forward": forward, "frontier": frontier, "report_path": None,
+            }
+        self.run.record_output(path)
+        self._record_run_state()
         print(f"\n  KPI review saved: {path}")
         print(f"  Open report: open {path}")
 
@@ -991,7 +1009,16 @@ class InventoryPlanner:
             ts = timeseries_pivot
             # Build demand summary from the pre-compiled pivot
             demand_summary = self._summarize_from_pivot(ts, timeseries_meta)
-            print(f"      Source: pre-compiled time series")
+            # Said with both sources named, because which one won is the whole
+            # question. `demand_signal` ranks demand_timeseries above sales_history —
+            # a planner who bucketed the demand has already made that judgement, and
+            # the pipeline's own bucketing should not quietly outrank it — and silence
+            # here is indistinguishable from the file having been dropped at routing,
+            # which is exactly what used to happen to a worksheet headed `2026年1月`.
+            print("      Source: the uploaded demand matrix, bucketed by the planner")
+            if sales_df is not None and len(sales_df):
+                print("              Sales history is loaded and is NOT the demand "
+                      "basis — it supplies price, customer and service instead.")
         else:
             ts = self.sales_reader.to_time_series(sales_df)
             demand_summary = self.sales_reader.summarize(sales_df)

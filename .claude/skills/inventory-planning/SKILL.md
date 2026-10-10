@@ -59,8 +59,12 @@ path below is relative to the repository root — run from there.** All logic is
    per-SKU comparison against the parameters the planner set by hand
 7. **Parameter suggestions** — what the data says the policy parameters should be, as a
    per-SKU CSV and as rule blocks that paste straight into `planning_parameters.md`
-8. **KPI review** — two-chapter HTML: what happened and who caused it, what is coming
-9. **CSV outputs** — supplier_params, sku_planning_params, projection, forecast, recommendations
+8. **KPI review** — two-chapter HTML with the charts: what happened and who caused it,
+   what is coming. Written by `run_kpi_review`, which the CLI calls on both paths —
+   until 2026-10-09 it had no caller and a run produced no charts at all
+9. **The workbook** — `planning_<run_id>.xlsx`, five sheets, the file a meeting runs on.
+   It replaced sixteen per-stage CSVs on 2026-09-04; `supplier_params.csv` stays beside
+   it because SKU × supplier is a grain no per-SKU sheet holds
 
 ---
 
@@ -564,7 +568,14 @@ must buy and hold, the second is the number sales review. Both are right; never 
 them. A period is short where the projected close falls below safety stock, not where
 it falls below zero: service is at risk before the shelf is bare. The projection runs
 per SKU and is summed — say so if anyone asks why a period shows a gap while total
-stock looks ample. `siop_by_period_<run>.csv`, `siop_by_family_<run>.csv`.
+stock looks ample.
+
+Published as the workbook's **S&IOP** sheet — one row per item, months across the
+header, under the `<measure> <qty|amt> <period>` spelling the S&OP worksheet uses, with
+`first_short_period`, the safety floor and the buy leading the row. The by-period and
+by-family rollups are not separate files: summed down a month's column or by product
+line, this sheet *is* the rollup, so the two cannot disagree. `plan.by_period` and
+`plan.by_family` are still on the object for a caller that wants them.
 
 **`results["forecast_accuracy"]` — the plan we published against what sold.** Not the
 model's backtest. The backtest asks whether the model was the best available for a
@@ -821,23 +832,37 @@ All outputs carry `location_id`. When expanding to multi-echelon:
 
 ## Output file reference
 
+Two files to open and a short tail of records. The sixteen CSVs this section used to
+list were consolidated on 2026-09-04 — a planner's question is answered by joining four
+of them, and nobody joins four CSVs in a meeting.
+
 ```
-output/<timestamp>/
-├── kpi_review_<run_id>.html             ← self-contained review (open this)
-├── parameter_suggestions_<run_id>.csv   ← suggested parameters vs those in force, per SKU
-├── suggested_rules_<run_id>.md          ← the same as paste-able planning_parameters.md rules
-├── source_crosscheck_<run_id>.csv       ← where two sources disagree, and by how much
-├── supersessions_<run_id>.csv           ← old number -> new, and what each contributed to
-                                       each document. Written only where a renumbering
-                                       was declared and matched something.
-├── purchase_recommendations_<run_id>.csv
-├── inventory_projection_<run_id>.csv
-├── backlog_realization_<run_id>.csv     ← per-SKU realization rate and the evidence
-├── forecast_detail_<run_id>.csv
-├── sku_planning_params.csv          stocking class, SS, ROP per SKU
-├── supplier_params.csv              WMA LT per SKU×supplier
-└── history/YYYY-MM/snapshot_<run_id>.json
+output/
+├── kpi_review_<run_id>.html         ← the review, with the charts. Open this first
+├── planning_<run_id>.xlsx           ← the plan, in five sheets. The file a meeting runs on
+│     Forecast     what it sold, what it will sell, what the model is worth
+│     Parameters   every planning parameter per item, and where each value came from
+│     Purchase     what to order, pull in, push out
+│     Inventory    what is on the shelf, how long it lasts, against what policy
+│     S&IOP        one row per item, months across the header
+├── sop_worksheet_<run_id>.xlsx/.csv the form sales fills in and returns — a worksheet,
+│                                    not a report, which is why it is not a sheet
+├── run_health_<run_id>.md           what this run could not measure, and why
+├── quality_gates_<run_id>.json      what each checkpoint found, including the passes
+├── suggested_rules_<run_id>.md      paste-able planning_parameters.md rules
+├── source_crosscheck_<run_id>.csv   where two sources disagree, and by how much
+├── supplier_params.csv              WMA LT per SKU×supplier — a grain no per-SKU sheet
+│                                    holds without dropping a supplier or repeating an item
+└── runs/<run_id>.json               what this run read, resolved and wrote
+
+<store>/history/YYYY-MM/snapshot_<run_id>.json
                                      ← the durable record: plan + the lead time it
                                        planned on. Read back by the feedback loop and
-                                       by feedback.drift for lead-time movement.
+                                       by feedback.drift for lead-time movement. It
+                                       lives in the store, not under --output.
 ```
+
+The two files are two renderings of one run, not alternatives. Everything in the review
+is in the workbook; the review adds the *shape* — a flat trend, a distribution with a
+tail, a gap that is one item and not fifty. The workbook is where a number is looked
+up, filtered and sorted.

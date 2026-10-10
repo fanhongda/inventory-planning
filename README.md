@@ -798,27 +798,42 @@ is never taken from the request.
 
 ## Output
 
+A run used to leave sixteen CSVs named for the stage that produced them, and the
+question a planner arrives with was answered by joining four of them. It leaves two
+things to open and a short tail of records:
+
 ```
 output/
-├── kpi_review_<run_id>.html                 ← open this
-├── parameter_suggestions_<run_id>.csv       suggested parameters vs those in force, per SKU
-├── suggested_rules_<run_id>.md              the same, as paste-able planning_parameters.md rules
-├── source_crosscheck_<run_id>.csv           where two sources disagree, and by how much
-├── policy_profile_<run_id>.csv              what each SKU *is* on eight axes — demand,
-│                                        lead time, review, locations, capacity,
-│                                        excess demand — the evidence behind each
-│                                        reading, and the replenishment policy it
-│                                        implies next to the one in force
-├── supersessions_<run_id>.csv               old item number -> new, and what each old
-│                                        number contributed to each document
-├── purchase_recommendations_<run_id>.csv
-├── inventory_projection_<run_id>.csv
-├── backlog_realization_<run_id>.csv         per-SKU realization rate and the evidence
-├── forecast_detail_<run_id>.csv
-├── sku_planning_params.csv              persisted: stocking class, SS, ROP per SKU
-├── supplier_params.csv                  persisted: WMA lead time per SKU × supplier
-└── history/YYYY-MM/snapshot_<run_id>.json   feedback loop input
+├── kpi_review_<run_id>.html             ← the review, with the charts. Open this first
+├── planning_<run_id>.xlsx               ← the plan, in five sheets. This is the one a
+│                                           meeting is handed
+│     Forecast     what it sold, what it will sell, and what the model is worth
+│     Parameters   every planning parameter per item, and where each value came from
+│     Purchase     what to order, what to pull in, what to push out
+│     Inventory    what is on the shelf, how long it lasts, against what policy
+│     S&IOP        one row per item, months across the header: projected position,
+│                  committed supply, the floor, the gap, and the buy behind it
+├── sop_worksheet_<run_id>.xlsx / .csv   the form sales fills in and returns — a
+│                                        worksheet, not a report, which is why it is
+│                                        not a sheet of the workbook
+├── run_health_<run_id>.md               what this run could not measure, and why
+├── quality_gates_<run_id>.json          what each of the four checkpoints found,
+│                                        including the ones that passed
+├── suggested_rules_<run_id>.md          paste-able planning_parameters.md rules
+├── source_crosscheck_<run_id>.csv       where two sources disagree, and by how much
+├── supplier_params.csv                  persisted: WMA lead time per SKU × supplier —
+│                                        SKU × supplier, which no per-SKU sheet holds
+└── runs/<run_id>.json                   what this run read, resolved and wrote
 ```
+
+The two files are two renderings of one run and are not alternatives. Everything in the
+review is in the workbook; what the review adds is the shape of it — a trend that is
+flat, a distribution with a tail, a gap that is one item rather than fifty. The
+workbook is where a number is looked up, filtered and sorted.
+
+The snapshot the feedback loop scores against goes to the store, under
+`<store>/history/YYYY-MM/`, not to the output directory — the location no longer
+depends on the shape of `--output`.
 
 `<run_id>` is the run that wrote the file — `runs/<run_id>.json` holds what that run
 read, the parameters it resolved and the code that ran. It carries seconds and a random
@@ -1048,7 +1063,8 @@ inventory_planning/
 │   ├── backlog_realization.py what share of the open order book actually ships
 │   ├── rounding.py            a countable quantity is a whole unit, and it says when
 │   ├── sop.py / sales_plan.py the S&OP worksheet out, and the reviewed plan back in
-│   ├── siop.py                supply and demand per period, in money
+│   ├── siop.py                supply and demand per period, in money — and the
+│   │                          same projection reshaped one row per item
 │   ├── forecast_accuracy.py   did the plan we *published* hold up — not the backtest
 │   └── purchase_recommender.py  forecast consumption → net requirement
 ├── feedback/
@@ -1062,7 +1078,9 @@ inventory_planning/
 └── reporting/
     ├── workbook.py            the five-sheet workbook a meeting runs on
     ├── read_workbook.py       the same file back, for the Results screen to render
-    └── kpi_report.py          two-chapter review: what happened / what is coming
+    └── kpi_report.py          two-chapter review, with the charts: what happened /
+                               what is coming. Inline SVG, no script, no asset — it
+                               has to open from a network share
 
   (at repo root:)
   .claude/skills/inventory-planning/ the skill itself — SKILL.md is the workflow, and

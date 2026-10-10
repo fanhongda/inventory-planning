@@ -21,6 +21,14 @@ shape: a gap by product line is a number to be explained, not acted on, and the 
 sums is exactly what a planner needs to see. Summed, this sheet *is* the rollup — the
 totals fall out of it and cannot disagree with it.
 
+It is also **one row per item, with the months across the header**, and not one row per
+item per month. The long form was the grain the projection is computed on, published
+unchanged: a planner holding one item and asking when it runs short had to read six rows
+and compare one against another, which with a real catalogue is thousands of rows for
+hundreds of decisions. The reshape is in `SIOPPlan.per_sku_wide` and is lossless — every
+cell appears under a `<measure> <qty|amt> <period>` name, the spelling the S&OP worksheet
+already uses, so the two sheets a meeting opens together sort the same way.
+
 ## Column order, and why nothing is dropped
 
 Each sheet leads with a curated, ordered set: identity, then the two or three figures
@@ -94,14 +102,28 @@ LEAD_COLUMNS: Dict[str, Sequence[Tuple[str, Optional[str]]]] = {
         ("qty_on_hand", QTY), ("qty_in_transit", QTY), ("unit_cost", MONEY),
         ("last_sale", None),
     ],
+    # Periods are not listed: they are the data. Everything phased is named
+    # `<measure> <qty|amt> <period>` and formatted by `_PHASED_FORMATS` below.
     "S&IOP": [
         ("sku", None), ("description", None), ("product_family", None),
-        ("period", None),
-        ("demand_qty", QTY), ("supply_qty", QTY), ("closing_qty", QTY),
-        ("safety_stock", QTY), ("gap_qty", QTY),
-        ("demand_cogs", MONEY), ("supply_value", MONEY), ("closing_value", MONEY),
-        ("gap_value", MONEY),
+        ("recommended_action", None),
+        ("first_short_period", None), ("short_periods", QTY),
+        ("suggested_po_qty", QTY), ("pushout_open_po_qty", QTY),
+        ("safety_stock", QTY),
+        ("demand qty total", QTY), ("supply qty total", QTY), ("gap qty peak", QTY),
+        ("demand amt total", MONEY), ("supply amt total", MONEY),
+        ("gap amt total", MONEY),
     ],
+}
+
+# How a phased column is formatted, by the prefix its name carries. A sheet whose
+# columns are named after the data cannot list them, and leaving them unformatted put
+# fourteen significant figures of a currency amount in a cell a planner reads at a
+# glance — which is the thing the number formats exist to stop.
+_PHASED_FORMATS: Dict[str, Sequence[Tuple[str, str]]] = {
+    "S&IOP": [("demand qty ", QTY), ("supply qty ", QTY), ("closing qty ", QTY),
+              ("gap qty ", QTY), ("demand amt ", MONEY), ("supply amt ", MONEY),
+              ("closing amt ", MONEY), ("gap amt ", MONEY)],
 }
 
 # What each sheet is for, in the file rather than in the message that sent it. A
@@ -148,12 +170,16 @@ SHEET_NOTES: Dict[str, List[str]] = {
         "yesterday can show a year of cover, and an old part with one order shows almost none.",
     ],
     "S&IOP": [
-        "Projected on-hand per item per month, and the purchase behind it.",
-        "`closing_qty` is the projected position at the end of the period. A period is "
-        "short when it falls below `safety_stock`, which is what `gap_qty` measures — not "
-        "when the shelf is bare.",
-        "Summed by product line or by period, this sheet is the S&IOP rollup. The totals "
-        "come out of these rows, so the two cannot disagree.",
+        "One row per item, months across the header, and the purchase behind the position.",
+        "Read `first_short_period` first: it is the month the projection first falls "
+        "below the policy floor, and a blank means this item is covered across the whole "
+        "horizon. `suggested_po_qty` beside it is what the plan does about it.",
+        "`closing qty <month>` is the projected position at the end of that month. The "
+        "month is short when it falls below `safety_stock` — which is one column, not one "
+        "per month, because the projection holds one floor per item — and `gap qty "
+        "<month>` is by how much. Not when the shelf is bare: above an empty shelf.",
+        "Summed by product line or down a month's column, this sheet is the S&IOP "
+        "rollup. The totals come out of these cells, so the two cannot disagree.",
         "Amounts are at cost. Items with no unit cost carry quantities and a blank amount, "
         "so they cannot sum into a total unnoticed.",
     ],
@@ -166,6 +192,10 @@ def _order_columns(frame: pd.DataFrame, sheet: str) -> Tuple[pd.DataFrame, Dict[
     lead_names = [c for c, _ in lead]
     rest = [c for c in frame.columns if c not in lead_names]
     formats = {c: fmt for c, fmt in lead if fmt}
+    for prefix, fmt in _PHASED_FORMATS.get(sheet, []):
+        for column in rest:
+            if str(column).startswith(prefix):
+                formats[column] = fmt
     return frame[lead_names + rest], formats
 
 
@@ -272,9 +302,24 @@ def collect_sheets(results: Dict[str, Any],
         sheets["Inventory"] = _attach(inventory, dims)
 
     siop = policy.get("siop") or results.get("siop")
-    per_sku = getattr(siop, "per_sku", None)
-    if per_sku is not None and len(per_sku):
-        sheets["S&IOP"] = _attach(per_sku, dims)
+    wide = siop.per_sku_wide() if siop is not None else None
+    if wide is not None and len(wide):
+        frame = _attach(wide, dims)
+        # The action beside the projection, which is what makes the sheet answerable
+        # rather than merely informative: a month that falls below the floor is a
+        # question until the row also says what was ordered about it. Only the three
+        # action columns — the rest of the recommendation has its own sheet, and
+        # repeating it here would be two places one figure is maintained.
+        recommendations = results.get("recommendations")
+        if recommendations is not None and len(recommendations):
+            action = [c for c in ("recommended_action", "suggested_po_qty",
+                                  "pushout_open_po_qty")
+                      if c in recommendations.columns]
+            if action:
+                frame = frame.merge(
+                    recommendations[["sku"] + action].drop_duplicates("sku"),
+                    on="sku", how="left")
+        sheets["S&IOP"] = frame
 
     return {name: _order_columns(frame, name)[0] for name, frame in sheets.items()}
 

@@ -172,6 +172,36 @@ def _setup(workspace) -> int:
     return 0
 
 
+def _review(planner, policy, loaded) -> None:
+    """
+    The visual review, written last.
+
+    It had no caller. `run_kpi_review` renders the only output of this pipeline that is
+    a picture — the OTD trend, the should-be against actual bars, the cover
+    distribution, the forward risk — and it was reachable from the README, from the
+    skill and from a Python session, and from no command anybody runs. So a run left a
+    workbook, three CSVs and a note, and the charts were dead code that still passed
+    its tests. Charts are a rendering of figures the workbook carries: they add nothing
+    a planner cannot get from the numbers, and they are how a review meeting is
+    actually read.
+
+    Never allowed to fail the run. It runs after everything a planner acts on is
+    already on disk, so a failure costs the picture and nothing else.
+    """
+    try:
+        planner.run_kpi_review(
+            policy,
+            sales_df=loaded.get("sales_df"),
+            open_so_df=loaded.get("open_so_df"),
+            open_po_df=loaded.get("open_po_df"),
+            inventory_df=loaded.get("inventory_df"),
+            po_history_df=loaded.get("po_history_df"),
+        )
+    except Exception as exc:                       # pragma: no cover - reported, not raised
+        print(f"\n  Warning: the visual review could not be produced ({exc})")
+        print("  Every figure it would have drawn is in the workbook above.")
+
+
 def main():
     args = build_parser().parse_args()
     if not args.setup and not args.inputs and not any(
@@ -235,7 +265,7 @@ def main():
             loaded["timeseries_pivot"], loaded["timeseries_meta"] = pivot, meta
 
         results = planner.run_planning(**loaded, sales_plan=sales_plan)
-        planner.run_policy_analysis(
+        policy = planner.run_policy_analysis(
             results,
             inventory_df=loaded.get("inventory_df"),
             open_po_df=loaded.get("open_po_df"),
@@ -243,6 +273,7 @@ def main():
             planning_master_df=loaded.get("planning_master_df"),
             target_value=args.target, deadline=_target_date(args),
         )
+        _review(planner, policy, loaded)
         return
 
     # ── The per-file path ────────────────────────────────────────────────────
@@ -308,11 +339,15 @@ def main():
         planning_master_df=planning_master_df,
         sales_plan=sales_plan,
     )
-    planner.run_policy_analysis(
+    policy = planner.run_policy_analysis(
         results, inventory_df=inv_df, open_po_df=open_po_df,
         item_master_df=item_master_df, planning_master_df=planning_master_df,
         target_value=args.target, deadline=_target_date(args),
     )
+    _review(planner, policy, {
+        "sales_df": sales_df, "open_so_df": open_so_df, "open_po_df": open_po_df,
+        "inventory_df": inv_df, "po_history_df": po_hist_df,
+    })
 
 
 if __name__ == "__main__":

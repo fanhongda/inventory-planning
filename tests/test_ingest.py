@@ -6,6 +6,7 @@ Each of the "silent corruption" tests represents a bug that produced plausible-l
 numbers with no error — the class of failure that contract tests exist to catch.
 """
 
+import datetime
 import sys
 from pathlib import Path
 
@@ -132,6 +133,41 @@ class TestProfiler:
         """
         assert str(parse_period_header(header)) == expected
 
+    @pytest.mark.parametrize("header,expected", [
+        (pd.Timestamp(2025, 1, 31), "2025-01"),
+        (pd.Timestamp(2025, 1, 1), "2025-01"),
+        (pd.Timestamp(2025, 12, 31), "2025-12"),
+        (datetime.datetime(2025, 1, 31), "2025-01"),
+        (datetime.date(2025, 1, 31), "2025-01"),
+        (np.datetime64("2025-01-31"), "2025-01"),
+    ])
+    def test_recognises_date_typed_period_headers(self, header, expected):
+        """
+        The form a real workbook arrives in. Typing `Jan-25` into Excel makes a date
+        cell displayed through `mmm-yy`; `read_excel` hands that back as a `Timestamp`,
+        not as the serial the path below was written for, because pandas has already
+        converted it.
+
+        What it fell through to split on nothing of consequence. `str(datetime(2025, 1,
+        31))` carries a time the `ymd` pattern cannot match; `str(date(2025, 1, 31))`
+        does not and matched — so the one type a workbook never produces parsed, and the
+        one it always produces did not. The matrix then profiled as `long` and was read
+        as an inventory report at 39%, which is the same ending as the Chinese headers
+        above by a different route.
+
+        Month end and month start must read alike: a planner's column is stamped with
+        either and they are not different periods.
+        """
+        assert str(parse_period_header(header)) == expected
+
+    @pytest.mark.parametrize("header", [pd.NaT, None])
+    def test_rejects_an_empty_date_header(self, header):
+        """
+        `pd.NaT` is an instance of `datetime`, and a trailing empty header cell arrives
+        as one — so the type check alone would have accepted it and asked for its year.
+        """
+        assert parse_period_header(header) is None
+
     @pytest.mark.parametrize("header", ["SKU", "Item Code", "2026", "M1", "Qty", "Total",
                                         "2026年", "八月", "2026年13月", "年月"])
     def test_rejects_non_period_headers(self, header):
@@ -150,6 +186,25 @@ class TestProfiler:
         profile = profile_frame(frame, "需求矩阵.xlsx")
         assert profile.shape == "wide_periods"
         assert len(profile.period_columns) == 12
+
+    def test_a_date_headed_demand_matrix_is_routed_as_one(self):
+        """
+        End to end on the shape that was failing: one part-number column and twelve
+        month-end date headers, which is what the India consumption export looks like.
+        Before the date-typed headers were read, this profiled as `long` and routed to
+        `inventory`; the header fix is only worth anything if the routing follows.
+        """
+        frame = pd.DataFrame({
+            "Part number": [5435793 + i for i in range(12)],
+            **{pd.Timestamp(2025, m, 1) + pd.offsets.MonthEnd(0): list(range(m, m + 12))
+               for m in range(1, 13)},
+        })
+        profile = profile_frame(frame, "IN Historical consumption.xlsx")
+        assert profile.shape == "wide_periods"
+        assert len(profile.period_columns) == 12
+
+        route = AdapterRegistry().route(frame, "IN Historical consumption.xlsx")
+        assert route.doc_type == "demand_timeseries"
 
     def test_detects_wide_timeseries(self, planner_timeseries):
         profile = profile_frame(planner_timeseries, "demand.xlsx")

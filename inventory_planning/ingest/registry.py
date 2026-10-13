@@ -29,6 +29,7 @@ import pandas as pd
 from .adapter import Adapter, ADAPTERS_DIR, Fingerprint, ParsingRules
 from .contract import ContractRegistry, DocContract, default_registry
 from .expressions import Expression, ExpressionError
+from .location import resolve_adapter_store, warn_if_inside_repo
 from .profiler import Profiler, TableProfile, normalize_header
 
 # Sentinel so a missing contract can be probed for `.discriminator` without a guard.
@@ -171,23 +172,65 @@ class AdapterRegistry:
         self,
         adapters_dir: Path = None,
         contracts: ContractRegistry = None,
+        local_dir: Path = None,
     ):
-        self.adapters_dir = Path(adapters_dir) if adapters_dir else ADAPTERS_DIR
+        # `adapters_dir`, when given, is the whole store: the only directory read and
+        # the one `save()` writes to. The suite depends on that — a test run whose
+        # routing depends on which files this machine has ingested cannot say whether
+        # the code is good, so `tests/conftest.py` points it at a copy of what the
+        # repository tracks and nothing else.
+        if adapters_dir is not None:
+            self.adapters_dir = Path(adapters_dir)
+            self.local_dir = Path(adapters_dir)
+            self.local_origin = "argument"
+        else:
+            self.adapters_dir = ADAPTERS_DIR
+            self.local_dir, self.local_origin = resolve_adapter_store(local_dir)
         self.contracts = contracts or default_registry()
         self._adapters: List[Adapter] = []
         self._loaded = False
 
     # ── Store ────────────────────────────────────────────────────────────────
 
+    @property
+    def source_dirs(self) -> List[Path]:
+        """
+        Every directory read, shipped first.
+
+        Shipped adapters travel with the code and are reviewed in a diff. Local ones
+        are this installation's own — this ERP, this region, this export — and are the
+        half that describes somebody's business, so they live outside the working tree.
+        Reading both lets an install keep the templates it was given and add to them;
+        writing only to the second means adding never touches the package.
+        """
+        if self.local_dir == self.adapters_dir:
+            return [self.adapters_dir]
+        return [self.adapters_dir, self.local_dir]
+
     def _load_all(self) -> None:
         if self._loaded:
             return
-        if self.adapters_dir.exists():
-            for path in sorted(self.adapters_dir.rglob("*.yaml")):
+        # A local adapter displaces a shipped one of the same identity and version: the
+        # installation has reviewed and frozen its own answer for that export, and a
+        # duplicate left in the list would make routing depend on which of the two
+        # `rglob` reached first. Everything else accumulates.
+        seen: Dict[Tuple[str, str, str, int], int] = {}
+        for directory in self.source_dirs:
+            if not directory.exists():
+                continue
+            for path in sorted(directory.rglob("*.yaml")):
                 try:
-                    self._adapters.append(Adapter.load(path))
+                    adapter = Adapter.load(path)
                 except Exception as exc:
                     print(f"  ⚠ Skipping malformed adapter {path.name}: {exc}")
+                    continue
+                identity = (adapter.tenant, adapter.system, adapter.doc_type,
+                            adapter.version)
+                if identity in seen:
+                    self._adapters[seen[identity]] = adapter
+                else:
+                    seen[identity] = len(self._adapters)
+                    self._adapters.append(adapter)
         self._loaded = True
 
     @property
@@ -196,8 +239,18 @@ class AdapterRegistry:
         return list(self._adapters)
 
     def save(self, adapter: Adapter) -> Path:
-        """Persist an adapter into the store, versioned by tenant/system/doc_type."""
-        folder = self.adapters_dir / f"{adapter.tenant}__{adapter.system}"
+        """
+        Persist an adapter into the local store, versioned by tenant/system/doc_type.
+
+        The local store, not the package. A frozen adapter is production configuration
+        and a description of the installation's own master data; written into the
+        working tree it is one `git clean -fdx` from gone and one `git add -A` from
+        published. `ingest/location.py` says where it goes and why.
+        """
+        warning = warn_if_inside_repo(self.local_dir)
+        if warning:
+            print(f"  ⚠ {warning}")
+        folder = self.local_dir / f"{adapter.tenant}__{adapter.system}"
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"{adapter.doc_type}.v{adapter.version}.yaml"
         path.write_text(adapter.to_yaml(), encoding="utf-8")

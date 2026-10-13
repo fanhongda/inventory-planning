@@ -99,9 +99,26 @@ _PERIOD_PATTERNS: List[Tuple[re.Pattern, str]] = [
 ]
 
 
+# The shape `str()` gives a datetime, which is how a date-typed header survives storage.
+# Anchored and specific: it accepts `2025-01-31 00:00:00` and `2025-01-31T00:00`, and
+# rejects everything the bare-year rule rejects, because a header has to carry a time to
+# match at all. `2025-01-31` without one is the `ymd` pattern's, not this one's.
+_STRINGIFIED_DATETIME = re.compile(
+    r"^(\d{4})-(\d{1,2})-(\d{1,2})[ T]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?$")
+
+
 def _as_month_from_datetime(header: Any) -> Optional[pd.Period]:
     """
     The month a date-typed header denotes, or None if the header is not a date.
+
+    Both forms, because a header is read twice and is a different type each time. A
+    route at upload sees the object `read_excel` produced. Everything downstream reads
+    it back from the landing layer, which stores headers in JSON — `landing.py` writes
+    `str(v)` because a JSON key cannot be a datetime — so the second read gets
+    `'2025-01-31 00:00:00'`. Reading only the object meant the same file routed as
+    `demand_timeseries` on upload and as `inventory` on every read after it, and the
+    requirements checklist reported the demand signal missing while the upload list
+    showed it present.
 
     `read_excel` converts a date-typed cell to a `Timestamp`, so this is the form a
     demand matrix headed `Jan-25` actually arrives in — the display is `mmm-yy`, the
@@ -121,6 +138,15 @@ def _as_month_from_datetime(header: Any) -> Optional[pd.Period]:
     stamped with the month end as the month start, and the two must not read as
     different periods.
     """
+    if isinstance(header, str):
+        matched = _STRINGIFIED_DATETIME.match(header.strip())
+        if not matched:
+            return None
+        year, month = int(matched.group(1)), int(matched.group(2))
+        if not 1 <= month <= 12:
+            return None
+        return pd.Period(year=year, month=month, freq="M")
+
     if not isinstance(header, (dt.date, np.datetime64)):
         return None
     try:

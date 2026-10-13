@@ -160,6 +160,38 @@ class TestProfiler:
         """
         assert str(parse_period_header(header)) == expected
 
+    @pytest.mark.parametrize("header,expected", [
+        ("2025-01-31 00:00:00", "2025-01"),
+        ("2025-01-31T00:00:00", "2025-01"),
+        ("2025-01-31 00:00", "2025-01"),
+        ("2025-01-31 00:00:00.000", "2025-01"),
+        ("2025-12-31 00:00:00", "2025-12"),
+    ])
+    def test_recognises_a_date_header_that_has_been_through_str(self, header, expected):
+        """
+        The same header, read the second time. A route at upload sees the object
+        `read_excel` produced; everything after it reads the header back from the
+        landing layer, which stores headers in JSON and so writes `str(v)` — a JSON key
+        cannot be a datetime.
+
+        Reading only the object meant one file routed two ways: `demand_timeseries` on
+        upload and `inventory` on every read after it, at the same 39%. The import list
+        showed the demand signal present and the requirements checklist showed it
+        missing, which is the disagreement that surfaced it.
+        """
+        assert str(parse_period_header(header)) == expected
+
+    @pytest.mark.parametrize("header", [
+        "2025", "2025 00:00:00", "2025-13-01 00:00:00", "2025-01-31-7 00:00:00",
+    ])
+    def test_rejects_what_only_resembles_a_stringified_date(self, header):
+        """
+        The pattern is anchored and demands a time, so the bare-year rule survives it:
+        a header has to look like `str(datetime)` to match, not merely start with four
+        digits. `2025-01-31` without a time is the `ymd` pattern's and stays there.
+        """
+        assert parse_period_header(header) is None
+
     @pytest.mark.parametrize("header", [pd.NaT, None])
     def test_rejects_an_empty_date_header(self, header):
         """
@@ -205,6 +237,26 @@ class TestProfiler:
 
         route = AdapterRegistry().route(frame, "IN Historical consumption.xlsx")
         assert route.doc_type == "demand_timeseries"
+
+    def test_a_date_header_routes_the_same_before_and_after_landing(self):
+        """
+        The round trip, which is where it broke. `landing.py` writes `str(v)` for every
+        header, so the frame a later read resolves has strings where the upload had
+        datetimes. Both must reach the same contract — a file that is a demand matrix on
+        the way in and an inventory report on the way out is worse than either answer,
+        because each screen shows one of them and neither is wrong on its own evidence.
+        """
+        frame = pd.DataFrame({
+            "Part number": [5435793 + i for i in range(12)],
+            **{pd.Timestamp(2025, m, 1) + pd.offsets.MonthEnd(0): list(range(m, m + 12))
+               for m in range(1, 13)},
+        })
+        landed = frame.copy()
+        landed.columns = ["" if pd.isna(c) else str(c) for c in frame.columns]
+
+        registry = AdapterRegistry()
+        assert registry.route(frame, "x.xlsx").doc_type == "demand_timeseries"
+        assert registry.route(landed, "x.xlsx").doc_type == "demand_timeseries"
 
     def test_detects_wide_timeseries(self, planner_timeseries):
         profile = profile_frame(planner_timeseries, "demand.xlsx")

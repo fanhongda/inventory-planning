@@ -233,6 +233,103 @@ class TestTheFirstRun:
         assert body.index("Workspace.resolve") < body.index("InventoryPlanner(")
 
 
+class TestTheVisualReviewIsPartOfARun:
+    """
+    `run_kpi_review` renders the only output of this pipeline that is a picture — the
+    OTD trend, should-be against actual, the cover distribution, forward risk — and it
+    had no caller. It was reachable from the README, from the skill and from a Python
+    session, and from no command anybody runs, so a run left a workbook, three CSVs and
+    a note. The charts were dead code that still passed their own tests, which is why
+    the suite never noticed.
+
+    These are about the wiring, not the drawing: that each path reaches it, with the
+    frames it needs, and that a failure there cannot take down a run whose plan is
+    already on disk.
+    """
+
+    class _Planner:
+        def __init__(self, *_, **__):
+            self.reviewed = None
+            self.raises = False
+
+        class _Workspace:
+            def summary(self):
+                return "workspace"
+
+        workspace = _Workspace()
+
+        def load_all(self, paths):
+            return {"sales_df": "S", "po_history_df": "P", "open_so_df": "O",
+                    "open_po_df": "Q", "inventory_df": "I", "item_master_df": "M",
+                    "planning_master_df": None}
+
+        def run_planning(self, **kwargs):
+            return {"results": True}
+
+        def run_policy_analysis(self, *_, **__):
+            return {"policy": True}
+
+        def run_kpi_review(self, policy, **frames):
+            if self.raises:
+                raise RuntimeError("the chart library fell over")
+            self.reviewed = (policy, frames)
+
+    def _run(self, monkeypatch, tmp_path, planner, argv):
+        from inventory_planning import cli
+
+        monkeypatch.setattr(cli, "InventoryPlanner", lambda *a, **k: planner)
+        monkeypatch.setattr(cli.Path, "is_dir", lambda self: False, raising=False)
+        monkeypatch.setattr(sys, "argv", argv)
+
+        class _Workspace:
+            ready = True
+            tenant = "default"
+            config_dir = tmp_path
+            output_dir = tmp_path
+
+            def summary(self):
+                return "workspace"
+
+        monkeypatch.setattr("inventory_planning.workspace.Workspace.resolve",
+                            classmethod(lambda cls, *a, **k: _Workspace()))
+        cli.main()
+
+    def test_the_contract_path_reaches_it_with_every_frame(self, monkeypatch, tmp_path):
+        planner = self._Planner()
+        sample = tmp_path / "export.csv"
+        sample.write_text("a,b\n1,2\n", encoding="utf-8")
+        self._run(monkeypatch, tmp_path, planner,
+                  ["inventory-plan", str(sample), "--no-interactive"])
+        assert planner.reviewed is not None, "a run produced no visual review"
+        _, frames = planner.reviewed
+        assert set(frames) == {"sales_df", "open_so_df", "open_po_df",
+                               "inventory_df", "po_history_df"}
+        assert all(v is not None for v in frames.values())
+
+    def test_both_paths_reach_it(self):
+        """
+        The per-file path is harder to drive here and just as easy to re-orphan. The
+        defect was never subtle arithmetic: it was a method with no caller.
+        """
+        import inspect
+
+        from inventory_planning import cli
+
+        assert inspect.getsource(cli.main).count("_review(") == 2
+
+    def test_a_failure_there_does_not_fail_the_run(self, monkeypatch, tmp_path, capsys):
+        """It runs last, after everything a planner acts on is already written."""
+        planner = self._Planner()
+        planner.raises = True
+        sample = tmp_path / "export.csv"
+        sample.write_text("a,b\n1,2\n", encoding="utf-8")
+        self._run(monkeypatch, tmp_path, planner,
+                  ["inventory-plan", str(sample), "--no-interactive"])
+        out = capsys.readouterr().out
+        assert "could not be produced" in out
+        assert "in the workbook" in out
+
+
 class TestTheSubcommandCLIsAcceptTheFlagsEitherWay:
     """
     Found by following the README's own steps: `feedback runs --tenant prod` was an

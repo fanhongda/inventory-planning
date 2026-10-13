@@ -378,6 +378,105 @@ section used to rule out was built once the reason changed from correctness to p
 adoption — [INTERFACE.md](INTERFACE.md) carries that decision and its constraint, which
 is unchanged: it writes declarations and overrides, never a fact.
 
+## What a run leaves, and what the screen lets you take back (2026-10-09)
+
+Five findings from running the current build end to end, four of them fixed here. They
+have one shape in common and it is worth naming before the list: **each is a capability
+that exists in the code and is not reachable from anything anybody runs.** Not an
+arithmetic error — those have tests. A method with no caller, a screen with no undo, a
+parser that covers one script, a frame published at the grain it was computed at.
+
+**The visual review had no caller. Fixed.** `reporting/kpi_report.py` is 1,978 lines
+that render the only output of this pipeline that is a picture — the OTD trend with the
+volume panel beneath it, should-be against actual, the cover distribution, forward risk
+— and `run_kpi_review` was reachable from the README, from `SKILL.md`, and from a Python
+session. No command called it. So a run left a workbook, three CSVs and a note, the
+charts were dead code that passed its own tests every time, and the complaint that came
+back was the accurate one: *this version threw the visualisations away*. It did, on
+2026-08-09, when `ChartBuilder` and `HTMLReportGenerator` were removed — and what
+replaced them was wired to nothing.
+
+The CLI calls it now on both paths, it is recorded on the manifest, and the Results
+screen renders it ahead of the workbook. A failure there cannot fail the run: it is the
+last thing a run does, after everything a planner acts on is written, so it is reported
+and the run still ends having produced a plan. `test_cli.py` asserts both call sites,
+by counting them in the source — the defect was never subtle, and the test for it does
+not need to be either.
+
+**The import screen had no way back. Fixed.** Every upload landed and stayed. Worse than
+clutter: `Service.landed_documents` takes the newest batch per document type, so a file
+uploaded by mistake was the document a run would have read, and the only correction on
+offer was to upload something else and hope it won. There is now a list of what has been
+uploaded, which of two claims on a document type is in force, `Remove` per file and
+`Start over` for everything not yet promoted. The reasoning — why a fact needs a written
+reason and an upload does not — is in [INTERFACE.md](INTERFACE.md) §2 M1.
+
+It found a quieter one on the way: `landed_at` carried **seconds**, and a batch id's
+suffix is random, so two files uploaded in the same second — three dropped on the page
+at once, the normal way to use it — were indistinguishable by every field that decides
+which is newest. Which one a run read was whichever the filesystem happened to list
+last. Milliseconds now, and the sort keyed on the id as well.
+
+**A planner's demand matrix headed `2026年1月` was silently discarded. Fixed.** This is
+the one that was costing real accuracy. `demand_signal` ranks `demand_timeseries` above
+`sales_history` — a planner who bucketed the demand has already made that judgement, and
+the pipeline's own bucketing should not quietly outrank it — and the precedence was
+correctly implemented and unreachable, because the shape detection never fired. The
+period-header parser knew seven Latin spellings and no CJK one, so the file profiled as
+`long`, fell through to alias scoring, scored 39% as an inventory report, lost to the
+real stock report and was dropped as a duplicate claim. The run then forecast from sales
+history and said nothing about it.
+
+Three changes: the CJK forms (`2026年1月`, `26年1月`, `2026年第2季度`); one parser instead
+of two, with `readers/timeseries_reader.py` delegating to the profiler's rather than
+keeping its own narrower month table; and the console now names both sources when the
+matrix wins, because silence there is indistinguishable from the file having been
+dropped.
+
+And one more underneath it: **the landing layer deleted a column that was blank on every
+row.** The payload omits empty cells, correctly — a wide export is mostly blanks — but
+what came back was the union of the keys that happened to be filled, in order of first
+appearance. On a demand matrix that is a month deleted rather than a month of zeroes,
+and `demand_timeseries` says in as many words that zero is a real no-demand period and
+is what drives the intermittency classification. It also scrambled the header order,
+which is the one thing a reader of that layer is looking at the file to see. Both fixed
+by reindexing onto the header map.
+
+**The S&IOP sheet was published at the grain it was computed at. Fixed.** One row per
+SKU per period: ten items and six months is sixty rows for ten decisions, and with a
+real catalogue it is thousands of rows for hundreds. A planner holding one item and
+asking when it runs short had to read six rows and compare one against another. It is
+one row per item now, months across the header under the `<measure> <qty|amt> <period>`
+spelling the S&OP worksheet already uses — so the two sheets a meeting opens together
+sort the same way — with `first_short_period`, the floor and the buy leading the row.
+The reshape is lossless and `test_workbook.py` asserts it cell by cell, because the only
+honest defence of a narrower-looking sheet is that nothing left it.
+
+**The README was describing sixteen files that stopped being written on 2026-09-04.**
+Fixed here, and recorded as a class rather than a typo: the output consolidation changed
+what a run leaves and nothing failed when the documentation went on describing the old
+set. There is no test that the README's file list matches what a run writes, and the
+manifest now records exactly that, so one is cheap. Not written.
+
+### Left open by this pass
+
+- **A fiscal period header is still unreadable.** `FY26 P01`, `P01 2026`, `2026-W01`.
+  Deliberately not guessed: a fiscal month needs a calendar saying where the year starts,
+  which is a declaration, not a regex. A **two-row header** — the year on one row, the
+  month on the next — is the other common worksheet shape and is the same conversation.
+- **A month column with a qualifier attached** — `Jan 2026 (EA)`, `Qty Jan 2026` — parses
+  as nothing. Stripping the qualifier is tempting and wrong by default: `Amt Jan 2026`
+  beside `Qty Jan 2026` would melt money into a quantity field, and the parser's whole
+  stated discipline is to be conservative. It needs the block to be identified first.
+- **`--timeseries` and the contract path can read the same file twice, differently.**
+  Pass the flag for a file that is also in the directory and `load_all` routes it
+  through the contract, then the flag path overwrites the pivot with the legacy
+  reader's — which applies `rolling_months` and drops SKUs with no demand in the window,
+  and the contract path does not. Which reading a run gets depends on a flag. The
+  readers reading through the contracts is the end state already named under the data
+  layer; this is one more reason it is the right one.
+- **Nothing checks that the documented outputs are the outputs.** See above.
+
 ## Smaller items
 
 - `IFR` (item fill rate) service metric — `config/stocking_policy.json` documents

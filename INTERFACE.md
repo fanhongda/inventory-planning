@@ -230,6 +230,41 @@ shape:
   `what` / `why` / `fix` and now also who waived it and when that expires. A waiver that
   removed the finding would be indistinguishable from a check that never fired.
 
+**Taking an upload back, since 2026-10-09.** The screen had no way back at all, which
+was the one thing the flow above never listed as a step. Every upload landed and stayed
+— in the requirements checklist, in the quality gate, and, because `landed_documents`
+takes the **newest batch per document type**, as the document a run would actually read.
+So a file uploaded by mistake was not clutter on the page: it was the answer, and the
+only correction on offer was to upload something else and hope it won. "Nothing here
+enters a planning run" was true and did not mean anything could be undone.
+
+What it is now: a list of what has been uploaded, with what each was read as, how many
+rows, and which of two claims on one document type is the one in force — the superseded
+one marked, because a second upload silently replacing the first is exactly what nobody
+could see. Per row, `Remove`. Below it, `Start over`, which withdraws every landed batch
+that was never promoted.
+
+Three decisions in that, and the first is the only one that is not obvious:
+
+- **A reason is required of a fact and not of an upload.** `POST /batches/{id}/void`
+  still demands one from a promoted batch: it has been read by a run, so withdrawing it
+  changes an answer somebody may be holding and the reason is the only account of why.
+  A landed batch has entered nothing, so taking it back asks for a name and stops. A
+  screen that demands a written justification for undoing a mis-click is a screen whose
+  undo nobody uses, and the result is the state this paragraph exists to describe.
+- **Withdrawal is append-only, like everything else.** The rows stay on disk, the void
+  is a ledger line, and it can itself be read back and undone. `Remove` and the Stored
+  facts screen's `void` are the same operation seen from two distances.
+- **`Start over` leaves the facts alone and says so.** Those are withdrawn deliberately,
+  one at a time, with a reason each. A button that cleared both would eventually clear
+  the one someone meant to keep.
+
+It also closed a quieter defect found while writing it: `landed_at` carried seconds, and
+a batch id's suffix is random, so two files uploaded in the same second — three files
+dropped on the page at once, the normal way to use it — were indistinguishable by every
+field that decides which is newest. Which one a run read was then whichever the
+filesystem happened to list last. Milliseconds, and the sort keyed on the id as well.
+
 Two things this surfaced rather than fixed. `cli.py` loads the five files individually
 and never builds an `IntakeResult`, so **the intake gate does not run on the CLI's own
 default path** — only under `load_all`. The CLI knows this for one of its checks and
@@ -419,6 +454,30 @@ What the screen adds over opening the workbook is the two things the file cannot
 once it is in someone's downloads folder: which run it came from and what that run was
 resting on, and the rest of that run's outputs beside it — the health note and the gate
 findings a planner opening only the xlsx never sees.
+
+**And the charts, since 2026-10-09.** The screen listed every output and rendered two
+kinds, and the one output that is a *picture* was neither — because no run produced it.
+`run_kpi_review` had no caller anywhere outside the README, the skill and a Python
+session, so the report with the OTD trend, the should-be bars, the cover distribution
+and the forward-risk chart was dead code that still passed its own tests. The CLI calls
+it now, on both paths, and it is recorded on the manifest like every other output.
+
+Rendering it does not breach "computes nothing" — it is the same rule the workbook is
+under. The page frames the run's own artefact; it does not redraw it. Two mechanics
+follow from that:
+
+- **A `/view` endpoint separate from `/download`.** `/download` sets a filename and
+  therefore an attachment disposition, which is right for a workbook and means the one
+  output that is a page arrives in a downloads folder instead of on the screen. `/view`
+  serves it as `text/html`, and only for an output the manifest names whose suffix is
+  `.html` — otherwise this would be a file read that happens to serve HTML.
+- **Framed with an empty `sandbox`.** The run wrote the file and the run is trusted, but
+  a page rendered inside this one is a page rendered inside this one. The report is
+  self-contained — inline SVG, no script, no external asset, because it has to open
+  from a network share — so granting it nothing costs nothing.
+
+The charts lead the screen, ahead of the workbook, because manifest order is write order
+and the review is produced last: the opposite of the order it is read in.
 
 `test_results_screen.py` pins the writer and the reader together: every number format
 `workbook.py` emits must be one the reader renders. Add a fifth there and the test fails,

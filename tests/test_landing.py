@@ -115,6 +115,50 @@ class TestNothingIsDroppedForNotBeingMapped:
         assert row["Product code"] == "MS-FAC2513-0"
 
 
+class TestAnEmptyColumnIsStillAColumn:
+    """
+    The payload omits empty cells — a wide export is mostly blanks and storing the
+    string "null" in them would be most of the file. What came back, though, was the
+    *union of the keys that happened to be filled*, in order of first appearance: a
+    column blank on every row vanished, and the header order scrambled.
+
+    On a demand matrix that is a month deleted rather than a month of zeroes.
+    `demand_timeseries` says in as many words that zero is a real no-demand period and
+    is what drives the intermittency classification, so the series moves instead of
+    carrying a gap — and nothing raises.
+    """
+
+    @pytest.fixture
+    def matrix(self, tmp_path):
+        return _write_xlsx(tmp_path / "demand.xlsx", [
+            ["Item", "2026年1月", "2026年2月", "2026年3月", "Description"],
+            ["SKU-001", "4", "", "7", "a part"],
+            ["SKU-002", "2", "", "", "another"],
+        ])
+
+    def test_a_column_blank_on_every_row_comes_back(self, store, matrix):
+        store.land(matrix, doc_type="demand_timeseries", batch_id="d1")
+        wide = store.rows("demand_timeseries", "d1", named=True)
+        assert "2026年2月" in wide.columns
+        assert wide["2026年2月"].isna().all()
+
+    def test_the_header_order_is_the_file_s_own(self, store, matrix):
+        """The one thing a reader of this layer is looking at the file to see."""
+        store.land(matrix, doc_type="demand_timeseries", batch_id="d1")
+        wide = store.rows("demand_timeseries", "d1", named=True)
+        assert list(wide.columns) == [
+            "row_no", "Item", "2026年1月", "2026年2月", "2026年3月", "Description"]
+
+    def test_the_shape_still_profiles_as_a_time_series(self, store, matrix):
+        from inventory_planning.ingest.profiler import Profiler
+
+        store.land(matrix, doc_type="demand_timeseries", batch_id="d1")
+        wide = store.rows("demand_timeseries", "d1", named=True).drop(columns=["row_no"])
+        profile = Profiler().profile(wide, "demand.xlsx")
+        assert profile.shape == "wide_periods"
+        assert len(profile.period_columns) == 3
+
+
 class TestNoTypeInference:
     """A padded material number and a numeric-looking code both come back as written."""
 

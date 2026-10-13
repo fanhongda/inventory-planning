@@ -210,7 +210,13 @@ class LandingStore:
             "source_name": path.name,
             "source_sha": source_sha,
             "run_id": run_id,
-            "landed_at": datetime.now().isoformat(timespec="seconds"),
+            # Milliseconds, not seconds. Which batch is "the newest of this document
+            # type" decides which file a run reads, and two uploads in one second —
+            # three files dropped on the screen at once, which is the normal way to
+            # use it — were indistinguishable by this field and by the batch id, whose
+            # suffix is random. The newest was then whichever the filesystem happened
+            # to list last.
+            "landed_at": datetime.now().isoformat(timespec="milliseconds"),
             "rows": len(frame),
             # Position first, because position is the key. `header` is the raw cell as
             # written — repeated spellings and all — so a duplicate is visible here
@@ -288,7 +294,11 @@ class LandingStore:
                 # reported by its absence from a list the caller can compare against
                 # the directory, which is more use than an exception here.
                 continue
-        return sorted(out, key=lambda r: str(r.get("landed_at", "")), reverse=True)
+        # Keyed on the id as well, so the order does not depend on the directory
+        # listing where two records share a timestamp — which every batch landed before
+        # this field carried milliseconds does.
+        return sorted(out, key=lambda r: (str(r.get("landed_at", "")),
+                                          str(r.get("batch_id", ""))), reverse=True)
 
     def find(self, batch_id: str) -> Optional[Dict[str, Any]]:
         """One landed batch by id, without the caller having to know its doc type."""
@@ -330,6 +340,22 @@ class LandingStore:
             [{labels.get(k, k): v for k, v in json.loads(p).items()}
              for p in frame["payload"]]
         )
+        # Reindexed onto the header map, in the file's own column order.
+        #
+        # The payload omits empty cells, so the columns that come back are the union of
+        # the keys that happened to be filled — in order of first appearance, and
+        # missing entirely where a column was blank on every row. On a demand matrix
+        # that is a month deleted rather than a month of zeroes: `demand_timeseries`
+        # says in as many words that zero is a real no-demand period and drives the
+        # intermittency classification, so dropping the column moves the series instead
+        # of leaving a gap in it. It also scrambled the header order, which is the one
+        # thing a reader of this layer is looking at the file to see.
+        #
+        # Only where there is a header map to reindex onto. Without one the payload
+        # keys are the column indices and they are all there is — reindexing onto an
+        # empty list would return every row with no columns at all.
+        if labels:
+            widened = widened.reindex(columns=list(labels.values()))
         return pd.concat([frame[["row_no"]], widened], axis=1)
 
     def source_row(self, doc_type: str, batch_id: str, row_no: int) -> Dict[str, str]:

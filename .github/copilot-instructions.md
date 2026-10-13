@@ -35,12 +35,22 @@ than keeping its own copy. Do not restate a rule in `schema.py` that a contract 
 reintroduce per-document loader calls. The legacy `load_sales_history()` style still
 works but requires the caller to know the answer already.
 
-Outputs land in `output_dir`: `kpi_review_*.html` is the review, plus CSVs
-(`purchase_recommendations_*`, `parameter_suggestions_*`, `inventory_projection_*`,
-`forecast_detail_*`, `supplier_params`, `sku_planning_params`, `supersessions_*` where
-material numbers were merged) and `suggested_rules_*.md`. There is no longer an
-`inventory_report_*.html` — the older forecast-oriented report was removed, and three
-skill evals went on asserting its existence for months afterwards.
+Outputs land in `output_dir`, and there are **two files to open**:
+`planning_<run_id>.xlsx` — five sheets, the one a meeting is handed — and
+`kpi_review_<run_id>.html`, the review with the charts. Then the records:
+`sop_worksheet_*` (a form sales fills in, not a report), `run_health_*.md`,
+`quality_gates_*.json`, `suggested_rules_*.md`, `source_crosscheck_*.csv`,
+`supplier_params.csv` and `runs/<run_id>.json`.
+
+Two things that caught people out and are worth stating rather than discovering. The
+sixteen per-stage CSVs — `purchase_recommendations_*`, `inventory_projection_*`,
+`forecast_detail_*` and the rest — were consolidated into the workbook's sheets on
+2026-09-04; do not write code that globs for them. And there is no
+`inventory_report_*.html`: the older forecast-oriented report was removed, and three
+skill evals went on asserting its existence for months afterwards. The review above is
+a different file, and until 2026-10-09 it was written by a method the CLI never called,
+so a run genuinely produced no charts at all — if you are adding an output, add the
+call that produces it in the same change.
 
 The review covers, in order: service (OTD split four ways, plus OTD by month), inventory
 against policy, ordering behaviour, replenishment cadence, forward risk, then the work

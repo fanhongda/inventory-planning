@@ -73,6 +73,14 @@ _MONTH_NAMES = {
 }
 
 # Ordered most- to least-specific; first match wins.
+#
+# The CJK forms are not a nicety. A planner writing a demand matrix in a Chinese ERP
+# heads the columns `2026年1月`, and none of the Latin patterns below can match that —
+# so the file profiled as `long`, fell through to alias scoring, scored 39% as an
+# inventory report and was dropped as a duplicate claim on a document another file had
+# already won. The whole planner-supplied time series was silently discarded and the
+# run forecast from sales history instead, which is the opposite of the precedence the
+# capability declares.
 _PERIOD_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"^(\d{4})[\-/\s]?(\d{1,2})$"), "ym"),                       # 2026-01, 2026/1, 202601
     (re.compile(r"^(\d{1,2})[\-/\s](\d{4})$"), "my"),                        # 01-2026
@@ -81,6 +89,12 @@ _PERIOD_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"^(\d{4})[\-/\s]?q([1-4])$"), "yq"),                        # 2026-Q1
     (re.compile(r"^q([1-4])[\-/\s]?(\d{2,4})$"), "qy"),                      # Q1-2026
     (re.compile(r"^(\d{4})[\-/\s](\d{1,2})[\-/\s](\d{1,2})$"), "ymd"),       # 2026-01-31
+    # 2026年1月, 2026年01月份, 26年1月 — the 月 is required, so a bare `2026年` stays
+    # rejected exactly as a bare `2026` is.
+    (re.compile(r"^(\d{2,4})\s*年\s*(\d{1,2})\s*月(?:份)?$"), "cjk_ym"),
+    # 2026年Q1, 2026年第1季度, 2026年1季度
+    (re.compile(r"^(\d{2,4})\s*年\s*(?:第)?\s*(?:q)?([1-4])\s*季(?:度)?$"), "cjk_yq"),
+    (re.compile(r"^(\d{2,4})\s*年\s*q([1-4])$"), "cjk_yq"),
 ]
 
 
@@ -145,6 +159,13 @@ def parse_period_header(header: Any) -> Optional[pd.Period]:
                     continue
             elif kind == "yq":
                 year, month = int(m.group(1)), (int(m.group(2)) - 1) * 3 + 1
+            elif kind == "cjk_ym":
+                # `26年1月` is as common in a worksheet as `2026年1月`, and windowing a
+                # two-digit year is already settled here — see `_two_digit_year`.
+                year, month = _two_digit_year(m.group(1)), int(m.group(2))
+            elif kind == "cjk_yq":
+                year = _two_digit_year(m.group(1))
+                month = (int(m.group(2)) - 1) * 3 + 1
             elif kind == "qy":
                 month = (int(m.group(1)) - 1) * 3 + 1
                 year = _two_digit_year(m.group(2))

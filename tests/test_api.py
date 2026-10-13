@@ -54,6 +54,22 @@ def _upload(client, path=SAMPLE, name=None):
                            files={"file": (name or path.name, fh.read(), "text/csv")})
 
 
+def _promoted(client):
+    """
+    A batch in the facts. The sample inventory export carries no plant column and
+    `inventory` is keyed on sku + location_id, so the declaration is the intended
+    remedy and not a test fixture of convenience.
+    """
+    batch_id = _upload(client).json()["landed"][0]["batch_id"]
+    client.post(f"/batches/{batch_id}/declarations",
+                json={"scope": "value", "field": "location_id", "value": "DC-01",
+                      "by": "jfanhon", "reason": "single-plant export; the DC is DC-01"})
+    response = client.post(f"/batches/{batch_id}/promote",
+                           json={"valid_time": "2024-07-01", "by": "jfanhon"})
+    assert response.status_code == 200, response.json()
+    return batch_id
+
+
 class TestTheWorkspaceIsSetUpFromTheBrowser:
     """
     The target user never opens a terminal, so a workspace nobody has prepared had to be
@@ -286,7 +302,7 @@ class TestACorrectionIsADeclaration:
 
 class TestWithdrawingABatch:
 
-    def test_it_needs_a_reason_and_a_name(self, client):
+    def test_it_always_needs_a_name(self, client):
         batch_id = _upload(client).json()["landed"][0]["batch_id"]
         assert client.post(f"/batches/{batch_id}/void", json={}).status_code == 400
 
@@ -297,6 +313,63 @@ class TestWithdrawingABatch:
         assert response.status_code == 200
         listed = {b["batch_id"]: b for b in client.get("/batches").json()}
         assert listed[batch_id]["status"] == "void"
+
+    def test_undoing_an_upload_does_not_need_a_justification(self, client):
+        """
+        A landed batch has entered nothing — the screen says so on every upload — so
+        taking it back is undoing an upload. Demanding a written reason for that is how
+        a screen with no way back acquires one nobody uses.
+        """
+        batch_id = _upload(client).json()["landed"][0]["batch_id"]
+        response = client.post(f"/batches/{batch_id}/void", json={"by": "jfanhon"})
+        assert response.status_code == 200
+        assert response.json()["was"] == "landed"
+
+    def test_withdrawing_a_fact_still_does(self, client):
+        """Promoted, a batch has been read by a run, so the reason is the only account."""
+        batch_id = _promoted(client)
+        refused = client.post(f"/batches/{batch_id}/void", json={"by": "jfanhon"})
+        assert refused.status_code == 400
+        assert "reason" in refused.json()["detail"]
+        assert client.post(f"/batches/{batch_id}/void",
+                           json={"by": "jfanhon", "reason": "wrong extract"}
+                           ).json()["was"] == "promoted"
+
+
+class TestStartingTheImportOver:
+    """
+    The import screen had no way back at all. An export uploaded by mistake stayed in
+    the requirements checklist and in the quality gate for good — and because the
+    server reads the newest batch per document type, a wrong file was not clutter, it
+    was the document a run would have read.
+    """
+
+    def test_it_withdraws_every_upload_that_was_never_promoted(self, client):
+        _upload(client, Path("sample_data/inventory.csv"))
+        _upload(client, Path("sample_data/sales_history.csv"))
+        body = client.post("/uploads/reset", json={"by": "jfanhon"}).json()
+        assert len(body["withdrawn"]) == 2
+        assert all(b["status"] == "void" for b in client.get("/batches").json())
+
+    def test_the_checklist_forgets_what_was_withdrawn(self, client):
+        """The list is what answers the checklist, so emptying one empties the other."""
+        _upload(client, Path("sample_data/inventory.csv"))
+        assert any(d["landed"] for d in client.get("/requirements").json()["documents"])
+        client.post("/uploads/reset", json={"by": "jfanhon"})
+        assert not any(d["landed"]
+                       for d in client.get("/requirements").json()["documents"])
+
+    def test_a_promoted_batch_is_left_alone_and_named(self, client):
+        """Those are facts. Clearing one is the void above, with a reason each."""
+        batch_id = _promoted(client)
+        body = client.post("/uploads/reset", json={"by": "jfanhon"}).json()
+        assert body["withdrawn"] == []
+        assert [k["batch_id"] for k in body["kept_promoted"]] == [batch_id]
+        assert "with a reason" in body["note"]
+
+    def test_it_needs_a_name(self, client):
+        _upload(client)
+        assert client.post("/uploads/reset", json={}).status_code == 400
 
 
 class TestABlankTemplateSaysWhatIsWrongWithIt:
@@ -1283,10 +1356,14 @@ class TestWhatARunProduced:
             writer._format_sheet(excel.book["Inventory"], frame, "Inventory")
         (out / "run_health_x.md").write_text("# what this run rests on\n",
                                              encoding="utf-8")
+        (out / "kpi_review_x.html").write_text(
+            "<!doctype html><title>Review</title><svg class='chart'></svg>",
+            encoding="utf-8")
 
         manifest = RunManifest.begin(output_dir=out)
         manifest.record_output(book)
         manifest.record_output(out / "run_health_x.md")
+        manifest.record_output(out / "kpi_review_x.html")
         manifest.record_output(out / "gone.csv")
         RunRegistry(out).save(manifest)
         return out, manifest.run_id
@@ -1302,6 +1379,7 @@ class TestWhatARunProduced:
         by_name = {o["name"]: o for o in body["outputs"]}
         assert by_name["planning_x.xlsx"]["kind"] == "workbook"
         assert by_name["run_health_x.md"]["kind"] == "text"
+        assert by_name["kpi_review_x.html"]["kind"] == "report"
         assert "does not recompute" in body["note"]
 
     def test_a_file_the_run_recorded_but_that_is_gone_says_so(self, client, run):
@@ -1330,6 +1408,24 @@ class TestWhatARunProduced:
         body = client.get(f"/runs/{run[1]}/outputs/run_health_x.md/text").json()
         assert body["text"] == "# what this run rests on\n"
         assert body["truncated"] is False
+
+    def test_the_visual_review_is_served_to_be_rendered(self, client, run):
+        """
+        Separate from `/download`, which sets a filename and therefore an attachment
+        disposition — right for a workbook, and for the one output that is a page it
+        means the planner gets a file in their downloads folder instead of the charts.
+        """
+        response = client.get(f"/runs/{run[1]}/outputs/kpi_review_x.html/view")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert "content-disposition" not in response.headers
+        assert "<svg" in response.text
+
+    def test_viewing_something_that_is_not_a_page_is_refused(self, client, run):
+        """Otherwise this is a file-read endpoint that happens to serve HTML."""
+        response = client.get(f"/runs/{run[1]}/outputs/planning_x.xlsx/view")
+        assert response.status_code == 400
+        assert "not a page" in response.json()["detail"]
 
     def test_a_name_the_run_did_not_write_is_refused(self, client, run, tmp_path):
         """

@@ -22,6 +22,7 @@ import { $, el, mount, api } from "/ui.js";
 
 const KIND_NOTE = {
   workbook: "the five-sheet workbook — this is what gets handed round a meeting",
+  report: "the visual review — the charts a review meeting is read from",
   text: "written by the run, shown verbatim",
   download: "not rendered here; open it in whatever reads it",
 };
@@ -123,6 +124,37 @@ async function workbookCard(runId, output, host) {
   if (body.sheets.length) load(body.sheets[0].name);
 }
 
+// The visual review, framed rather than re-drawn.
+//
+// It is the same rule as the workbook: this screen renders the run's own artefact and
+// computes nothing. The charts are inline SVG in a file with no script and no external
+// asset, so framing it costs nothing and gives the one output that is a picture a place
+// on the screen — it was previously written to disk and shown nowhere, which for a
+// chart is the same as not existing.
+//
+// Sandboxed with nothing granted. The run wrote the file and the run is trusted, but a
+// page rendered inside this one is a page rendered inside this one, and `allow-scripts`
+// on an artefact that has no scripts buys nothing.
+function reportCard(runId, output, host) {
+  const src = `/runs/${runId}/outputs/${encodeURIComponent(output.name)}/view`;
+  const frame = el("iframe", {
+    src, sandbox: "", loading: "lazy", title: output.name,
+    style: "width:100%;height:78vh;border:1px solid var(--line);border-radius:6px;"
+           + "background:var(--surface-1,#fff)",
+  });
+  mount(host,
+    el("h2", {}, output.name, el("span", { class: "badge ok" }, "charts")),
+    el("p", { class: "sub" }, KIND_NOTE.report),
+    el("p", { class: "note" },
+       el("a", { href: src, target: "_blank", rel: "noopener" }, "Open it full width"),
+       " \u00b7 ",
+       el("a", { href: `/runs/${runId}/outputs/`
+                       + `${encodeURIComponent(output.name)}/download` },
+          "Download the file")),
+    frame);
+  return Promise.resolve();
+}
+
 async function textCard(runId, output, host) {
   const body = await api(`/runs/${runId}/outputs/`
                          + `${encodeURIComponent(output.name)}/text`);
@@ -155,13 +187,14 @@ async function showRun(runId, runs, onPick) {
   mount(host, el("p", { class: "note" }, "Reading…"));
   const body = await api(`/runs/${runId}/outputs`);
 
-  const panels = [];
-  for (const output of body.outputs) {
-    if (!output.present) continue;
-    if (output.kind === "workbook" || output.kind === "text") {
-      panels.push({ output, host: el("section", { class: "card" }) });
-    }
-  }
+  // The charts first, then the workbook, then the prose. Manifest order is write
+  // order, which puts the visual review last because it is produced last — the
+  // opposite of the order it is read in.
+  const PANEL_ORDER = ["report", "workbook", "text"];
+  const panels = body.outputs
+    .filter((o) => o.present && PANEL_ORDER.includes(o.kind))
+    .sort((a, b) => PANEL_ORDER.indexOf(a.kind) - PANEL_ORDER.indexOf(b.kind))
+    .map((output) => ({ output, host: el("section", { class: "card" }) }));
 
   mount(host,
     runLine(runs, runId, onPick),
@@ -175,8 +208,9 @@ async function showRun(runId, runs, onPick) {
         el("tbody", {}, body.outputs.map((o) => fileRow(runId, o)))))),
     panels.map((p) => p.host));
 
+  const RENDER = { workbook: workbookCard, report: reportCard, text: textCard };
   for (const { output, host: panel } of panels) {
-    const render = output.kind === "workbook" ? workbookCard : textCard;
+    const render = RENDER[output.kind] || textCard;
     render(runId, output, panel).catch((err) =>
       mount(panel, el("h2", {}, output.name),
             el("p", { class: "status bad" }, String(err.message))));

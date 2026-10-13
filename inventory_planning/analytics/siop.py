@@ -65,6 +65,83 @@ class SIOPPlan:
     def periods(self) -> List[str]:
         return list(self.by_period["period"]) if len(self.by_period) else []
 
+    # The measures that are phased, and how each is spelled when it is spread across
+    # the header. `qty`/`amt` and the period last, matching the S&OP worksheet, because
+    # the two sheets are read in the same meeting and a planner should not have to learn
+    # two conventions to sort them.
+    PHASED = (
+        ("demand_qty", "demand qty"),
+        ("supply_qty", "supply qty"),
+        ("closing_qty", "closing qty"),
+        ("gap_qty", "gap qty"),
+        ("demand_cogs", "demand amt"),
+        ("supply_value", "supply amt"),
+        ("closing_value", "closing amt"),
+        ("gap_value", "gap amt"),
+    )
+
+    def per_sku_wide(self) -> pd.DataFrame:
+        """
+        The same projection, one row per SKU, with the periods across the header.
+
+        ## Why this is the shape and the long frame is not
+
+        `per_sku` is one row per SKU *per period*, which is the right grain to compute on
+        and the wrong one to read. A planner opening the sheet is holding one item and
+        asking when it runs short; the long form answers that by making them scroll six
+        rows and compare a number against another row's. With ten items and six periods
+        it is sixty rows for ten decisions, and the complaint it drew was exactly that —
+        one item, many rows of positions and buys, nothing legible.
+
+        The reshape is lossless: every cell of `per_sku` appears here under a
+        `<measure> <unit> <period>` name, which is the spelling the S&OP worksheet
+        already uses. Two deliberate exceptions, both of which remove repetition rather
+        than information:
+
+        - `safety_stock` is one column, not one per period. The projection holds a
+          single floor per SKU, so N identical columns would be N-1 columns of nothing.
+        - A short block of totals leads, so the question "is this item in trouble at all"
+          is answered before any scrolling. They are sums of the row they sit on and
+          cannot disagree with it.
+        """
+        frame = self.per_sku
+        if frame is None or not len(frame):
+            return pd.DataFrame()
+
+        periods = sorted(frame["period"].astype(str).unique())
+        out = pd.DataFrame({"sku": sorted(frame["sku"].astype(str).unique())})
+
+        # Lead block: the reading, before the detail. `first_short_period` is the month
+        # the projection first falls below the policy floor — the one date on the row
+        # that decides whether anything has to happen.
+        short = frame[frame["gap_qty"] > 0]
+        first_short = (short.assign(period=short["period"].astype(str))
+                       .groupby("sku")["period"].min())
+        out["first_short_period"] = out["sku"].map(first_short)
+        out["short_periods"] = out["sku"].map(
+            short.groupby("sku")["period"].nunique()).fillna(0).astype(int)
+        out["safety_stock"] = out["sku"].map(
+            frame.drop_duplicates("sku").set_index("sku")["safety_stock"])
+
+        totals = frame.groupby("sku")
+        out["demand qty total"] = out["sku"].map(totals["demand_qty"].sum())
+        out["supply qty total"] = out["sku"].map(totals["supply_qty"].sum())
+        out["gap qty peak"] = out["sku"].map(totals["gap_qty"].max())
+        out["demand amt total"] = out["sku"].map(totals["demand_cogs"].sum())
+        out["supply amt total"] = out["sku"].map(totals["supply_value"].sum())
+        out["gap amt total"] = out["sku"].map(totals["gap_value"].sum())
+
+        for column, label in self.PHASED:
+            spread = frame.pivot_table(index="sku", columns="period", values=column,
+                                       aggfunc="sum")
+            spread.columns = [str(c) for c in spread.columns]
+            spread = spread.reindex(columns=periods)
+            spread.columns = [f"{label} {period}" for period in periods]
+            out = out.merge(spread.reset_index().assign(
+                sku=lambda f: f["sku"].astype(str)), on="sku", how="left")
+
+        return out
+
     def summary(self) -> str:
         if not len(self.by_period):
             return "  S&IOP plan — not built (no forecast, or no cost to value it at)"

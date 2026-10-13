@@ -5,18 +5,17 @@ Handles wide-format demand pivot tables exported from S&OP/BI tools:
   - Columns = monthly periods (with inconsistent naming conventions)
   - Values = demand qty per period
 
-Supports messy period headers like:
-  "2019 Jan", "2020 June", "Dec 2022", "Jan 2023",
-  "Nov-2023", "March-2024", "April-2025", and Excel serial date integers.
+Period headers are read by `ingest.profiler.parse_period_header`, which covers the
+messy spellings a worksheet carries — "2019 Jan", "Dec 2022", "Nov-2023", "2026年1月",
+Excel serial date integers — in the one place every entry point reads them.
 """
 
-import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import pandas as pd
 
+from ..ingest.profiler import parse_period_header as _parse_period_header
 from ..readers.base_reader import load_file
 
 # Metadata columns that are NOT period data
@@ -26,78 +25,13 @@ METADATA_COLS = {
     "group", "item group", "uom", "unit", "category", "brand",
 }
 
-MONTH_MAP = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-    # Full names
-    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
-}
-
-# Excel epoch: Jan 1, 1900 (with Lotus 1-2-3 leap year bug)
-EXCEL_EPOCH = pd.Timestamp("1899-12-30")
-
-
-def _parse_period_header(col: str) -> Optional[pd.Period]:
-    """
-    Try to parse a column header as a monthly period.
-    Returns pd.Period('YYYY-MM', 'M') or None if not a period column.
-    """
-    s = str(col).strip()
-
-    # Excel serial date (integer-like)
-    try:
-        serial = int(float(s))
-        if 30000 < serial < 60000:  # plausible Excel date range ~1982–2064
-            dt = EXCEL_EPOCH + pd.Timedelta(days=serial)
-            return pd.Period(dt, freq="M")
-    except (ValueError, TypeError):
-        pass
-
-    # Normalize: remove dots, extra spaces, convert to lowercase
-    s_norm = re.sub(r"[\.\s]+", " ", s.lower()).strip()
-
-    # Patterns to try (year + month or month + year)
-    patterns = [
-        # "2023 Jan", "2020 June", "2021 July"
-        r"^(\d{4})\s+([a-z]+)$",
-        # "Jan 2023", "Dec 2022", "March 2024", "April 2025"
-        r"^([a-z]+)\s+(\d{4})$",
-        # "Jan-2023", "Nov-2023", "March-2024"
-        r"^([a-z]+)-(\d{4})$",
-        # "2023-01", "2023-1"
-        r"^(\d{4})-(\d{1,2})$",
-    ]
-
-    for pat in patterns:
-        m = re.match(pat, s_norm)
-        if m:
-            a, b = m.group(1), m.group(2)
-            # Determine which is year and which is month
-            if a.isdigit() and len(a) == 4:
-                year, month_str = int(a), b
-            elif b.isdigit() and len(b) == 4:
-                year, month_str = int(b), a
-            elif a.isdigit() and b.isdigit():
-                # "2023-01" pattern
-                year, month_num = int(a), int(b)
-                if 1 <= month_num <= 12:
-                    return pd.Period(f"{year}-{month_num:02d}", freq="M")
-                continue
-            else:
-                continue
-
-            if month_str.isdigit():
-                month_num = int(month_str)
-            else:
-                month_num = MONTH_MAP.get(month_str[:3], None)
-                if month_num is None:
-                    continue
-
-            if 2000 <= year <= 2040 and 1 <= month_num <= 12:
-                return pd.Period(f"{year}-{month_num:02d}", freq="M")
-
-    return None
+# Period headers are parsed by `ingest.profiler.parse_period_header`, not here.
+#
+# There used to be a second implementation in this module with its own month table and
+# its own Excel-serial window. It was narrower in exactly the way that matters: a
+# worksheet headed `2026年1月` parsed in neither, and a header the profiler recognises
+# but this did not meant the flag path and the contract path disagreed about how many
+# months a file carried. One parser, so a header added to it is added once.
 
 
 def _is_metadata_col(col: str) -> bool:

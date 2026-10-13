@@ -28,6 +28,7 @@ so and reads the ambient store rather than silently running against an empty one
 would turn the routing tests green for the wrong reason.
 """
 
+import os
 import shutil
 import subprocess
 import warnings
@@ -36,6 +37,7 @@ from pathlib import Path
 import pytest
 
 import inventory_planning.ingest.adapter as _adapter
+import inventory_planning.ingest.location as _location
 import inventory_planning.ingest.registry as _registry
 
 REPO = Path(__file__).resolve().parents[1]
@@ -65,14 +67,22 @@ def adapter_store_holds_only_what_the_repository_ships(tmp_path_factory):
     so its own module attribute is the one that decides where `AdapterRegistry()` looks;
     patching only `adapter.ADAPTERS_DIR` would leave the default untouched. Both are set
     and both are restored.
+
+    The shipped directory is only half of it. `AdapterRegistry()` also reads the local
+    store — the installation's own frozen mappings, outside the working tree — so
+    $INVENTORY_PLANNING_ADAPTERS is pointed at this same copy. `source_dirs` then
+    collapses to the one directory, and an adapter a planner froze on this machine is
+    as invisible to the suite as one it drafted into the tree used to be. Leaving the
+    local store at its default would reopen the hole from the other side.
     """
     tracked = _tracked_adapter_files()
     if tracked is None:
+        store, _ = _location.resolve_adapter_store()
         warnings.warn(
             "git could not list the tracked adapters, so the suite is reading "
-            f"{_registry.ADAPTERS_DIR}. Any adapter this machine has drafted from a "
-            "real extract is visible to the tests, and routing results may not be "
-            "reproducible.",
+            f"{_registry.ADAPTERS_DIR} and {store}. Any adapter this machine has "
+            "drafted from a real extract, or frozen into its local store, is visible "
+            "to the tests, and routing results may not be reproducible.",
             RuntimeWarning,
         )
         yield None
@@ -88,9 +98,15 @@ def adapter_store_holds_only_what_the_repository_ships(tmp_path_factory):
         shutil.copy2(source, destination)
 
     before = (_adapter.ADAPTERS_DIR, _registry.ADAPTERS_DIR)
+    before_env = os.environ.get(_location.ENV_VAR)
     _adapter.ADAPTERS_DIR = root
     _registry.ADAPTERS_DIR = root
+    os.environ[_location.ENV_VAR] = str(root)
     try:
         yield root
     finally:
         _adapter.ADAPTERS_DIR, _registry.ADAPTERS_DIR = before
+        if before_env is None:
+            os.environ.pop(_location.ENV_VAR, None)
+        else:
+            os.environ[_location.ENV_VAR] = before_env

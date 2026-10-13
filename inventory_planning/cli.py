@@ -12,6 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .ingest.location import warn_about_in_tree_adapters
 from .orchestrator import InventoryPlanner
 
 
@@ -247,6 +248,14 @@ def main():
     # reading a manifest for a run that should not have happened.
     print()
     print(planner.workspace.summary())
+
+    # Said here, with the other "where is this reading from" lines, because that is the
+    # question it answers. An adapter an older build drafted into the working tree is
+    # still read and still takes routing ahead of inference, so a run can be keyed on a
+    # mapping nobody reviewed and nothing else in the output would say so.
+    stray = warn_about_in_tree_adapters()
+    if stray:
+        print(f"\n  \u26a0 {stray}")
 
     # ── The contract path ────────────────────────────────────────────────────
     if args.inputs:

@@ -22,6 +22,7 @@ contract without the caller having to know that a different loader exists.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import re
 import warnings
@@ -98,6 +99,41 @@ _PERIOD_PATTERNS: List[Tuple[re.Pattern, str]] = [
 ]
 
 
+def _as_month_from_datetime(header: Any) -> Optional[pd.Period]:
+    """
+    The month a date-typed header denotes, or None if the header is not a date.
+
+    `read_excel` converts a date-typed cell to a `Timestamp`, so this is the form a
+    demand matrix headed `Jan-25` actually arrives in — the display is `mmm-yy`, the
+    cell holds `2025-01-31`. The serial path below handles the raw number and was
+    written for this case, but pandas has already converted it by the time a header
+    reaches here, so that path never saw it.
+
+    What it fell through to was worse than an outright failure. `str(datetime(2025, 1,
+    31))` is `'2025-01-31 00:00:00'`, whose time component the `ymd` pattern cannot
+    match, while `str(date(2025, 1, 31))` is `'2025-01-31'`, which it can — so a
+    `datetime.date` header parsed and a `datetime` header did not, on nothing but how
+    `str` renders them. The type a workbook produces was the one that failed, and the
+    whole matrix then profiled as `long`, scored 39% as an inventory report and was
+    read as one.
+
+    Taken as year and month rather than as a day: a planner's month column is as often
+    stamped with the month end as the month start, and the two must not read as
+    different periods.
+    """
+    if not isinstance(header, (dt.date, np.datetime64)):
+        return None
+    try:
+        stamp = pd.Timestamp(header)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    # `pd.NaT` is an instance of `datetime`, and an empty header cell in a trailing
+    # column arrives as one.
+    if pd.isna(stamp):
+        return None
+    return pd.Period(year=stamp.year, month=stamp.month, freq="M")
+
+
 def _as_excel_serial(header: Any) -> Optional[int]:
     """The header as an Excel date serial, or None if it is not plausibly one."""
     if isinstance(header, bool):
@@ -128,6 +164,10 @@ def parse_period_header(header: Any) -> Optional[pd.Period]:
     # columns are then not recognised as periods and are dropped from the reshape —
     # silently losing the most recent months, which are the ones the forecast leans on
     # hardest. The serial range cannot collide with a year header.
+    dated = _as_month_from_datetime(header)
+    if dated is not None:
+        return dated
+
     serial = _as_excel_serial(header)
     if serial is not None:
         return (_EXCEL_EPOCH + pd.Timedelta(days=serial)).to_period("M")

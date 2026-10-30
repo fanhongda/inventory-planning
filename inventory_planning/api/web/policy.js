@@ -531,7 +531,17 @@ function runNowCard(reload) {
     // Re-read the whole page rather than appending the new run to the list: the run
     // may have changed what the rules reached, and a list patched in place would be
     // the interface telling itself what happened instead of asking.
-    if (state.status === "done") reload(`Run ${state.run_id} finished.`);
+    if (state.status === "done") {
+      // A run that drew no charts finished all the same — the workbook and the CSVs
+      // are unaffected. Saying so here is the only place it can be said: the results
+      // screen renders the files a run wrote, so a picture that was never written
+      // looks there exactly like a screen that cannot draw one.
+      reload(`Run ${state.run_id} finished.`
+             + (state.review_error
+                ? ` The visual review was not drawn (${state.review_error}) — every`
+                  + ` figure it would have shown is in the workbook.`
+                : ""));
+    }
   };
 
   button.addEventListener("click", async () => {

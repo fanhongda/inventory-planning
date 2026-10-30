@@ -120,3 +120,97 @@ class TestTheRunIsAnswerableForItsInputs:
         run = RunManifest.begin()
         record = run.record_input(path, doc_type="inventory", batch_id="irrelevant")
         assert record.identity == record.sha256
+
+
+class TestARunStartedFromTheScreenDrawsTheCharts:
+    """
+    The two ways into this pipeline wrote different sets of files.
+
+    `run_kpi_review` renders the only output that is a picture. The CLI reaches it;
+    `Runner._run` — the path behind the button on the Policy screen — called
+    `run_planning` and `run_policy_analysis` and stopped. So a run started from the
+    interface produced a workbook, three CSVs and a note, and the results screen, which
+    renders a run's own outputs and deliberately computes nothing, had no picture to
+    render. It looked like a screen that could not show charts. It was a run that never
+    drew them.
+
+    These are about the wiring, as the CLI's are: that the path reaches it with the
+    frames it needs, that the html lands on the manifest the results screen reads, and
+    that a failure drawing it cannot take down a run whose plan is already on disk.
+    """
+
+    class _Planner:
+        def __init__(self, raises=False):
+            self.reviewed = None
+            self.raises = raises
+            self.run = type("R", (), {"run_id": "20261030_000000-aaaaaa",
+                                      "outputs": []})()
+
+        def absorb_intake(self, inputs, batches=None):
+            pass
+
+        def run_planning(self, **kwargs):
+            return {"results": True}
+
+        def run_policy_analysis(self, *_, **__):
+            return {"policy": True}
+
+        def run_kpi_review(self, policy, **frames):
+            if self.raises:
+                raise RuntimeError("the chart library fell over")
+            self.reviewed = (policy, frames)
+            self.run.outputs = list(self.run.outputs) + [
+                type("O", (), {"name": "kpi_review_20261030_000000-aaaaaa.html"})()]
+
+    @staticmethod
+    def _runner(tmp_path, planner, monkeypatch):
+        from inventory_planning.api.app import Service
+
+        runner = Runner(Service(config_dir=tmp_path / "config",
+                                store_root=tmp_path / "store",
+                                output_dir=tmp_path / "out"))
+        from inventory_planning.api.runner import RunState
+
+        # `_run` is the half after `start` has minted the run id and set the state, so
+        # these tests hand it the state `start` would have left.
+        runner._state = RunState(run_id=planner.run.run_id)
+        monkeypatch.setattr("inventory_planning.ingest_bridge.IngestBridge.adapt",
+                            lambda self, intake: {
+                                "sales_df": "S", "po_history_df": "P",
+                                "open_so_df": "O", "open_po_df": "Q",
+                                "inventory_df": "I"})
+        return runner
+
+    def test_the_run_reaches_the_review_with_every_frame(self, tmp_path, monkeypatch):
+        planner = self._Planner()
+        runner = self._runner(tmp_path, planner, monkeypatch)
+        runner._run(planner, intake=None, records={}, target_value=None, deadline=None)
+
+        assert planner.reviewed is not None, "a run produced no visual review"
+        _, frames = planner.reviewed
+        assert set(frames) == {"sales_df", "open_so_df", "open_po_df",
+                               "inventory_df", "po_history_df"}
+        assert all(value is not None for value in frames.values())
+
+    def test_the_picture_lands_on_the_manifest_the_screen_reads(
+            self, tmp_path, monkeypatch):
+        """
+        The results screen reads the manifest, not the directory. An html written after
+        the outputs were last read into the run state would be on disk and absent from
+        the list the screen renders.
+        """
+        planner = self._Planner()
+        runner = self._runner(tmp_path, planner, monkeypatch)
+        runner._run(planner, intake=None, records={}, target_value=None, deadline=None)
+
+        assert any(name.endswith(".html") for name in runner.state.outputs)
+        assert runner.state.status == "done"
+
+    def test_a_failure_drawing_it_does_not_fail_the_run(self, tmp_path, monkeypatch):
+        planner = self._Planner(raises=True)
+        runner = self._runner(tmp_path, planner, monkeypatch)
+        runner._run(planner, intake=None, records={}, target_value=None, deadline=None)
+
+        assert runner.state.status == "done"
+        assert not runner.state.error
+        assert "the chart library fell over" in runner.state.review_error

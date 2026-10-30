@@ -26,6 +26,10 @@ class DemandClassifier:
         # CV threshold above which a stocking item is flagged as erratic/intermittent
         self.cv_erratic_threshold = cfg.get("cv_erratic_threshold", 1.0)
         self.cv_intermittent_threshold = cfg.get("cv_intermittent_threshold", 0.5)
+        # Share of periods that must carry demand before an item counts as continuous
+        # rather than intermittent — the Syntetos–Boylan boundary, and the same number
+        # the forecaster withholds Croston above.
+        self.continuous_freq_threshold = cfg.get("continuous_freq_threshold", 0.75)
 
     def classify(self, demand_summary: pd.DataFrame, time_series: pd.DataFrame) -> pd.DataFrame:
         """
@@ -124,23 +128,41 @@ class DemandClassifier:
 
     def _demand_pattern(self, stocking_class: str, active: int, total: int, cv) -> str:
         """
-        Classify demand pattern within a stocking tier.
-        Used to route SKUs to the correct forecasting method.
+        Classify demand pattern within a stocking tier, on the two Syntetos–Boylan axes.
 
-          smooth      → ETS/Holt-Winters (low CV, high frequency)
-          intermittent → Croston's method (moderate CV or moderate frequency)
-          erratic     → Croston's method (high CV regardless of frequency)
-          lumpy       → Croston's method (low frequency + high CV)
-          non-stocking → no forecast needed
+        **How often demand arrives decides first**, and only then how much the size of
+        it varies. That order is the whole point of the taxonomy, and it was the wrong
+        way round here: CV was tested first, so anything with a CV between the two
+        thresholds fell through to `intermittent` whatever its frequency. An item that
+        sold in all twelve of the last twelve months at CV 0.61 came out *intermittent* —
+        51 of the 65 items on the IN30 extract that sold every single month did. The word
+        means demand arrives in some periods and not others, and those items have no
+        empty period at all. Downstream the label is read as evidence of sporadic demand:
+        it routes a short series to TSB in `Forecaster._forecast_sku`, and it is what the
+        policy profile shows a planner as `demand_continuity`.
+
+        So frequency splits first — gaps or no gaps — and CV names what kind within each:
+
+          no gaps, size steady      → smooth       (ETS, SES, ARIMA)
+          no gaps, size varies      → variable     (same; volatile, but not sporadic)
+          no gaps, size erratic     → erratic
+          gaps, size steady         → intermittent (Croston/TSB)
+          gaps, size erratic        → lumpy        (Croston/TSB)
+          non-stocking              → no forecast needed
+
+        `variable` is a third label rather than a widening of `smooth` because most of
+        this extract lands there, and a planner reading *smooth* against a history of
+        46, 49, 5, 112 would rightly stop believing the column.
         """
         if stocking_class == "non-stocking":
             return "non-stocking"
         if pd.isna(cv):
             return "unknown"
         freq_ratio = active / total if total > 0 else 0
-        if cv <= self.cv_intermittent_threshold and freq_ratio >= 0.75:
-            return "smooth"
-        if cv >= self.cv_erratic_threshold:
-            return "erratic" if freq_ratio >= 0.5 else "lumpy"
-        # moderate CV or moderate frequency
-        return "intermittent"
+        if freq_ratio >= self.continuous_freq_threshold:
+            # Demand in nearly every period: there is no interval to model, so the only
+            # question left is how steady the size is.
+            if cv <= self.cv_intermittent_threshold:
+                return "smooth"
+            return "variable" if cv < self.cv_erratic_threshold else "erratic"
+        return "lumpy" if cv >= self.cv_erratic_threshold else "intermittent"

@@ -1064,8 +1064,9 @@ class InventoryPlanner:
 
         # Step 4: Forecast — must run before safety stock to supply forecast RMSE
         print("\n[4/7] Forecasting demand (6 months)...")
-        # MTS competes its models; MTO goes straight to Croston. The policy is the
-        # ERP's, from the planner worksheet — not the pipeline's inferred class.
+        # Every item with enough history competes its models. The policy only decides
+        # the fallback for a series too short to hold anything out, where MTO routes to
+        # TSB. It is the ERP's, from the planner worksheet — not the inferred class.
         policy = (planning_master_df[["sku", "stocking_policy"]]
                   if planning_master_df is not None
                   and "stocking_policy" in planning_master_df.columns else None)

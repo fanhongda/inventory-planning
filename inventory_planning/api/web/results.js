@@ -196,8 +196,25 @@ async function showRun(runId, runs, onPick) {
     .sort((a, b) => PANEL_ORDER.indexOf(a.kind) - PANEL_ORDER.indexOf(b.kind))
     .map((output) => ({ output, host: el("section", { class: "card" }) }));
 
+  // A run with no picture in it. Worth a sentence, because the absence is
+  // indistinguishable on this screen from a screen that cannot draw one — and until
+  // the review was wired into the run started from the Policy screen, every run
+  // started there was this case.
+  const drewNothing = !body.outputs.some((o) => o.present && o.kind === "report");
+
   mount(host,
     runLine(runs, runId, onPick),
+    drewNothing
+      ? el("section", { class: "card" },
+          el("h2", {}, "This run drew no charts"),
+          el("p", { class: "sub" },
+             "The visual review is an output like any other, and this run's manifest "
+             + "does not name one — so there is nothing here to render."),
+          el("p", { class: "note" },
+             "Runs started from the Policy screen before the review was wired in never "
+             + "wrote it. Start another run and the charts appear here, above the "
+             + "workbook. If one still does not, the run said why when it finished."))
+      : null,
     el("section", { class: "card" },
       el("h2", {}, "Files this run wrote",
          el("span", { class: "badge" }, `${body.outputs.length}`)),

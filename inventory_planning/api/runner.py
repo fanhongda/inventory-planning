@@ -49,7 +49,8 @@ FAILED = "failed"
 # The stages a caller sees. Named for what is happening rather than for the method,
 # because the method names are an implementation and these are shown to a person.
 STAGES = ("reading the store", "checking the documents against each other",
-          "planning", "policy and targets", "writing the workbook")
+          "planning", "policy and targets", "writing the workbook",
+          "drawing the review")
 
 
 class RunRefused(Exception):
@@ -74,6 +75,7 @@ class RunState:
     documents: List[str] = dc_field(default_factory=list)
     target_value: Optional[float] = None
     error: str = ""
+    review_error: str = ""
     outputs: List[str] = dc_field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -82,6 +84,7 @@ class RunState:
             "started_at": self.started_at, "finished_at": self.finished_at,
             "batch_ids": list(self.batch_ids), "documents": list(self.documents),
             "target_value": self.target_value, "error": self.error,
+            "review_error": self.review_error,
             "outputs": list(self.outputs),
             "running": self.status in (QUEUED, RUNNING),
         }
@@ -242,7 +245,7 @@ class Runner:
 
             results = planner.run_planning(**inputs)
             self._set(stage=STAGES[3])
-            planner.run_policy_analysis(
+            policy = planner.run_policy_analysis(
                 results,
                 inventory_df=inputs.get("inventory_df"),
                 open_po_df=inputs.get("open_po_df"),
@@ -252,9 +255,41 @@ class Runner:
             )
             self._set(stage=STAGES[4],
                       outputs=[o.name for o in planner.run.outputs])
+            self._review(planner, policy, inputs)
             self._set(status=DONE, stage="done",
+                      outputs=[o.name for o in planner.run.outputs],
                       finished_at=datetime.now().isoformat(timespec="seconds"))
         except Exception as exc:  # noqa: BLE001 — the message is the product here
             self._set(status=FAILED, error=f"{type(exc).__name__}: {exc}",
                       finished_at=datetime.now().isoformat(timespec="seconds"))
+            traceback.print_exc()
+
+    def _review(self, planner, policy, inputs) -> None:
+        """
+        The charts, which a run started from this screen was not drawing.
+
+        The CLI reaches `run_kpi_review`; this path did not, so a run started from the
+        button left a workbook, three CSVs and a note — and the results screen, which
+        renders the run's own outputs and computes nothing, had no picture to render.
+        It was not that the screen could not show charts. It was that the one output
+        that is a picture was never written, so the two paths into the same pipeline
+        produced different sets of files and only one of them said so.
+
+        Never allowed to fail the run, for the same reason the CLI's copy is not: it
+        runs after everything a planner acts on is already on disk, so a failure here
+        costs the picture and nothing else. It is recorded rather than swallowed —
+        a run that quietly drew nothing is how this went unnoticed in the first place.
+        """
+        self._set(stage=STAGES[5])
+        try:
+            planner.run_kpi_review(
+                policy,
+                sales_df=inputs.get("sales_df"),
+                open_so_df=inputs.get("open_so_df"),
+                open_po_df=inputs.get("open_po_df"),
+                inventory_df=inputs.get("inventory_df"),
+                po_history_df=inputs.get("po_history_df"),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            self._set(review_error=f"{type(exc).__name__}: {exc}")
             traceback.print_exc()

@@ -380,9 +380,17 @@ class TestIntermittentDemandIsScoredHonestly:
         assert row["selected_by"] == "backtest:mape"
 
     def test_the_level_is_not_inflated_towards_the_months_that_had_demand(self):
-        _, row = _run(self.ERRATIC)
-        true_rate = float(np.mean(self.ERRATIC))
-        assert row["forecast_qty"] == pytest.approx(true_rate, rel=0.35)
+        """
+        Asserted over the horizon rather than on t+1, because the forecast is no longer
+        obliged to be flat. This fixture has demand in two months of every three, in a
+        fixed phase, and a seasonal model now reproduces that phase — so t+1 is zero
+        when a zero month is next, which is the right answer and not an under-forecast.
+        What must not happen is the months with no demand being forecast as if they had
+        some, and that shows in the total.
+        """
+        detail, _ = _run(self.ERRATIC)
+        true_total = float(np.mean(self.ERRATIC)) * 6
+        assert detail["forecast_qty"].sum() == pytest.approx(true_total, rel=0.35)
 
     def test_a_lumpy_item_is_not_forecast_at_nothing(self):
         """
@@ -505,9 +513,14 @@ class TestCrostonIsOnlyOfferedWhereThereAreGaps:
         offered = f._candidates(series, 6)
         assert "Croston" in offered and "TSB" in offered
 
-    def test_a_quarterly_item_still_wins_with_an_intermittent_method(self):
-        quarterly = [100.0 if i % 3 == 2 else 0.0 for i in range(22)]
-        _, row = _run(quarterly)
+    def test_an_irregularly_sporadic_item_still_wins_with_an_intermittent_method(self):
+        """
+        Irregular gaps, which is the case Croston is actually for. A *regularly* spaced
+        item is better served by a model that reproduces the phase than by the average
+        of it — see `TestARegularRhythmIsForecastAsOne` — so the fixture here is one
+        whose rhythm no season can describe.
+        """
+        _, row = _run(LUMPY)
         assert row["model_used"] in ("Croston", "TSB")
 
 
@@ -566,3 +579,155 @@ class TestHowOftenDemandArrivesDecidesThePatternFirst:
                           index=PERIODS[-8:])
         rows = f._forecast_sku("A", short, "variable")
         assert rows[0]["model_used"] != "TSB"
+
+
+class TestACycleIsMeasuredNotAssumed:
+    """
+    `_detect_seasonality` was a CV test wearing a seasonality test's name:
+
+        monthly = [vals[i::12].mean() for i in range(12)]
+        return np.std(monthly) > 0.2 * np.mean(monthly)
+
+    With 22 months of history each bucket holds one observation or two, so `monthly` is
+    very nearly the series and the test reduces to `CV > 0.2`. It fired on **65 of 65**
+    items on the IN30 extract that sold every month. Nothing downstream saw the claim,
+    because `_fit_ets` then discarded it below 24 observations — so a detector that
+    answered yes to everything and a detector that worked were indistinguishable from
+    the output. On a history longer than 24 months the answer stops being discarded, and
+    a universal yes puts a twelve-parameter seasonal fit on the whole catalogue.
+
+    Seasonality means the series resembles itself a cycle ago. That is autocorrelation
+    at that lag, and that is what is measured now.
+    """
+
+    @staticmethod
+    def _series(values):
+        return pd.Series(np.asarray(values, dtype=float),
+                         index=pd.period_range("2022-01", periods=len(values), freq="M"))
+
+    @staticmethod
+    def _wave(n, period, level=100.0, amp=60.0):
+        return level + amp * np.sin(2 * np.pi * np.arange(n) / period)
+
+    @pytest.mark.parametrize("period", [3, 4, 6, 12])
+    def test_it_finds_the_cycle_that_is_there(self, period):
+        f = Forecaster(horizon=6)
+        assert f._seasonal_period(self._series(self._wave(36, period))) == period
+
+    def test_a_short_cycle_is_found_on_a_history_too_short_for_an_annual_one(self):
+        """
+        The whole defect in one assertion. Eighteen months cannot hold two annual
+        cycles, so the old code could see no seasonality here at all — the
+        24-observation floor was never a fact about the data, only the consequence of
+        hardcoding an annual season. A quarterly rhythm is plainly visible in eighteen.
+        """
+        f = Forecaster(horizon=6)
+        assert f._seasonal_period(self._series(self._wave(18, 3))) == 3
+
+    def test_an_annual_cycle_needs_more_than_the_two_cycles_it_takes_to_fit(self):
+        """
+        Two cycles is the least that can be *fitted*, not the least that can be
+        *recognised*. On exactly 24 months an annual ACF reaches 0.43 against a bar of
+        0.52 and is refused; around 26 it clears. The asymmetry is deliberate — a missed
+        cycle leaves the forecast where it already was, a fabricated one reshapes a
+        purchase recommendation.
+        """
+        f = Forecaster(horizon=6)
+        assert f._seasonal_period(self._series(self._wave(22, 12))) is None
+        assert f._seasonal_period(self._series(self._wave(24, 12))) is None
+        assert f._seasonal_period(self._series(self._wave(30, 12))) == 12
+
+    def test_the_shortest_qualifying_cycle_wins(self):
+        """
+        A three-month cycle also correlates at six and twelve, because they are
+        multiples of it. Taking the largest autocorrelation would read a quarterly
+        rhythm as an annual one and spend four times the parameters saying so.
+        """
+        f = Forecaster(horizon=6)
+        assert f._seasonal_period(self._series(self._wave(48, 3))) == 3
+
+    def test_noise_is_not_a_cycle(self):
+        f = Forecaster(horizon=6)
+        noise = 100 + 30 * np.random.default_rng(0).standard_normal(36)
+        assert f._seasonal_period(self._series(noise)) is None
+
+    def test_a_trend_is_not_a_cycle(self):
+        """
+        A climbing series correlates with itself at every lag: the raw ramp scored 0.99
+        at lag 3 and came out quarterly. Measuring the first difference removes the
+        climb — and flattens a ramp to a constant, whose variance is zero.
+        """
+        f = Forecaster(horizon=6)
+        assert f._seasonal_period(self._series(np.arange(1, 37) * 10.0)) is None
+
+    def test_a_flat_series_is_not_a_cycle(self):
+        f = Forecaster(horizon=6)
+        assert f._seasonal_period(self._series(np.full(36, 100.0))) is None
+
+    def test_the_normal_catalogue_is_not_all_seasonal(self):
+        """The gate that fired on everything. Varying is not cycling."""
+        f = Forecaster(horizon=6)
+        rng = np.random.default_rng(3)
+        fired = sum(f._seasonal_period(
+            self._series(100 + 40 * rng.standard_normal(30))) is not None
+            for _ in range(30))
+        assert fired <= 3, f"{fired}/30 plain noisy series called seasonal"
+
+
+class TestETSIsActuallyInTheCompetition:
+    """
+    `ExponentialSmoothing.fit()` takes no `disp` argument. It was called with
+    `disp=False`, so it raised `TypeError` every time, and `_candidates` catches every
+    exception a candidate raises — which is right for a model that cannot fit this
+    series and wrong for one that cannot fit anything. ETS was never once in the pool,
+    and `_fit_smooth` fell through it to ARIMA on every call.
+
+    Nothing said so. The model mix on the real extract listed SES, Naive, SMA, Croston,
+    TSB and ARIMA and no ETS at all, which reads as a model that never wins rather than
+    as a model that never ran.
+    """
+
+    def test_ets_is_offered(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in RAMP], index=PERIODS)
+        assert "ETS" in f._candidates(series, 6)
+
+    def test_a_seasonal_ets_is_offered_beside_the_plain_one(self):
+        """
+        Beside, not instead. The detector decides what to try and the backtest decides
+        what is used, which is the defence that holds when the detector is wrong.
+        """
+        f = Forecaster(horizon=6)
+        wave = 100 + 60 * np.sin(2 * np.pi * np.arange(36) / 4)
+        series = pd.Series(wave, index=pd.period_range("2022-01", periods=36, freq="M"))
+        offered = f._candidates(series, 6)
+        assert "ETS" in offered and "ETS-seasonal4" in offered
+
+    def test_no_seasonal_entrant_where_there_is_no_cycle(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in RAMP], index=PERIODS)
+        assert not [n for n in f._candidates(series, 6) if n.startswith("ETS-seasonal")]
+
+
+class TestARegularRhythmIsForecastAsOne:
+    """
+    A per-period rate is the right input to safety stock and the wrong description of an
+    item that orders on a fixed beat. Where the beat is regular enough to be measured,
+    the forecast can carry it instead of averaging it away.
+    """
+
+    def test_a_quarterly_item_is_forecast_on_its_beat(self):
+        quarterly = [100.0 if i % 3 == 2 else 0.0 for i in range(22)]
+        detail, _ = _run(quarterly)
+        qty = detail["forecast_qty"].tolist()
+        assert not np.allclose(qty, qty[0]), f"flattened to a rate: {qty}"
+        # The next order is due two months out, and nothing is due next month.
+        assert qty[0] == pytest.approx(0.0, abs=5)
+        assert max(qty) == pytest.approx(100.0, rel=0.2)
+
+    def test_the_total_over_the_horizon_still_matches_the_rate(self):
+        """The shape may change; the quantity it integrates to may not drift."""
+        quarterly = [100.0 if i % 3 == 2 else 0.0 for i in range(22)]
+        detail, _ = _run(quarterly)
+        assert detail["forecast_qty"].sum() == pytest.approx(
+            float(np.mean(quarterly)) * 6, rel=0.3)

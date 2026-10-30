@@ -38,6 +38,22 @@ items on the IN30 extract that sold in all 22 months. The level forecast is a fa
 winner there and now stands in the pool under its own name, `SES`, which produces the
 same number; what it no longer does is tell a planner the item is sporadic.
 
+**ETS is in the pool, which it had not been.** `ExponentialSmoothing.fit()` takes no
+`disp` argument; it was called with `disp=False` and raised `TypeError` on every series,
+and `_candidates` catches whatever a candidate raises — right for a model that cannot
+fit *this* series, wrong for one that cannot fit anything. So the model mix on the real
+extract listed SES, Naive, SMA, Croston, TSB and ARIMA and no ETS at all, which reads as
+a model that never wins rather than as one that never ran, and `_fit_smooth` fell
+through ETS to ARIMA on every call. With the argument gone ETS wins 112 of 610 items.
+
+**A cycle is measured, not assumed.** The seasonal period is whatever the series repeats
+on — `_seasonal_period` — and no longer hardcoded to twelve months, which is what made
+24 observations the price of any seasonality at all. What stood in for detection was
+`std(monthly buckets) > 0.2 x mean`, which on a 22-month history is `CV > 0.2` with
+extra steps and said yes to 65 of 65 items that sold every month; the answer was then
+discarded below 24 observations, so nothing downstream could tell the difference. On a
+longer history it is no longer discarded.
+
 A **naive forecast is always in the pool**. Without it, "the best of five models" can
 still be worse than repeating last month's number, and nothing in the output would say
 so. `vs_naive` is the winner's error over the naive one's: 1.0 means the model earned
@@ -131,6 +147,30 @@ _MIN_DENSITY_FOR_ARIMA = 0.5
 # below deliberately: ARIMA needs density 0.5 or more, Croston needs less than 0.76, and
 # they overlap across the middle, which is where either could honestly win.
 _MAX_DENSITY_FOR_CROSTON = 0.76
+# Candidate cycle lengths for monthly data, shortest first: quarterly, four-monthly,
+# half-yearly, annual. Tried in this order because a genuine three-month cycle also
+# correlates at six and twelve — see `_seasonal_period`, which takes the shortest that
+# qualifies rather than the strongest.
+_SEASONAL_PERIODS = (3, 4, 6, 12)
+# How much autocorrelation at the candidate lag before a cycle is worth fitting a season
+# per phase for. The white-noise significance band decides alongside it, and the stricter
+# of the two applies: the band is the right bar on a short series and too low a one on a
+# long history, where an ACF of 0.18 clears it and still does not justify twelve
+# parameters.
+_MIN_SEASONAL_ACF = 0.3
+# The band's multiplier. 2.50 rather than the familiar 1.96 because four candidate
+# periods are tested and the bar has to hold for the set, not for one lag: at 1.96, one
+# noisy series in nine came out seasonal — 10.6% across 1,200 generated ones — which on
+# a 30,000-line catalogue is three thousand items handed a cycle they do not have. This
+# is 0.05/4 two-sided, and measured at 3.1%.
+#
+# What it costs: an annual cycle on exactly 24 months is no longer found (ACF 0.43
+# against a bar of 0.52). Two cycles is the least that can be fitted, not the least that
+# can be recognised — on a clean cycle the measured thresholds are 13 months for a
+# quarterly rhythm, 15 for four-monthly, 17 for half-yearly and 26 for annual, and more
+# where the series is noisy. A missed cycle leaves the forecast where it already was; a
+# fabricated one reshapes a purchase recommendation.
+_SEASONAL_ACF_Z = 2.50
 # MAPE needs a non-zero actual to divide by. With fewer than this many across the whole
 # backtest the ranking would rest on one or two months, so RMSE decides instead — the
 # metric is reported either way rather than left to be assumed.
@@ -197,8 +237,14 @@ class Forecaster:
     def _forecast_sku(self, sku: str, series: pd.Series, pattern: str,
                       policy: str = None) -> list:
         series = series.fillna(0).astype(float)
-        trend_detected = seasonal_detected = False
         scores = {}
+        # Reported on every row, whichever path produced the forecast. These were left
+        # False on the backtest path, which is nearly every item — so the two columns
+        # said "no trend, no cycle" about a catalogue nobody had asked, and
+        # `summary()` groups by them.
+        trend_detected = self._detect_trend(series)
+        seasonal_period = self._seasonal_period(series)
+        seasonal_detected = seasonal_period is not None
 
         if series.notna().sum() >= _MIN_BACKTEST_POINTS:
             model_used, forecast_values, rmse, scores = self._select_by_backtest(series)
@@ -214,10 +260,8 @@ class Forecaster:
             model_used, forecast_values, rmse = self._tsb(series)
             selected_by = "pattern"
         else:
-            trend_detected = self._detect_trend(series)
-            seasonal_detected = self._detect_seasonality(series)
             model_used, forecast_values, rmse = self._fit_smooth(
-                series, trend_detected, seasonal_detected)
+                series, trend_detected, seasonal_period)
             selected_by = "pattern"
 
         last_period = series.index[-1]
@@ -278,7 +322,7 @@ class Forecaster:
         """
         out = {}
         trend = self._detect_trend(series)
-        seasonal = self._detect_seasonality(series)
+        period = self._seasonal_period(series)
 
         # ARIMA is offered only where there is a series for it to be about.
         #
@@ -309,8 +353,16 @@ class Forecaster:
             allow_croston = self._sparse_enough_for_croston(series)
 
         candidates = [
-            ("ETS", lambda: self._fit_ets(series, trend, seasonal, horizon)),
+            ("ETS", lambda: self._fit_ets(series, trend, None, horizon)),
         ]
+        # Offered beside plain ETS rather than in place of it, so a detected cycle has
+        # to earn the parameters it costs. The detector decides what to try; the
+        # backtest decides what is used, which is the one defence that holds when the
+        # detector is wrong — and the detector it replaced was wrong on every item.
+        if period is not None:
+            candidates.append(
+                (f"ETS-seasonal{period}",
+                 lambda: self._fit_ets(series, trend, period, horizon)))
         if allow_arima:
             candidates.append(("ARIMA", lambda: self._fit_arima(series, horizon)))
         if allow_croston:
@@ -374,8 +426,8 @@ class Forecaster:
                 pooled[name]["act"].extend(actual)
 
         if not pooled:
-            trend, seasonal = self._detect_trend(series), self._detect_seasonality(series)
-            model, values, rmse = self._fit_smooth(series, trend, seasonal)
+            trend, period = self._detect_trend(series), self._seasonal_period(series)
+            model, values, rmse = self._fit_smooth(series, trend, period)
             return model, values, rmse, {"_metric": "in-sample (too short to backtest)"}
 
         # A window that caught no demand has not measured anything.
@@ -464,20 +516,28 @@ class Forecaster:
 
     # ── Smooth demand: ETS → ARIMA → SMA ─────────────────────────────────────
 
-    def _fit_ets(self, series: pd.Series, trend: bool, seasonal: bool, horizon: int):
+    def _fit_ets(self, series: pd.Series, trend: bool, period=None, horizon: int = None):
+        """
+        `period` is the cycle length to fit a season for, or None for level and trend
+        only. It used to be the pair (`seasonal: bool`, 12), so the one cycle this could
+        ever fit was an annual one and the one history that could hold two of those was
+        24 months long.
+        """
         n = len(series)
+        horizon = self.horizon if horizon is None else horizon
         if n < 12:
+            return None
+        if period is not None and n < 2 * period:
             return None
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            seasonal_arg = "add" if seasonal and n >= 24 else None
             model = ExponentialSmoothing(
                 series,
                 trend="add" if trend else None,
-                seasonal=seasonal_arg,
-                seasonal_periods=12 if seasonal_arg else None,
+                seasonal="add" if period else None,
+                seasonal_periods=period if period else None,
                 initialization_method="estimated",
-            ).fit(optimized=True, disp=False)
+            ).fit(optimized=True)
             return model.forecast(horizon).values
 
     def _fit_arima(self, series: pd.Series, horizon: int):
@@ -517,27 +577,32 @@ class Forecaster:
             level = alpha * v + (1 - alpha) * level
         return np.full(horizon, max(0.0, level))
 
-    def _fit_smooth(self, series: pd.Series, trend: bool, seasonal: bool):
+    def _fit_smooth(self, series: pd.Series, trend: bool, period=None):
         """
         The original decision tree, kept for SKUs with no MTS policy and for series too
         short to hold anything out. First model that fits, in a fixed order — the point
         of the backtest above is that this order is not evidence about accuracy.
+
+        `period` is the detected cycle length or None, as in `_fit_ets`. Nothing here
+        compares anything, so a detected cycle is fitted on trust — which is the reason
+        `_seasonal_period` has to be a real test rather than a CV threshold.
         """
         n = len(series)
+        if period is not None and n < 2 * period:
+            period = None
 
         if n >= 12:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     trend_arg = "add" if trend else None
-                    seasonal_arg = "add" if seasonal and n >= 24 else None
                     model = ExponentialSmoothing(
                         series,
                         trend=trend_arg,
-                        seasonal=seasonal_arg,
-                        seasonal_periods=12 if seasonal_arg else None,
+                        seasonal="add" if period else None,
+                        seasonal_periods=period if period else None,
                         initialization_method="estimated",
-                    ).fit(optimized=True, disp=False)
+                    ).fit(optimized=True)
                     fc = model.forecast(self.horizon).values
                     rmse = self._insample_rmse(series, model.fittedvalues)
                     return "ETS", fc, rmse
@@ -722,12 +787,77 @@ class Forecaster:
         except Exception:
             return False
 
+    def _seasonal_period(self, series: pd.Series):
+        """
+        The cycle length the series repeats on, or None where it does not repeat.
+
+        What this replaces was a CV test wearing a seasonality test's name:
+
+            monthly = [vals[i::12].mean() for i in range(12)]
+            return np.std(monthly) > 0.2 * np.mean(monthly)
+
+        With 22 months of history each of those twelve buckets holds one observation or
+        two, so `monthly` is very nearly the series itself and the test reduces to
+        `CV > 0.2`. Every item that varies at all passes it: on the IN30 extract it
+        fired on **65 of 65** items that sold every month, and the answer was then
+        discarded by the `n >= 24` gate in `_fit_ets`, so nothing downstream ever saw
+        what it claimed. A detector that fires on everything is detecting nothing, and
+        one whose answer is always thrown away hides that fact. With more than 24 months
+        in hand the answer stops being thrown away, and a universal yes would put a
+        twelve-parameter seasonal fit on every item in the catalogue.
+
+        Seasonality means the series resembles itself a cycle ago, which is
+        autocorrelation at that lag, so that is what this measures. `_SEASONAL_PERIODS`
+        are the candidate business cycles for monthly data; a two-month "cycle" is left
+        out because alternating noise and a real fortnightly rhythm are the same
+        arithmetic, and an every-other-month item is better served by ARIMA recovering
+        its phase, which `_MIN_DENSITY_FOR_ARIMA` already exists to allow.
+
+        The bar is the white-noise significance band, widened for the number of lags
+        tested (`_SEASONAL_ACF_Z`), and an absolute floor besides. The band alone loosens
+        as the series lengthens — on 120 months an ACF of 0.18 clears it — and an effect
+        that is distinguishable from noise is not therefore worth twelve parameters. Both
+        must hold.
+
+        The **shortest** qualifying period wins, not the strongest. A genuine
+        three-month cycle also correlates at six and twelve, because they are multiples
+        of it; picking the largest ACF would read a quarterly rhythm as an annual one and
+        spend four times the parameters saying so.
+
+        A period is only offered where the history covers it twice, which is what
+        estimating a season per phase needs at a minimum — and is where the old `n >= 24`
+        came from. It was never a fact about the data, only that 12 was hardcoded.
+
+        Measured on the **first difference**, because a trend correlates with itself at
+        every lag. A plain linear ramp scored 0.99 at lag 3 on the raw series and came
+        out quarterly: the longer a series climbs, the more any lag looks like a cycle.
+        Differencing removes the climb and leaves the rhythm — a period-m signal differs
+        with period m — and it flattens a ramp to a constant, whose variance is zero, so
+        the one series most likely to be misread cannot be read at all.
+        """
+        observed = len(series)
+        values = np.diff(series.values.astype(float))
+        if len(values) < 2:
+            return None
+        centred = values - values.mean()
+        denom = float(np.dot(centred, centred))
+        if denom <= 0:
+            return None
+        bar = max(_MIN_SEASONAL_ACF, _SEASONAL_ACF_Z / np.sqrt(len(values)))
+        for m in _SEASONAL_PERIODS:
+            # Two full cycles judged on the observations, not on the differences: 24
+            # months hold two annual cycles, and differencing costs one point, not one
+            # cycle. The lag still has to fit inside the differenced series.
+            if observed < 2 * m or len(values) <= m:
+                continue
+            acf = float(np.dot(centred[:-m], centred[m:]) / denom)
+            if acf >= bar:
+                return m
+        return None
+
     def _detect_seasonality(self, series: pd.Series) -> bool:
-        if len(series) < 12:
-            return False
-        vals = series.values
-        monthly = [vals[i::12].mean() for i in range(12) if len(vals[i::12]) > 0]
-        return np.std(monthly) > 0.2 * np.mean(monthly) if np.mean(monthly) > 0 else False
+        """Whether there is a cycle at all. The period itself is what callers want."""
+        return self._seasonal_period(series) is not None
 
     @staticmethod
     def _insample_rmse(actual: pd.Series, fitted: pd.Series) -> float:

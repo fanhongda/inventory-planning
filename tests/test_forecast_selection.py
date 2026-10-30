@@ -200,7 +200,8 @@ class TestAWinnerStaysOnTheGround:
         seen = []
         f = Forecaster(horizon=6)
         original = f._candidates
-        f._candidates = lambda s, h, allow=None: (seen.append(allow) or original(s, h, allow))
+        f._candidates = lambda s, h, arima=None, croston=None: (
+            seen.append((arima, croston)) or original(s, h, arima, croston))
         f._select_by_backtest(series)
 
         assert len(seen) > 1, "expected more than one fold"
@@ -455,3 +456,113 @@ class TestTheLumpTravelsBesideTheRate:
         f = Forecaster(horizon=6)
         s = pd.Series([0.0, 100.0, 0.0, 100.0] + [0.0] * 18, index=PERIODS)
         assert f._demand_shape(s)["expected_interval"] > 2.0
+
+
+class TestCrostonIsOnlyOfferedWhereThereAreGaps:
+    """
+    Croston and TSB split a demand size from the interval between arrivals. Given a
+    series with demand in every period there is no interval: every gap is one, `n_hat`
+    initialises to 1.0 and its update has 1.0 as a fixed point, so Croston returns
+    `z_hat` — exponential smoothing at alpha 0.2 and nothing more.
+
+    It was offered anyway and it won, because a fixed-alpha level forecast is hard to
+    beat on noisy trendless demand: 25 of the 65 items on the IN30 extract that sold in
+    all 22 months came out `model_used = Croston`. The number was defensible; the label
+    said the item was sporadic, which those 25 were not. So the level forecast stands in
+    the pool as `SES` and the two intermittent-demand methods are withheld from items
+    that have no intermittence.
+    """
+
+    # Demand every month, varying in size — the real shape of the mislabelled items.
+    NOISY_CONTINUOUS = [46, 49, 25, 112, 32, 27, 38, 19, 44, 37, 43, 38,
+                        49, 54, 71, 101, 30, 18, 21, 75, 40, 52]
+
+    def test_a_series_with_no_empty_period_is_not_offered_croston(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in self.NOISY_CONTINUOUS], index=PERIODS)
+        offered = f._candidates(series, 6)
+        assert "Croston" not in offered
+        assert "TSB" not in offered
+        assert "SES" in offered, "withdrawing Croston must not remove the level forecast"
+
+    def test_the_winner_is_no_longer_named_after_an_intermittent_method(self):
+        _, row = _run(self.NOISY_CONTINUOUS)
+        assert row["model_used"] not in ("Croston", "TSB")
+
+    def test_ses_gives_the_same_number_croston_did(self):
+        """
+        The gate is a correction to the label, not to the forecast. On a dense series
+        Croston computes exactly this, so the quantity a planner buys must not move.
+        """
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in self.NOISY_CONTINUOUS], index=PERIODS)
+        assert f._ses(series, 6)[0] == pytest.approx(f._croston(series, 6)[1][0])
+
+    def test_it_is_still_offered_where_the_demand_is_genuinely_sporadic(self):
+        """The gate must not fire on the items the method exists for."""
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        offered = f._candidates(series, 6)
+        assert "Croston" in offered and "TSB" in offered
+
+    def test_a_quarterly_item_still_wins_with_an_intermittent_method(self):
+        quarterly = [100.0 if i % 3 == 2 else 0.0 for i in range(22)]
+        _, row = _run(quarterly)
+        assert row["model_used"] in ("Croston", "TSB")
+
+
+class TestHowOftenDemandArrivesDecidesThePatternFirst:
+    """
+    The two Syntetos–Boylan axes are frequency and then size variability, in that order.
+    They were tested the other way round: CV first, so anything between the two CV
+    thresholds fell through to `intermittent` whatever its frequency. An item that sold
+    in all twelve of the last twelve months at CV 0.61 came out *intermittent* — 51 of
+    the 65 items on the IN30 extract that sold every single month did.
+
+    The word means demand arrives in some periods and not others, and the label is read
+    downstream as evidence of that: it routes a short series to TSB, and the policy
+    profile shows it to a planner as `demand_continuity`.
+    """
+
+    @staticmethod
+    def _pattern(values):
+        from inventory_planning.analytics.demand_classifier import DemandClassifier
+        ts = pd.DataFrame({"A": [float(v) for v in values]}, index=PERIODS[-12:])
+        summary = pd.DataFrame({"sku": ["A"], "demand_mean": 0.0, "demand_std": 0.0})
+        cfg = Path(__file__).parents[1] / "config"
+        out = DemandClassifier(cfg).classify(summary, ts).set_index("sku")
+        return out.loc["A", "demand_pattern"], out.loc["A", "demand_cv"]
+
+    def test_demand_in_every_month_is_never_called_intermittent(self):
+        pattern, cv = self._pattern([46, 49, 25, 112, 32, 27, 38, 19, 44, 37, 43, 38])
+        assert 0.5 < cv < 1.0, "the CV band that used to decide this on its own"
+        assert pattern not in ("intermittent", "lumpy")
+
+    def test_a_continuous_item_whose_size_moves_is_called_variable(self):
+        pattern, _ = self._pattern([46, 49, 25, 112, 32, 27, 38, 19, 44, 37, 43, 38])
+        assert pattern == "variable"
+
+    def test_a_steady_item_is_still_smooth(self):
+        pattern, _ = self._pattern([100, 104, 98, 101, 99, 103, 97, 102, 100, 101, 99, 100])
+        assert pattern == "smooth"
+
+    def test_a_continuous_item_with_a_wild_size_is_erratic_not_intermittent(self):
+        pattern, cv = self._pattern([5, 400, 10, 8, 350, 6, 12, 300, 9, 7, 280, 11])
+        assert cv >= 1.0
+        assert pattern == "erratic"
+
+    def test_an_item_with_gaps_and_a_steady_size_is_intermittent(self):
+        pattern, _ = self._pattern([50, 0, 55, 0, 48, 0, 52, 0, 51, 0, 49, 53])
+        assert pattern == "intermittent"
+
+    def test_an_item_with_gaps_and_a_wild_size_is_lumpy(self):
+        pattern, _ = self._pattern([5, 0, 400, 0, 8, 0, 350, 0, 12, 0, 300, 6])
+        assert pattern == "lumpy"
+
+    def test_a_continuous_pattern_does_not_route_a_short_series_to_tsb(self):
+        """`erratic` and `variable` mean gaps-free, and TSB has nothing to offer them."""
+        f = Forecaster(horizon=6)
+        short = pd.Series([46.0, 49.0, 25.0, 112.0, 32.0, 27.0, 38.0, 19.0],
+                          index=PERIODS[-8:])
+        rows = f._forecast_sku("A", short, "variable")
+        assert rows[0]["model_used"] != "TSB"

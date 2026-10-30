@@ -30,6 +30,14 @@ genuinely sporadic item is most of the time. What changed is that it has to win.
 Below `_MIN_BACKTEST_POINTS` there is not enough history to rank anything, and the
 routing falls back to the policy and then to the demand pattern as before.
 
+**Croston is offered only where there are gaps for it to be about.** On a series with
+demand in every period its interval estimate is pinned at 1.0 — see
+`_MAX_DENSITY_FOR_CROSTON` — so it computes exponential smoothing at a fixed alpha and
+reports itself as an intermittent-demand method while doing it. That won 25 of the 65
+items on the IN30 extract that sold in all 22 months. The level forecast is a fair
+winner there and now stands in the pool under its own name, `SES`, which produces the
+same number; what it no longer does is tell a planner the item is sporadic.
+
 A **naive forecast is always in the pool**. Without it, "the best of five models" can
 still be worse than repeating last month's number, and nothing in the output would say
 so. `vs_naive` is the winner's error over the naive one's: 1.0 means the model earned
@@ -102,6 +110,27 @@ _MIN_BACKTEST_POINTS = 12
 # genuine every-other-month item keeps it: on one of those ARIMA recovers the phase —
 # `[0, 150, 0, 150, ...]` — which is a better answer than Croston's flat average of it.
 _MIN_DENSITY_FOR_ARIMA = 0.5
+# Share of periods that must be *empty* before Croston and TSB are worth offering.
+#
+# Both methods exist to split a demand size from the interval between arrivals. On a
+# series with demand in every period there is no interval to estimate: every gap is one,
+# `n_hat` initialises to 1.0, and its update — `0.2 x 1 + 0.8 x n_hat` — has 1.0 as a
+# fixed point, so it stays there. Croston's forecast is then `z_hat / 1`, which is
+# exponential smoothing of the series at alpha = 0.2 and nothing else. TSB degenerates
+# the same way, with `p_hat` pinned at 1.0.
+#
+# Offered anyway, it wins — and it deserves to, because a fixed-alpha level forecast
+# beats ETS and ARIMA on noisy trendless demand. On the IN30 extract it took 25 of the
+# 65 items that sold in all 22 months. The forecast was defensible and the label was
+# not: `model_used = Croston` tells a planner the item is sporadic, which is the one
+# thing those 25 are not. So the level forecast now stands in the pool under its own
+# name, `SES`, and the two intermittent-demand methods are offered only where there is
+# intermittence for them to be about.
+#
+# 0.76 is the Syntetos–Boylan boundary, the same one `_MIN_DENSITY_FOR_ARIMA` is set
+# below deliberately: ARIMA needs density 0.5 or more, Croston needs less than 0.76, and
+# they overlap across the middle, which is where either could honestly win.
+_MAX_DENSITY_FOR_CROSTON = 0.76
 # MAPE needs a non-zero actual to divide by. With fewer than this many across the whole
 # backtest the ranking would rest on one or two months, so RMSE decides instead — the
 # metric is reported either way rather than left to be assumed.
@@ -177,7 +206,11 @@ class Forecaster:
         elif policy == MTO:
             model_used, forecast_values, rmse = self._tsb(series)
             selected_by = "policy:MTO"
-        elif pattern in ("intermittent", "erratic", "lumpy"):
+        # Only the patterns that mean *gaps*. `erratic` and `variable` are continuous
+        # demand whose size moves about, and an intermittent-demand method has nothing to
+        # offer them — see `DemandClassifier._demand_pattern`, where frequency decides
+        # which family a pattern belongs to before CV names it.
+        elif pattern in ("intermittent", "lumpy"):
             model_used, forecast_values, rmse = self._tsb(series)
             selected_by = "pattern"
         else:
@@ -223,8 +256,20 @@ class Forecaster:
         """Whether a series has enough demand in it for ARIMA to be about anything."""
         return bool(float((series > 0).mean()) >= _MIN_DENSITY_FOR_ARIMA)
 
+    @staticmethod
+    def _sparse_enough_for_croston(series: pd.Series) -> bool:
+        """
+        Whether a series has gaps for an intermittent-demand method to be about.
+
+        See `_MAX_DENSITY_FOR_CROSTON`: above that density both Croston and TSB collapse
+        into exponential smoothing at a fixed alpha, which `SES` offers under its own
+        name, so all that is left to choose between them is which label the output
+        carries.
+        """
+        return bool(float((series > 0).mean()) < _MAX_DENSITY_FOR_CROSTON)
+
     def _candidates(self, series: pd.Series, horizon: int,
-                    allow_arima: bool = None) -> dict:
+                    allow_arima: bool = None, allow_croston: bool = None) -> dict:
         """
         Every model's forecast for the next `horizon` periods, by name.
 
@@ -257,18 +302,34 @@ class Forecaster:
         # different sample from its rivals.
         if allow_arima is None:
             allow_arima = self._dense_enough_for_arima(series)
+        # Decided by the caller for the same reason `allow_arima` is: density moves by a
+        # period between folds, and a series near the boundary would otherwise admit
+        # Croston to some folds and not others.
+        if allow_croston is None:
+            allow_croston = self._sparse_enough_for_croston(series)
 
         candidates = [
             ("ETS", lambda: self._fit_ets(series, trend, seasonal, horizon)),
         ]
         if allow_arima:
             candidates.append(("ARIMA", lambda: self._fit_arima(series, horizon)))
+        if allow_croston:
+            candidates += [
+                ("Croston", lambda: self._croston(series, horizon)[1]),
+                # Croston's estimate of the interval cannot fall while an item is quiet,
+                # so it competes against a version that can.
+                ("TSB", lambda: self._tsb(series, horizon)[1]),
+            ]
         for name, build in candidates + [
             ("SMA", lambda: self._fit_sma(series, horizon)),
-            ("Croston", lambda: self._croston(series, horizon)[1]),
-            # Croston's estimate of the interval cannot fall while an item is quiet, so
-            # it competes against a version that can.
-            ("TSB", lambda: self._tsb(series, horizon)[1]),
+            # The level forecast, under its own name. Not a duplicate of `ETS`: that
+            # entrant lets statsmodels optimise alpha against the fit, needs twelve
+            # observations before it is offered at all, and on noisy demand an optimised
+            # alpha chases the noise. This one holds alpha at 0.2 and starts from the
+            # mean of the series — which is precisely what Croston reduces to on a dense
+            # series, so withdrawing Croston from those items costs no accuracy, only
+            # the wrong label.
+            ("SES", lambda: self._ses(series, horizon)),
             # The floor every other model has to clear: repeat the last observation.
             ("Naive", lambda: np.full(horizon, float(series.iloc[-1]))),
         ]:
@@ -299,13 +360,15 @@ class Forecaster:
         # classes are meaningful for an item is a property of the item, not of how much
         # of it a particular fold was shown.
         allow_arima = self._dense_enough_for_arima(series)
+        allow_croston = self._sparse_enough_for_croston(series)
 
         pooled = {}
         for origin in origins:
             train, actual = series.iloc[:origin], series.iloc[origin:origin + steps].values
             if len(actual) == 0:
                 continue
-            for name, values in self._candidates(train, len(actual), allow_arima).items():
+            for name, values in self._candidates(train, len(actual), allow_arima,
+                                                 allow_croston).items():
                 pooled.setdefault(name, {"err": [], "act": []})
                 pooled[name]["err"].extend(values[:len(actual)] - actual)
                 pooled[name]["act"].extend(actual)
@@ -381,7 +444,7 @@ class Forecaster:
             metric = "rmse"
         # The same admission the folds were judged under, so the winner of the ranking
         # is guaranteed to be among the models refitted to produce the forecast.
-        final = self._candidates(series, self.horizon, allow_arima)
+        final = self._candidates(series, self.horizon, allow_arima, allow_croston)
         ranked = sorted(scored, key=lambda k: scored[k][metric])
         best = next((n for n in ranked if n in final), ranked[0])
         values = final.get(best, np.full(self.horizon, float(series.tail(3).mean())))
@@ -429,6 +492,30 @@ class Forecaster:
     def _fit_sma(self, series: pd.Series, horizon: int):
         window = min(len(series), 3)
         return np.full(horizon, float(series.tail(window).mean()))
+
+    @staticmethod
+    def _ses(series: pd.Series, horizon: int):
+        """
+        Exponential smoothing of the level, at a fixed alpha, seeded from the mean.
+
+        The plainest answer a forecaster can give to a series with no trend and no
+        seasonality: a weighted average of history that leans on the recent end. It is
+        in the pool because it was already winning there in disguise — Croston on a
+        series with demand in every period computes exactly this and reported itself as
+        an intermittent-demand method while doing it.
+
+        Alpha is fixed rather than fitted. `ETS` is the entrant that fits it, and the two
+        differ on purpose: an optimised alpha is chosen to trace the history it was given
+        and on noisy demand that means chasing noise, which the backtest then charges it
+        for. Which of the two is the better description of an item is the competition's
+        question, not something to settle here.
+        """
+        values = series.values.astype(float)
+        alpha = 0.2
+        level = float(values.mean())
+        for v in values[1:]:
+            level = alpha * v + (1 - alpha) * level
+        return np.full(horizon, max(0.0, level))
 
     def _fit_smooth(self, series: pd.Series, trend: bool, seasonal: bool):
         """

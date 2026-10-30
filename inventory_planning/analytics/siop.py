@@ -222,7 +222,15 @@ def build_siop_plan(
                              .fillna(0.0) * demand["unit_cost"])
 
     supply = _phase_supply(open_po, periods)
-    supply["supply_value"] = supply["supply_qty"] * supply["sku"].map(cost)
+    # `to_numeric` on the mapped cost, as the demand side above already does. Mapping a
+    # dict over an *empty* string column returns a string column rather than a numeric
+    # one, so this multiplication became str times float and raised — on a plan whose
+    # every open PO falls beyond the horizon, which is a legitimate plan and not an
+    # error. The costing is unchanged where there is anything to cost: a SKU with no
+    # unit cost was already NaN here, and still is, because valuing it at zero would
+    # sum into the total and understate the plan without saying so.
+    supply["supply_value"] = supply["supply_qty"] * pd.to_numeric(
+        supply["sku"].map(cost), errors="coerce")
 
     opening = _opening_position(inventory)
     target = _safety_target(safety_stock)

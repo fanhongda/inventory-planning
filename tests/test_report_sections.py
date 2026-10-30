@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from pandas.api.types import is_numeric_dtype
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
@@ -92,6 +93,25 @@ class TestTheGapIsNeverNetted:
         })
         plan = build_siop_plan(forecast, open_po=open_po, attributes=attributes)
         assert plan.by_period["supply_qty"].sum() == 0
+
+    def test_supply_filtered_to_nothing_is_still_valued_as_a_number(self):
+        """
+        Every open PO beyond the horizon leaves the supply frame empty, and an empty
+        frame is still costed. Mapping unit cost over an empty string column returns a
+        string column, so the valuation was string times float — which pandas 3.1
+        raises on, turning a legitimate plan into a TypeError. Asserting the dtype
+        rather than the sum, because a sum of nothing is zero whichever way it is
+        typed and the dtype is what broke.
+        """
+        forecast = _forecast(["A"], self.PERIODS, qty=10.0)
+        attributes = pd.DataFrame({"sku": ["A"], "unit_cost": [2.0]})
+        open_po = pd.DataFrame({
+            "sku": ["A"], "open_qty": [50.0],
+            "committed_delivery": [pd.Timestamp("2030-01-01")],
+        })
+        plan = build_siop_plan(forecast, open_po=open_po, attributes=attributes)
+        assert is_numeric_dtype(plan.by_period["supply_value"])
+        assert plan.by_period["supply_value"].sum() == 0
 
     def test_an_uncosted_sku_is_excluded_and_counted_not_valued_at_zero(self):
         """

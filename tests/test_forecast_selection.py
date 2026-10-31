@@ -115,9 +115,19 @@ class TestTheCompetitionPicksOnEvidence:
         The case the old router got right by luck and would have got wrong on a lumpy
         classification: a clean ramp needs a model that extrapolates, and the winner
         has to beat repeating last month by a distance.
+
+        Asserted as *not flat* rather than against a list of model names. The list was
+        `("ARIMA", "ETS")` and `ETS-trend` — added for exactly this case — is not in it,
+        so the test failed on the behaviour it exists to require. Which of the
+        extrapolating models wins is a close call that moves with the optimiser: this
+        passed locally and failed on all four CI legs. What the test is for is that the
+        forecast climbs.
         """
-        _, row = _run(RAMP, "MTS")
-        assert row["model_used"] in ("ARIMA", "ETS")
+        detail, row = _run(RAMP, "MTS")
+        qty = detail["forecast_qty"].tolist()
+        assert not np.allclose(qty, qty[0]), f"a clean ramp forecast flat: {qty}"
+        assert qty[-1] > qty[0]
+        assert row["forecast_qty"] > RAMP[-1] * 0.9
         assert row["vs_naive"] < 0.5
 
     def test_intermittent_demand_lands_on_a_rate_and_gets_there_by_competing(self):

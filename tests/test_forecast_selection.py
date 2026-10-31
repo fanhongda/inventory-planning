@@ -64,10 +64,26 @@ class TestTheHistoryDecidesWhetherThereIsACompetition:
         _, row = _run(LUMPY, "MTO")
         assert row["selected_by"].startswith("backtest")
 
-    def test_croston_still_wins_on_a_series_it_suits(self):
-        """Which is the point: it wins on merit rather than by being routed to."""
+    def test_an_intermittent_method_is_competitive_on_a_series_it_suits(self):
+        """
+        Asserted as *competitive* rather than as the winner, because on an intermittent
+        item it is not a two-horse race and never was — see
+        `TestTheRateModelsAllAnswerTheSameNumber`. Croston, TSB, SES, SMA and plain ETS
+        all estimate a rate, and on LUMPY they pool within 14% of each other with
+        forecasts between 16.4 and 20.4. Which name comes top is decided by sampling
+        noise across nine backtest points; asserting a particular one encodes the noise.
+
+        It was asserted that way because ETS could not fit at the time and so was never
+        among them. What the test is really for is that an intermittent-demand method
+        competes on merit instead of being routed to, which is what this checks.
+        """
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        offered = f._candidates(series, 6)
+        assert "Croston" in offered and "TSB" in offered
         _, row = _run(LUMPY, "MTO")
-        assert row["model_used"] == "Croston"
+        assert row["selected_by"].startswith("backtest")
+        assert row["forecast_qty"] == pytest.approx(float(np.mean(LUMPY)), rel=0.35)
 
     def test_a_ramp_is_not_forced_onto_croston_by_its_policy(self):
         """
@@ -104,11 +120,15 @@ class TestTheCompetitionPicksOnEvidence:
         assert row["model_used"] in ("ARIMA", "ETS")
         assert row["vs_naive"] < 0.5
 
-    def test_intermittent_demand_still_lands_on_croston(self):
-        """Not by routing this time — by winning."""
+    def test_intermittent_demand_lands_on_a_rate_and_gets_there_by_competing(self):
+        """
+        Not by routing. The winner is whichever rate model scored best and they are all
+        within a couple of percent on this fixture, so what is asserted is the rate and
+        the route, not the name — see the sibling test above.
+        """
         _, row = _run(LUMPY, "MTS")
-        assert row["model_used"] == "Croston"
         assert row["selected_by"].startswith("backtest")
+        assert row["forecast_qty"] == pytest.approx(float(np.mean(LUMPY)), rel=0.35)
 
     def test_where_no_model_helps_the_naive_one_wins(self):
         """
@@ -520,8 +540,11 @@ class TestCrostonIsOnlyOfferedWhereThereAreGaps:
         of it — see `TestARegularRhythmIsForecastAsOne` — so the fixture here is one
         whose rhythm no season can describe.
         """
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        assert "Croston" in f._candidates(series, 6)
         _, row = _run(LUMPY)
-        assert row["model_used"] in ("Croston", "TSB")
+        assert row["forecast_qty"] == pytest.approx(float(np.mean(LUMPY)), rel=0.35)
 
 
 class TestHowOftenDemandArrivesDecidesThePatternFirst:
@@ -797,3 +820,103 @@ class TestTheMonthsBeforeAnItemExistedAreNotEvidence:
                            index=pd.period_range("2023-01", periods=6, freq="M"))
         # Four live periods from the first sale, three of them with demand.
         assert f._density(series) == pytest.approx(3 / 4)
+
+
+class TestTheTrendIsMeasuredNotInferredFromAUnitRoot:
+    """
+    `_detect_trend` asked a unit-root test a question it does not answer:
+
+        clean = series[series > 0]
+        return adfuller(clean, autolag="AIC")[1] > 0.05
+
+    `adfuller` with its default `regression="c"` tests for a unit root against a
+    stationary mean. A deterministic ramp has no unit root, so the test rejects and the
+    rule concluded *no trend*; on a perfectly straight climb the regression is
+    degenerate, `adfuller` returns NaN, and `nan > 0.05` is False. A random walk has a
+    unit root and no trend, and the rule concluded the opposite. It fired on 60% of the
+    catalogue.
+
+    A growing item answered "no trend" gets a level-only ETS and is forecast flat,
+    which is the complaint this was found from. Dropping the zero periods first made it
+    worse: it compresses the time axis, so an item declining towards nothing has the
+    evidence of the decline removed before the test sees it.
+    """
+
+    @staticmethod
+    def _series(values):
+        return pd.Series(np.asarray(values, dtype=float),
+                         index=pd.period_range("2024-01", periods=len(values), freq="M"))
+
+    def test_a_clean_upward_ramp_has_a_trend(self):
+        """The case that returned NaN and was read as False."""
+        f = Forecaster(horizon=6)
+        assert f._detect_trend(self._series(np.arange(1, 25) * 10.0))
+
+    def test_a_decline_has_a_trend(self):
+        f = Forecaster(horizon=6)
+        assert f._detect_trend(self._series(np.arange(24, 0, -1) * 10.0))
+
+    def test_a_flat_series_has_none(self):
+        f = Forecaster(horizon=6)
+        assert not f._detect_trend(self._series(np.full(24, 100.0)))
+        noisy = 100 + 20 * np.random.default_rng(1).standard_normal(24)
+        assert not f._detect_trend(self._series(noisy))
+
+    def test_a_slope_too_small_to_matter_is_not_a_trend(self):
+        """Significant and material are different bars, and both have to clear."""
+        f = Forecaster(horizon=6)
+        barely = 100 + np.arange(24) * 0.05        # 1.2 across a level of 100
+        assert not f._detect_trend(self._series(barely))
+
+    def test_a_growing_item_is_not_forecast_flat(self):
+        """What the defect cost: the whole point of detecting a trend."""
+        detail, _ = _run(list(np.arange(1, 23) * 10.0))
+        qty = detail["forecast_qty"].tolist()
+        assert not np.allclose(qty, qty[0]), f"growing item forecast flat: {qty}"
+        assert qty[-1] > qty[0]
+
+    def test_a_trended_ets_is_offered_beside_the_plain_one(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in RAMP], index=PERIODS)
+        offered = f._candidates(series, 6)
+        assert "ETS" in offered and "ETS-trend" in offered
+
+    def test_no_trended_entrant_without_a_trend(self):
+        f = Forecaster(horizon=6)
+        noisy = 100 + 20 * np.random.default_rng(1).standard_normal(22)
+        assert "ETS-trend" not in f._candidates(self._series(noisy), 6)
+
+
+class TestTheRateModelsAllAnswerTheSameNumber:
+    """
+    Five of the seven entrants — Croston, TSB, SES, SMA and plain ETS — estimate a level
+    and repeat it across the horizon. On an item with no trend and no cycle that is not
+    a shortcut: the conditional mean of a stationary series is the same for t+1 and t+6,
+    so a forecast that wiggles is claiming to know which month will be high, and where
+    that knowledge is absent the wiggle costs accuracy rather than adding information.
+
+    Two alternatives were measured on the real extract and both lost. Laying Croston's
+    rate on the beat it already estimates scored MAE 89.06 against the flat 83.98 across
+    359 lumpy items. Recursing the moving average so it feeds its own forecasts back in
+    — which does make the horizon move — scored 369.32 against 358.62 over six months.
+
+    The consequence for a reader is that `model_used` on an intermittent item carries
+    much less information than its name suggests. This test pins that, so that a future
+    change making one of them win by a nose is not mistaken for a finding.
+    """
+
+    def test_they_agree_on_an_intermittent_item(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        offered = f._candidates(series, 6)
+        rates = {n: float(v[0]) for n, v in offered.items()
+                 if n in ("Croston", "TSB", "SES", "SMA", "ETS")}
+        assert len(rates) >= 4, f"expected the rate models in the pool, got {list(rates)}"
+        assert max(rates.values()) / min(rates.values()) < 1.5, rates
+
+    def test_each_of_them_repeats_across_the_horizon(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        for name, values in f._candidates(series, 6).items():
+            if name in ("Croston", "TSB", "SES", "SMA", "ETS", "Naive"):
+                assert np.allclose(values, values[0]), f"{name} is not a level model"

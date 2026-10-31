@@ -171,6 +171,13 @@ _MIN_SEASONAL_ACF = 0.3
 # where the series is noisy. A missed cycle leaves the forecast where it already was; a
 # fabricated one reshapes a purchase recommendation.
 _SEASONAL_ACF_Z = 2.50
+# A slope has to be distinguishable from no slope, and then big enough to be worth a
+# parameter. Both bars, for the same reason the seasonal ones are both there: on a short
+# noisy series a significant slope is easy to come by and usually says nothing about
+# next quarter. The drift bar is the slope carried across the whole window, against the
+# series' own mean — so "this item moved by at least a fifth of itself".
+_MIN_TREND_T = 2.0
+_MIN_TREND_DRIFT = 0.20
 # MAPE needs a non-zero actual to divide by. With fewer than this many across the whole
 # backtest the ranking would rest on one or two months, so RMSE decides instead — the
 # metric is reported either way rather than left to be assumed.
@@ -379,13 +386,17 @@ class Forecaster:
         if allow_croston is None:
             allow_croston = self._sparse_enough_for_croston(series)
 
+        # Each detected shape is offered *beside* the plain level model rather than
+        # replacing it, so it has to earn the parameters it costs. The detectors decide
+        # what to try; the backtest decides what is used. That is the one defence that
+        # holds when a detector is wrong, and both of these were: the seasonal one said
+        # yes to every item, and the trend one answered no on a clean upward ramp.
         candidates = [
-            ("ETS", lambda: self._fit_ets(series, trend, None, horizon)),
+            ("ETS", lambda: self._fit_ets(series, False, None, horizon)),
         ]
-        # Offered beside plain ETS rather than in place of it, so a detected cycle has
-        # to earn the parameters it costs. The detector decides what to try; the
-        # backtest decides what is used, which is the one defence that holds when the
-        # detector is wrong — and the detector it replaced was wrong on every item.
+        if trend:
+            candidates.append(
+                ("ETS-trend", lambda: self._fit_ets(series, True, None, horizon)))
         if period is not None:
             candidates.append(
                 (f"ETS-seasonal{period}",
@@ -803,16 +814,58 @@ class Forecaster:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _detect_trend(self, series: pd.Series) -> bool:
-        clean = series[series > 0]
-        if len(clean) < 4:
+        """
+        Whether the series is going somewhere: a least-squares slope, tested for
+        significance and then for materiality.
+
+        What this replaces answered a different question and got the common cases
+        backwards:
+
+            clean = series[series > 0]
+            return adfuller(clean, autolag="AIC")[1] > 0.05
+
+        `adfuller` with its default `regression="c"` tests for a unit root against a
+        stationary mean. A deterministic ramp has no unit root, so the test rejects and
+        the rule concluded *no trend* — on a perfectly straight climb it is worse than
+        that, because the regression is degenerate, `adfuller` returns NaN, and
+        `nan > 0.05` is False. A random walk has a unit root and no trend, and the rule
+        concluded the opposite. Measured on named cases: a clean up ramp came out
+        False, a down ramp True, a random walk True.
+
+        A growing item answered "no trend" gets a level-only ETS and is forecast flat,
+        which is the complaint this was found from. Dropping the zero periods first
+        made it worse again: it compresses the time axis, so an item declining towards
+        nothing has the evidence of the decline removed before the test sees it.
+
+        The slope is now measured directly, on every period, and has to clear two bars
+        for the same reason the seasonal one does — statistically distinguishable from
+        no slope (`_MIN_TREND_T`), and large enough to be worth a parameter
+        (`_MIN_TREND_DRIFT` of the series' own level across the window). Neither is
+        asked to be reliable on its own: `ETS-trend` is offered *beside* plain ETS, so
+        a slope read off a random walk loses the backtest instead of deciding it.
+        """
+        values = series.values.astype(float)
+        n = len(values)
+        if n < 4:
             return False
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                result = adfuller(clean, autolag="AIC")
-            return result[1] > 0.05
-        except Exception:
+        x = np.arange(n, dtype=float) - (n - 1) / 2.0
+        denom = float(np.dot(x, x))
+        level = float(np.mean(values))
+        if denom <= 0 or level <= 0:
             return False
+        slope = float(np.dot(x, values - level) / denom)
+        drift = abs(slope) * (n - 1)
+        if drift < _MIN_TREND_DRIFT * level:
+            return False
+        residual = values - (level + slope * x)
+        rss = float(np.dot(residual, residual))
+        if rss <= 0:
+            # A straight line with nothing left over. Materiality already passed, so
+            # this is a ramp rather than a flat series — the one case the unit-root
+            # test returned NaN on.
+            return True
+        se = np.sqrt(rss / (n - 2) / denom)
+        return bool(se > 0 and abs(slope) / se >= _MIN_TREND_T)
 
     def _seasonal_period(self, series: pd.Series):
         """

@@ -213,11 +213,20 @@ class TestThePublishedPlanIsScoredAgainstWhatSold:
     PERIODS = ["2026-01", "2026-02", "2026-03"]
 
     def _history(self, tmp_path, plan_rows, run_at="2026-01-01T00:00:00",
-                 name="snapshot_20260101_0000.json"):
+                 name="snapshot_20260101_0000.json", reviewed=True):
+        """
+        A snapshot as `SnapshotSaver` writes one. `reviewed` marks it as a plan the
+        business committed to — only those are scored, see
+        `TestOnlyACommittedPlanIsScored`.
+        """
         month = tmp_path / "2026-01"
         month.mkdir(parents=True, exist_ok=True)
         (month / name).write_text(
-            json.dumps({"run_at": run_at, "plan": plan_rows}), encoding="utf-8")
+            json.dumps({"run_at": run_at, "plan": plan_rows,
+                        "commitment": {"reviewed": reviewed,
+                                       "source": "worksheet.xlsx" if reviewed else "",
+                                       "adjustments_applied": 1 if reviewed else 0}}),
+            encoding="utf-8")
         return tmp_path
 
     def _plan(self, sku, qty):
@@ -345,3 +354,163 @@ class TestTheHealthBannerLeadsTheReport:
 
     def test_no_health_renders_no_banner(self):
         assert "class='health" not in self._page(None)
+
+
+class TestOnlyACommittedPlanIsScored:
+    """
+    Forecast accuracy is the plan the business signed up to against what then sold. It
+    used to be every snapshot on file against what then sold, and most snapshots are not
+    plans: a re-run, a parameter experiment, a developer trying something. Each of those
+    publishes a forecast nobody aligned on and nobody bought stock against, and scoring
+    it measures the model — which the forecaster's own backtest already does on held-out
+    history — and then reports the answer as a bias the business owns.
+
+    Worse, the de-duplication made it the *preferred* answer. Where two runs planned one
+    SKU and period the earliest was kept, correctly, as the number acted on; but applied
+    across all snapshots that meant a statistical run on the 1st displaced the reviewed
+    plan published on the 15th. The commitment was the one thing discarded.
+
+    It cannot be read off the plan rows. Per-row `forecast_source` marks only the lines
+    sales *changed*, so a line they read and agreed with reads `statistical`, exactly
+    like a line in a run nobody ever opened. The round trip is a property of the run.
+    """
+
+    PERIODS = ["2026-01", "2026-02"]
+
+    def _snapshot(self, root, qty, reviewed, run_at, name):
+        month = root / "2026-01"
+        month.mkdir(parents=True, exist_ok=True)
+        (month / name).write_text(json.dumps({
+            "run_at": run_at,
+            "plan": [{"sku": "A", "period": p, "forecast_qty": qty}
+                     for p in self.PERIODS],
+            "commitment": {"reviewed": reviewed, "source": "ws.xlsx" if reviewed else "",
+                           "adjustments_applied": 0},
+        }), encoding="utf-8")
+
+    def _actuals(self):
+        return pd.DataFrame({"A": [100.0, 100.0]}, index=self.PERIODS)
+
+    def test_a_statistical_run_is_not_scored(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._snapshot(root, 500.0, False, "2026-01-01T00:00:00", "snapshot_a.json")
+            out = build_forecast_accuracy(time_series=self._actuals(), history_root=root)
+            assert out.scored_periods == 0
+            assert "none was committed to" in out.reason
+
+    def test_the_reason_distinguishes_an_empty_store_from_an_unreviewed_one(self):
+        """Two different remedies. One message for both and nobody reads either."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = build_forecast_accuracy(time_series=self._actuals(),
+                                            history_root=Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._snapshot(root, 500.0, False, "2026-01-01T00:00:00", "snapshot_a.json")
+            unreviewed = build_forecast_accuracy(time_series=self._actuals(),
+                                                 history_root=root)
+        assert empty.reason != unreviewed.reason
+        assert "No earlier plan has been published" in empty.reason
+
+    def test_a_committed_plan_is_scored(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._snapshot(root, 150.0, True, "2026-01-01T00:00:00", "snapshot_a.json")
+            out = build_forecast_accuracy(time_series=self._actuals(), history_root=root)
+            assert out.scored_periods == 2
+            assert out.scored_skus == 1
+
+    def test_a_statistical_run_cannot_displace_a_committed_one(self):
+        """
+        The defect that made this matter. The statistical run is earlier, so keep-first
+        used to hand it the (sku, period) and throw the commitment away.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._snapshot(root, 500.0, False, "2026-01-01T00:00:00", "snapshot_a.json")
+            self._snapshot(root, 150.0, True, "2026-01-15T00:00:00", "snapshot_b.json")
+            out = build_forecast_accuracy(time_series=self._actuals(), history_root=root)
+            assert out.scored_periods == 2
+            planned = out.detail["forecast_qty"].unique().tolist()
+            assert planned == [150.0], f"scored the un-reviewed plan: {planned}"
+
+    def test_the_earliest_committed_plan_still_wins(self):
+        """Restricting to committed plans must not reverse the rule, only scope it."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._snapshot(root, 150.0, True, "2026-01-05T00:00:00", "snapshot_a.json")
+            self._snapshot(root, 900.0, True, "2026-01-20T00:00:00", "snapshot_b.json")
+            out = build_forecast_accuracy(time_series=self._actuals(), history_root=root)
+            assert out.detail["forecast_qty"].unique().tolist() == [150.0]
+
+    def test_a_snapshot_written_before_the_marker_existed_is_not_scored(self):
+        """No `commitment` key at all — every snapshot on file today. None was reviewed."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            month = root / "2026-01"
+            month.mkdir(parents=True)
+            (month / "snapshot_old.json").write_text(json.dumps({
+                "run_at": "2026-01-01T00:00:00",
+                "plan": [{"sku": "A", "period": "2026-01", "forecast_qty": 500.0}],
+            }), encoding="utf-8")
+            out = build_forecast_accuracy(time_series=self._actuals(), history_root=root)
+            assert out.scored_periods == 0
+
+
+class TestTheRunSaysWhetherItsPlanIsCommitted:
+    """
+    `apply_sales_plan` knows whether a reviewed worksheet reached the run — it returns
+    early when none did — and the snapshot used to throw that away, leaving the question
+    unanswerable later.
+
+    An empty worksheet is not the same as no worksheet: sales reading the sheet and
+    changing nothing is agreement, and the plan is committed.
+    """
+
+    def _detail(self):
+        return pd.DataFrame({"sku": ["A"], "period": ["2026-01"], "forecast_qty": [10.0]})
+
+    def test_no_worksheet_is_not_a_commitment(self):
+        from inventory_planning.analytics.sales_plan import apply_sales_plan
+        assert not apply_sales_plan(self._detail(), None).reviewed
+
+    def test_a_worksheet_that_changed_nothing_is_still_a_commitment(self):
+        from inventory_planning.analytics.sales_plan import SalesPlan, apply_sales_plan
+        empty = SalesPlan(adjustments=pd.DataFrame(
+            columns=["sku", "period", "reviewed_qty", "reviewed_by", "reason"]),
+            source="ws.xlsx")
+        result = apply_sales_plan(self._detail(), empty)
+        assert result.reviewed
+        assert result.applied == 0
+        assert result.source == "ws.xlsx"
+
+    def test_a_worksheet_that_changed_something_carries_its_reviewers(self):
+        from inventory_planning.analytics.sales_plan import SalesPlan, apply_sales_plan
+        plan = SalesPlan(adjustments=pd.DataFrame({
+            "sku": ["A"], "period": ["2026-01"], "reviewed_qty": [25.0],
+            "reviewed_by": ["pat"], "reason": ["promo"]}), source="ws.xlsx")
+        result = apply_sales_plan(self._detail(), plan)
+        assert result.reviewed and result.applied == 1
+        assert result.reviewers == ["pat"]
+
+    def test_the_snapshot_records_it(self):
+        from inventory_planning.feedback.snapshot import SnapshotSaver
+        from inventory_planning.analytics.sales_plan import SalesPlan, apply_sales_plan
+        plan = SalesPlan(adjustments=pd.DataFrame({
+            "sku": ["A"], "period": ["2026-01"], "reviewed_qty": [25.0],
+            "reviewed_by": ["pat"], "reason": ["promo"]}), source="ws.xlsx")
+        override = apply_sales_plan(self._detail(), plan)
+        got = SnapshotSaver._commitment({"sales_plan_override": override})
+        assert got["reviewed"] is True
+        assert got["source"] == "ws.xlsx"
+        assert got["reviewers"] == ["pat"]
+
+    def test_the_snapshot_records_its_absence(self):
+        from inventory_planning.feedback.snapshot import SnapshotSaver
+        assert SnapshotSaver._commitment({})["reviewed"] is False

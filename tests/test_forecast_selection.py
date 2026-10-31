@@ -29,7 +29,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from inventory_planning.analytics.forecaster import Forecaster
+from inventory_planning.analytics.forecaster import Forecaster, _MAX_DENSITY_FOR_CROSTON
 
 PERIODS = pd.period_range("2024-01", periods=22, freq="M")
 RAMP = list(np.arange(1, 23) * 10.0)
@@ -731,3 +731,69 @@ class TestARegularRhythmIsForecastAsOne:
         detail, _ = _run(quarterly)
         assert detail["forecast_qty"].sum() == pytest.approx(
             float(np.mean(quarterly)) * 6, rel=0.3)
+
+
+class TestTheMonthsBeforeAnItemExistedAreNotEvidence:
+    """
+    Density decided whether Croston is offered, and it was measured over the whole
+    extract. The months before an item's first sale are zeros that mean *not
+    applicable*, so reading them as "no demand" reads the length of the extract as
+    evidence about the item.
+
+    An item launched half-way through a 24-month history and selling every month since
+    has a true density of 1.0, measured 0.50, and was offered Croston — which then won,
+    and reported a continuously selling item as intermittent with a flat rate across the
+    horizon. The bias grows with the history: a 48-month extract and two years of
+    continuous sales still measured 0.50.
+
+    Only the leading run is excluded. Trailing zeros are evidence that an item may have
+    stopped, which is the question TSB exists to answer.
+    """
+
+    @staticmethod
+    def _launched(total, live, level=100.0):
+        values = np.concatenate([np.zeros(total - live), np.full(live, level)])
+        return pd.Series(values,
+                         index=pd.period_range("2023-01", periods=total, freq="M"))
+
+    @pytest.mark.parametrize("total,live", [(24, 12), (36, 16), (48, 24)])
+    def test_a_late_launch_is_not_read_as_intermittent_demand(self, total, live):
+        f = Forecaster(horizon=6)
+        series = self._launched(total, live)
+        assert f._density(series) == pytest.approx(1.0)
+        assert not f._sparse_enough_for_croston(series)
+        assert "Croston" not in f._candidates(series, 6)
+
+    def test_the_item_that_won_on_croston_before(self):
+        """24 months, selling the last 12 — Croston was offered and chosen."""
+        f = Forecaster(horizon=6)
+        rng = np.random.default_rng(5)
+        values = np.concatenate([np.zeros(12), np.clip(100 + 30 * rng.standard_normal(12), 1, None)])
+        series = pd.Series(values, index=pd.period_range("2023-01", periods=24, freq="M"))
+        model, _, _, _ = f._select_by_backtest(series)
+        assert model not in ("Croston", "TSB")
+
+    def test_trailing_quiet_still_counts(self):
+        """
+        An item that sold monthly and then stopped is sparse, and must stay so — that is
+        the case TSB is for, and excluding trailing zeros too would hide it.
+        """
+        f = Forecaster(horizon=6)
+        values = np.concatenate([np.full(10, 100.0), np.zeros(14)])
+        series = pd.Series(values, index=pd.period_range("2023-01", periods=24, freq="M"))
+        assert f._density(series) == pytest.approx(10 / 24)
+        assert f._sparse_enough_for_croston(series)
+
+    def test_a_genuinely_sporadic_item_is_unaffected(self):
+        """Gaps after the first sale are still gaps."""
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        assert f._density(series) < _MAX_DENSITY_FOR_CROSTON
+        assert f._sparse_enough_for_croston(series)
+
+    def test_density_ignores_only_the_leading_run(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([0.0, 0.0, 10.0, 0.0, 10.0, 10.0],
+                           index=pd.period_range("2023-01", periods=6, freq="M"))
+        # Four live periods from the first sale, three of them with demand.
+        assert f._density(series) == pytest.approx(3 / 4)

@@ -296,12 +296,39 @@ class Forecaster:
     # ── Choosing by competition ──────────────────────────────────────────────
 
     @staticmethod
-    def _dense_enough_for_arima(series: pd.Series) -> bool:
-        """Whether a series has enough demand in it for ARIMA to be about anything."""
-        return bool(float((series > 0).mean()) >= _MIN_DENSITY_FOR_ARIMA)
+    def _density(series: pd.Series) -> float:
+        """
+        The share of periods that carried demand, counted from the item's first sale.
 
-    @staticmethod
-    def _sparse_enough_for_croston(series: pd.Series) -> bool:
+        The months before an item existed are zeros that mean *not applicable*, and
+        reading them as "no demand" is reading the length of the extract as evidence
+        about the item. An item launched half-way through a 24-month history and selling
+        every month since has a true density of 1.0 and measures 0.50, which is how it
+        came to be offered Croston — and the longer the history, the worse the bias
+        gets. On 24 months with the last 12 continuous, Croston was offered and won.
+
+        Only the *leading* run is excluded. Trailing zeros are evidence: an item that
+        has gone quiet may have stopped, which is the question TSB exists to answer, so
+        they stay in.
+
+        This is the window Croston itself already works on — `_croston` starts its loop
+        at the first non-zero observation. The gate deciding whether to offer it now
+        measures over the same span the method would use.
+        """
+        values = series.values.astype(float)
+        nonzero = np.flatnonzero(values > 0)
+        if len(nonzero) == 0:
+            return 0.0
+        live = values[int(nonzero[0]):]
+        return float((live > 0).mean())
+
+    @classmethod
+    def _dense_enough_for_arima(cls, series: pd.Series) -> bool:
+        """Whether a series has enough demand in it for ARIMA to be about anything."""
+        return bool(cls._density(series) >= _MIN_DENSITY_FOR_ARIMA)
+
+    @classmethod
+    def _sparse_enough_for_croston(cls, series: pd.Series) -> bool:
         """
         Whether a series has gaps for an intermittent-demand method to be about.
 
@@ -310,7 +337,7 @@ class Forecaster:
         name, so all that is left to choose between them is which label the output
         carries.
         """
-        return bool(float((series > 0).mean()) < _MAX_DENSITY_FOR_CROSTON)
+        return bool(cls._density(series) < _MAX_DENSITY_FOR_CROSTON)
 
     def _candidates(self, series: pd.Series, horizon: int,
                     allow_arima: bool = None, allow_croston: bool = None) -> dict:

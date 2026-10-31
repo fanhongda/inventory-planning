@@ -1505,7 +1505,20 @@ class InventoryPlanner:
                 history_root=history_root(self.store_root),
                 stamp=self.run.run_id,
             )
-            print(f"  Snapshot saved:   {snapshot_path.name}")
+            # The whole path, not the filename. The store defaults to
+            # `~/.local/share/inventory-planning/store` on every platform — on Windows
+            # that is a directory nobody has reason to open — and the run printed the
+            # basename alone, so the only way to find a snapshot was to read the source.
+            # Asked where the snapshots were, the answer was that there weren't any.
+            print(f"  Snapshot saved:   {snapshot_path}")
+            committed = (results.get("sales_plan_override") is not None
+                         and getattr(results["sales_plan_override"], "reviewed", False))
+            print("                    "
+                  + ("committed — a reviewed worksheet was loaded, so this plan will be "
+                     "scored once its first period closes"
+                     if committed else
+                     "statistical only — no reviewed worksheet was loaded, so this plan "
+                     "is not scored for forecast accuracy"))
         except Exception as e:
             print(f"  Warning: snapshot save failed ({e})")
 

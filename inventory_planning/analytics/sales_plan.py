@@ -197,6 +197,21 @@ class OverrideResult:
     unmatched: List[str] = dc_field(default_factory=list)
     qty_before: float = 0.0
     qty_after: float = 0.0
+    # Whether a reviewed worksheet reached this run at all, and which one.
+    #
+    # Distinct from `applied`, and the distinction is the whole point. `applied` counts
+    # the lines sales *changed*; a line they read and agreed with is not among them, and
+    # per-row `forecast_source` records it as `statistical` — indistinguishable from a
+    # line in a run nobody ever opened. So "did this plan carry a commitment" cannot be
+    # recovered from the rows, only from whether the round trip happened, which is a
+    # property of the run.
+    #
+    # `feedback.snapshot` records it and `analytics.forecast_accuracy` scores on it: a
+    # statistical run is a forecast, and only a reviewed one is a plan the business
+    # committed to and can fairly be measured against.
+    reviewed: bool = False
+    source: str = ""
+    reviewers: List[str] = dc_field(default_factory=list)
 
     def summary(self) -> str:
         if not self.applied:
@@ -253,9 +268,14 @@ def apply_sales_plan(forecast_detail: pd.DataFrame,
     out["review_reason"] = ""
 
     if plan is None or not len(plan):
-        return OverrideResult(forecast_detail=out,
-                              qty_before=float(out["forecast_qty"].sum()),
-                              qty_after=float(out["forecast_qty"].sum()))
+        # An empty worksheet is not the same as no worksheet. Sales reading the sheet and
+        # changing nothing is agreement, and the plan is committed; no sheet at all means
+        # nobody looked. Both reach here, and only `plan is not None` separates them —
+        # which is why `reviewed` is set from that rather than from `applied`.
+        total = float(out["forecast_qty"].sum())
+        return OverrideResult(forecast_detail=out, qty_before=total, qty_after=total,
+                              reviewed=plan is not None,
+                              source=str(getattr(plan, "source", "") or ""))
 
     before = float(out["forecast_qty"].sum())
     key = out["sku"].astype(str) + "||" + out["period"].astype(str)
@@ -273,10 +293,15 @@ def apply_sales_plan(forecast_detail: pd.DataFrame,
         out.loc[hit, "review_reason"] = matched.map(lookup["reason"]).fillna("").values
 
     unmatched = sorted(plan.skus - set(out["sku"].astype(str)))
+    reviewers = sorted({str(v).strip() for v in adjustments.get("reviewed_by", [])
+                        if str(v).strip() and str(v).strip().lower() != "nan"})
     return OverrideResult(
         forecast_detail=out,
         applied=int(hit.sum()),
         unmatched=unmatched,
         qty_before=before,
         qty_after=float(out["forecast_qty"].sum()),
+        reviewed=True,
+        source=str(getattr(plan, "source", "") or ""),
+        reviewers=reviewers,
     )

@@ -29,7 +29,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from inventory_planning.analytics.forecaster import Forecaster
+from inventory_planning.analytics.forecaster import Forecaster, _MAX_DENSITY_FOR_CROSTON
 
 PERIODS = pd.period_range("2024-01", periods=22, freq="M")
 RAMP = list(np.arange(1, 23) * 10.0)
@@ -64,10 +64,26 @@ class TestTheHistoryDecidesWhetherThereIsACompetition:
         _, row = _run(LUMPY, "MTO")
         assert row["selected_by"].startswith("backtest")
 
-    def test_croston_still_wins_on_a_series_it_suits(self):
-        """Which is the point: it wins on merit rather than by being routed to."""
+    def test_an_intermittent_method_is_competitive_on_a_series_it_suits(self):
+        """
+        Asserted as *competitive* rather than as the winner, because on an intermittent
+        item it is not a two-horse race and never was — see
+        `TestTheRateModelsAllAnswerTheSameNumber`. Croston, TSB, SES, SMA and plain ETS
+        all estimate a rate, and on LUMPY they pool within 14% of each other with
+        forecasts between 16.4 and 20.4. Which name comes top is decided by sampling
+        noise across nine backtest points; asserting a particular one encodes the noise.
+
+        It was asserted that way because ETS could not fit at the time and so was never
+        among them. What the test is really for is that an intermittent-demand method
+        competes on merit instead of being routed to, which is what this checks.
+        """
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        offered = f._candidates(series, 6)
+        assert "Croston" in offered and "TSB" in offered
         _, row = _run(LUMPY, "MTO")
-        assert row["model_used"] == "Croston"
+        assert row["selected_by"].startswith("backtest")
+        assert row["forecast_qty"] == pytest.approx(float(np.mean(LUMPY)), rel=0.35)
 
     def test_a_ramp_is_not_forced_onto_croston_by_its_policy(self):
         """
@@ -99,16 +115,30 @@ class TestTheCompetitionPicksOnEvidence:
         The case the old router got right by luck and would have got wrong on a lumpy
         classification: a clean ramp needs a model that extrapolates, and the winner
         has to beat repeating last month by a distance.
+
+        Asserted as *not flat* rather than against a list of model names. The list was
+        `("ARIMA", "ETS")` and `ETS-trend` — added for exactly this case — is not in it,
+        so the test failed on the behaviour it exists to require. Which of the
+        extrapolating models wins is a close call that moves with the optimiser: this
+        passed locally and failed on all four CI legs. What the test is for is that the
+        forecast climbs.
         """
-        _, row = _run(RAMP, "MTS")
-        assert row["model_used"] in ("ARIMA", "ETS")
+        detail, row = _run(RAMP, "MTS")
+        qty = detail["forecast_qty"].tolist()
+        assert not np.allclose(qty, qty[0]), f"a clean ramp forecast flat: {qty}"
+        assert qty[-1] > qty[0]
+        assert row["forecast_qty"] > RAMP[-1] * 0.9
         assert row["vs_naive"] < 0.5
 
-    def test_intermittent_demand_still_lands_on_croston(self):
-        """Not by routing this time — by winning."""
+    def test_intermittent_demand_lands_on_a_rate_and_gets_there_by_competing(self):
+        """
+        Not by routing. The winner is whichever rate model scored best and they are all
+        within a couple of percent on this fixture, so what is asserted is the rate and
+        the route, not the name — see the sibling test above.
+        """
         _, row = _run(LUMPY, "MTS")
-        assert row["model_used"] == "Croston"
         assert row["selected_by"].startswith("backtest")
+        assert row["forecast_qty"] == pytest.approx(float(np.mean(LUMPY)), rel=0.35)
 
     def test_where_no_model_helps_the_naive_one_wins(self):
         """
@@ -520,8 +550,11 @@ class TestCrostonIsOnlyOfferedWhereThereAreGaps:
         of it — see `TestARegularRhythmIsForecastAsOne` — so the fixture here is one
         whose rhythm no season can describe.
         """
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        assert "Croston" in f._candidates(series, 6)
         _, row = _run(LUMPY)
-        assert row["model_used"] in ("Croston", "TSB")
+        assert row["forecast_qty"] == pytest.approx(float(np.mean(LUMPY)), rel=0.35)
 
 
 class TestHowOftenDemandArrivesDecidesThePatternFirst:
@@ -731,3 +764,169 @@ class TestARegularRhythmIsForecastAsOne:
         detail, _ = _run(quarterly)
         assert detail["forecast_qty"].sum() == pytest.approx(
             float(np.mean(quarterly)) * 6, rel=0.3)
+
+
+class TestTheMonthsBeforeAnItemExistedAreNotEvidence:
+    """
+    Density decided whether Croston is offered, and it was measured over the whole
+    extract. The months before an item's first sale are zeros that mean *not
+    applicable*, so reading them as "no demand" reads the length of the extract as
+    evidence about the item.
+
+    An item launched half-way through a 24-month history and selling every month since
+    has a true density of 1.0, measured 0.50, and was offered Croston — which then won,
+    and reported a continuously selling item as intermittent with a flat rate across the
+    horizon. The bias grows with the history: a 48-month extract and two years of
+    continuous sales still measured 0.50.
+
+    Only the leading run is excluded. Trailing zeros are evidence that an item may have
+    stopped, which is the question TSB exists to answer.
+    """
+
+    @staticmethod
+    def _launched(total, live, level=100.0):
+        values = np.concatenate([np.zeros(total - live), np.full(live, level)])
+        return pd.Series(values,
+                         index=pd.period_range("2023-01", periods=total, freq="M"))
+
+    @pytest.mark.parametrize("total,live", [(24, 12), (36, 16), (48, 24)])
+    def test_a_late_launch_is_not_read_as_intermittent_demand(self, total, live):
+        f = Forecaster(horizon=6)
+        series = self._launched(total, live)
+        assert f._density(series) == pytest.approx(1.0)
+        assert not f._sparse_enough_for_croston(series)
+        assert "Croston" not in f._candidates(series, 6)
+
+    def test_the_item_that_won_on_croston_before(self):
+        """24 months, selling the last 12 — Croston was offered and chosen."""
+        f = Forecaster(horizon=6)
+        rng = np.random.default_rng(5)
+        values = np.concatenate([np.zeros(12), np.clip(100 + 30 * rng.standard_normal(12), 1, None)])
+        series = pd.Series(values, index=pd.period_range("2023-01", periods=24, freq="M"))
+        model, _, _, _ = f._select_by_backtest(series)
+        assert model not in ("Croston", "TSB")
+
+    def test_trailing_quiet_still_counts(self):
+        """
+        An item that sold monthly and then stopped is sparse, and must stay so — that is
+        the case TSB is for, and excluding trailing zeros too would hide it.
+        """
+        f = Forecaster(horizon=6)
+        values = np.concatenate([np.full(10, 100.0), np.zeros(14)])
+        series = pd.Series(values, index=pd.period_range("2023-01", periods=24, freq="M"))
+        assert f._density(series) == pytest.approx(10 / 24)
+        assert f._sparse_enough_for_croston(series)
+
+    def test_a_genuinely_sporadic_item_is_unaffected(self):
+        """Gaps after the first sale are still gaps."""
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        assert f._density(series) < _MAX_DENSITY_FOR_CROSTON
+        assert f._sparse_enough_for_croston(series)
+
+    def test_density_ignores_only_the_leading_run(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([0.0, 0.0, 10.0, 0.0, 10.0, 10.0],
+                           index=pd.period_range("2023-01", periods=6, freq="M"))
+        # Four live periods from the first sale, three of them with demand.
+        assert f._density(series) == pytest.approx(3 / 4)
+
+
+class TestTheTrendIsMeasuredNotInferredFromAUnitRoot:
+    """
+    `_detect_trend` asked a unit-root test a question it does not answer:
+
+        clean = series[series > 0]
+        return adfuller(clean, autolag="AIC")[1] > 0.05
+
+    `adfuller` with its default `regression="c"` tests for a unit root against a
+    stationary mean. A deterministic ramp has no unit root, so the test rejects and the
+    rule concluded *no trend*; on a perfectly straight climb the regression is
+    degenerate, `adfuller` returns NaN, and `nan > 0.05` is False. A random walk has a
+    unit root and no trend, and the rule concluded the opposite. It fired on 60% of the
+    catalogue.
+
+    A growing item answered "no trend" gets a level-only ETS and is forecast flat,
+    which is the complaint this was found from. Dropping the zero periods first made it
+    worse: it compresses the time axis, so an item declining towards nothing has the
+    evidence of the decline removed before the test sees it.
+    """
+
+    @staticmethod
+    def _series(values):
+        return pd.Series(np.asarray(values, dtype=float),
+                         index=pd.period_range("2024-01", periods=len(values), freq="M"))
+
+    def test_a_clean_upward_ramp_has_a_trend(self):
+        """The case that returned NaN and was read as False."""
+        f = Forecaster(horizon=6)
+        assert f._detect_trend(self._series(np.arange(1, 25) * 10.0))
+
+    def test_a_decline_has_a_trend(self):
+        f = Forecaster(horizon=6)
+        assert f._detect_trend(self._series(np.arange(24, 0, -1) * 10.0))
+
+    def test_a_flat_series_has_none(self):
+        f = Forecaster(horizon=6)
+        assert not f._detect_trend(self._series(np.full(24, 100.0)))
+        noisy = 100 + 20 * np.random.default_rng(1).standard_normal(24)
+        assert not f._detect_trend(self._series(noisy))
+
+    def test_a_slope_too_small_to_matter_is_not_a_trend(self):
+        """Significant and material are different bars, and both have to clear."""
+        f = Forecaster(horizon=6)
+        barely = 100 + np.arange(24) * 0.05        # 1.2 across a level of 100
+        assert not f._detect_trend(self._series(barely))
+
+    def test_a_growing_item_is_not_forecast_flat(self):
+        """What the defect cost: the whole point of detecting a trend."""
+        detail, _ = _run(list(np.arange(1, 23) * 10.0))
+        qty = detail["forecast_qty"].tolist()
+        assert not np.allclose(qty, qty[0]), f"growing item forecast flat: {qty}"
+        assert qty[-1] > qty[0]
+
+    def test_a_trended_ets_is_offered_beside_the_plain_one(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in RAMP], index=PERIODS)
+        offered = f._candidates(series, 6)
+        assert "ETS" in offered and "ETS-trend" in offered
+
+    def test_no_trended_entrant_without_a_trend(self):
+        f = Forecaster(horizon=6)
+        noisy = 100 + 20 * np.random.default_rng(1).standard_normal(22)
+        assert "ETS-trend" not in f._candidates(self._series(noisy), 6)
+
+
+class TestTheRateModelsAllAnswerTheSameNumber:
+    """
+    Five of the seven entrants — Croston, TSB, SES, SMA and plain ETS — estimate a level
+    and repeat it across the horizon. On an item with no trend and no cycle that is not
+    a shortcut: the conditional mean of a stationary series is the same for t+1 and t+6,
+    so a forecast that wiggles is claiming to know which month will be high, and where
+    that knowledge is absent the wiggle costs accuracy rather than adding information.
+
+    Two alternatives were measured on the real extract and both lost. Laying Croston's
+    rate on the beat it already estimates scored MAE 89.06 against the flat 83.98 across
+    359 lumpy items. Recursing the moving average so it feeds its own forecasts back in
+    — which does make the horizon move — scored 369.32 against 358.62 over six months.
+
+    The consequence for a reader is that `model_used` on an intermittent item carries
+    much less information than its name suggests. This test pins that, so that a future
+    change making one of them win by a nose is not mistaken for a finding.
+    """
+
+    def test_they_agree_on_an_intermittent_item(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        offered = f._candidates(series, 6)
+        rates = {n: float(v[0]) for n, v in offered.items()
+                 if n in ("Croston", "TSB", "SES", "SMA", "ETS")}
+        assert len(rates) >= 4, f"expected the rate models in the pool, got {list(rates)}"
+        assert max(rates.values()) / min(rates.values()) < 1.5, rates
+
+    def test_each_of_them_repeats_across_the_horizon(self):
+        f = Forecaster(horizon=6)
+        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        for name, values in f._candidates(series, 6).items():
+            if name in ("Croston", "TSB", "SES", "SMA", "ETS", "Naive"):
+                assert np.allclose(values, values[0]), f"{name} is not a level model"

@@ -67,6 +67,27 @@ class SnapshotSaver:
             rows.append(entry)
         return rows
 
+    @staticmethod
+    def _commitment(results: dict) -> dict:
+        """
+        Whether a sales-reviewed worksheet reached this run, and which one.
+
+        Read from the `OverrideResult` the run already produced rather than re-derived:
+        a snapshot that works out for itself whether a review happened can disagree with
+        the plan it claims to describe.
+        """
+        override = results.get("sales_plan_override")
+        reviewed = bool(getattr(override, "reviewed", False))
+        return {
+            "reviewed": reviewed,
+            "source": str(getattr(override, "source", "") or ""),
+            "reviewers": list(getattr(override, "reviewers", []) or []),
+            # Lines sales changed. Zero with `reviewed` true means they read the sheet
+            # and agreed, which is a commitment; zero with `reviewed` false means
+            # nobody looked.
+            "adjustments_applied": int(getattr(override, "applied", 0) or 0),
+        }
+
     def save(self, results: dict, config: dict, output_dir: Path,
              history_root: Path = None, stamp: str = None) -> Path:
         """
@@ -158,6 +179,24 @@ class SnapshotSaver:
             # alone can only ever score the month that was already nearly certain.
             "as_of": str(results.get("as_of") or ""),
             "plan": self._published_plan(results),
+            # Whether this plan was committed to, or is only what the model said.
+            #
+            # `analytics.forecast_accuracy` scores published plans against what then
+            # sold, and it used to score every snapshot equally. Most snapshots are not
+            # plans: a statistical run — a re-run, a parameter experiment, a developer
+            # trying something — publishes a forecast that nobody aligned on and nobody
+            # bought stock against. Scoring those measures the model, which the
+            # forecaster's own backtest already does, and calls the result a forecast
+            # bias the business owns.
+            #
+            # It cannot be read off the rows. Per-row `forecast_source` marks only the
+            # lines sales *changed*; a line they read and agreed with says `statistical`,
+            # exactly like a line in a run nobody opened. The round trip is a property of
+            # the run, so it is recorded here, once, for the run.
+            #
+            # Absent on every snapshot written before this existed, which is the right
+            # answer for them: none of them went through a review.
+            "commitment": self._commitment(results),
             "config_snapshot": {
                 "cv_intermittent_threshold": config.get("cv_intermittent_threshold"),
                 "cv_erratic_threshold": config.get("cv_erratic_threshold"),

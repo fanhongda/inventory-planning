@@ -148,7 +148,7 @@ def build_forecast_accuracy(
     truth about what happened. `history_root` is where snapshots accumulate; each holds
     the plan its run published.
     """
-    plans, read = _load_plans(history_root, exclude_run)
+    plans, read, uncommitted = _load_plans(history_root, exclude_run)
     review = _review_frame(forecast_detail, attributes)
 
     if time_series is None or not len(time_series):
@@ -156,6 +156,23 @@ def build_forecast_accuracy(
             adjustments=review, plans_read=read, currency=currency,
             reason="No demand history in this run to compare a plan against.")
     if not len(plans):
+        # Said apart from the no-history case, because the remedy is different and a
+        # planner who sees "nothing to score" twice for two different reasons stops
+        # reading it. A store full of statistical runs is not an empty store.
+        if uncommitted:
+            return ForecastAccuracy(
+                adjustments=review, plans_read=read, currency=currency,
+                reason=(f"{uncommitted:,} earlier plan(s) are on file and none was "
+                        f"committed to, so there is nothing to score yet. Accuracy here "
+                        f"is the plan the business signed up to against what then sold: "
+                        f"a run whose forecast never went through the S&OP worksheet is "
+                        f"what the model said, not what anyone agreed to buy against, "
+                        f"and scoring it would report the model's error as the "
+                        f"business's forecast bias. Publish a plan with a reviewed "
+                        f"worksheet loaded and it will be scored once its first period "
+                        f"closes. The forecaster's own backtest is on every row of "
+                        f"`forecast_<run>.csv` meanwhile; it answers a different "
+                        f"question."))
         return ForecastAccuracy(
             adjustments=review, plans_read=read, currency=currency,
             reason=("No earlier plan has been published yet, so there is nothing to "
@@ -208,20 +225,35 @@ def build_forecast_accuracy(
 
 def _load_plans(history_root, exclude_run: str) -> tuple:
     """
-    Every plan an earlier run published, as one frame.
+    Every **committed** plan an earlier run published, as one frame.
 
-    Where two runs planned the same SKU and period, the **earlier** one is kept. That
-    is the number the business acted on: a plan republished a fortnight later with more
-    information is not the commitment anyone bought stock against, and scoring the
-    latest revision would flatter every forecast by measuring it after the fact.
+    Only runs whose forecast went through a sales-reviewed worksheet are scored. A
+    statistical run — a re-run, a parameter experiment, a developer trying something —
+    publishes a forecast nobody aligned on and nobody bought stock against. Scoring it
+    measures the model, which the forecaster's own backtest already does on held-out
+    history, and then presents the answer as a bias the business owns.
+
+    The flag is `commitment.reviewed`, written by `feedback.snapshot` from the run's
+    `OverrideResult`. It is not recoverable from the plan rows: per-row
+    `forecast_source` marks only the lines sales *changed*, so a line they read and
+    agreed with reads `statistical`, exactly like a line in a run nobody opened.
+
+    Where two committed runs planned the same SKU and period, the **earlier** one is
+    kept. That is the number the business acted on: a plan republished a fortnight later
+    with more information is not the commitment anyone bought stock against, and scoring
+    the latest revision would flatter every forecast by measuring it after the fact.
+    Restricting to committed plans first is what makes that rule mean what it says — it
+    used to be applied across all snapshots, so a statistical run published on the 1st
+    displaced the reviewed plan published on the 15th, and the commitment was the one
+    thing discarded.
     """
     if history_root is None:
-        return pd.DataFrame(), 0
+        return pd.DataFrame(), 0, 0
     root = Path(history_root)
     if not root.exists():
-        return pd.DataFrame(), 0
+        return pd.DataFrame(), 0, 0
 
-    rows, read = [], 0
+    rows, read, uncommitted = [], 0, 0
     for path in sorted(root.rglob("snapshot_*.json")):
         if exclude_run and exclude_run in path.name:
             continue
@@ -231,6 +263,9 @@ def _load_plans(history_root, exclude_run: str) -> tuple:
             continue
         plan = snapshot.get("plan") or []
         if not plan:
+            continue
+        if not (snapshot.get("commitment") or {}).get("reviewed"):
+            uncommitted += 1
             continue
         read += 1
         run_at = str(snapshot.get("run_at") or "")
@@ -243,9 +278,9 @@ def _load_plans(history_root, exclude_run: str) -> tuple:
                 "planned_at": run_at,
             })
     if not rows:
-        return pd.DataFrame(), read
+        return pd.DataFrame(), read, uncommitted
     frame = pd.DataFrame(rows).sort_values("planned_at")
-    return frame.drop_duplicates(["sku", "period"], keep="first"), read
+    return (frame.drop_duplicates(["sku", "period"], keep="first"), read, uncommitted)
 
 
 def _actual_frame(time_series: pd.DataFrame) -> pd.DataFrame:

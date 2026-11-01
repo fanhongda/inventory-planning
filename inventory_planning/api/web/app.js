@@ -9,12 +9,18 @@
 
 import { $, mount, el, api } from "/ui.js";
 import { mountReview } from "/review.js";
+import { mountSetup } from "/setup.js";
 import { mountBrowse } from "/browse.js";
 import { mountPolicy } from "/policy.js";
 import { mountResults } from "/results.js";
 import { mountItem } from "/item.js";
 
 const SCREENS = {
+  // First, and named for the question rather than for the files. The settings it
+  // shows were always reachable and were always skipped: on the policy screen a label
+  // that already had a value sat above a target that did not, in the same typeface,
+  // so the page read as configured rather than as asking.
+  setup: { label: "Setup", start: mountSetup },
   review: { label: "Import review", start: mountReview },
   browse: { label: "Stored facts", start: mountBrowse },
   policy: { label: "Policy & runs", start: mountPolicy },
@@ -97,7 +103,7 @@ function setupPanel(workspace, onDone) {
 }
 
 async function boot() {
-  const first = location.hash.slice(1) in SCREENS ? location.hash.slice(1) : "review";
+  let first = location.hash.slice(1) in SCREENS ? location.hash.slice(1) : "";
   try {
     const workspace = await api("/workspace");
     if (!workspace.ready) {
@@ -109,6 +115,24 @@ async function boot() {
   } catch (err) {
     // An older server has no /workspace. Carry on rather than refusing to start: the
     // screens have said what they cannot do for longer than this endpoint has existed.
+  }
+  if (!first) {
+    // Where a run that is not ready to be judged lands. Not a redirect the planner has
+    // to escape — a link they typed still wins — but the default has to be the screen
+    // that says what is missing, because the finding behind that screen is precisely
+    // that nobody goes looking for settings.
+    //
+    // Asked after the workspace check and not before: on a workspace with no config
+    // there is nothing for `/setup` to read, and the panel above is the answer to that
+    // case rather than a list of three things that cannot be stored yet.
+    first = "review";
+    try {
+      const state = await api("/setup");
+      if (state.blocked || !state.complete) first = "setup";
+    } catch (err) {
+      // An older server has no /setup. The import screen is the long-standing default
+      // and still works, so carry on rather than failing to boot over a tab.
+    }
   }
   $("#tabs").hidden = false;
   show(first);

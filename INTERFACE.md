@@ -398,6 +398,124 @@ decides nothing as the busiest one on the page.
 > is not a macro setting — it is a demand assertion, and it belongs in the S&OP
 > worksheet round-trip where sales sign for it.
 
+### M0 — Setup: what only the planner can say (2026-11-01)
+
+A screen that came out of a complaint about M2 rather than out of a missing feature.
+The complaint, in the user's words: *looking at this UI I have no desire to enter
+anything, and I don't feel any urgency*. That is a finding about the page, and the page
+turns out to deserve it.
+
+M2 is correct and it does not ask. It lists every scalar the engine reads, grouped by
+how often each is a planner's decision — `TARGET`, `CONVENTION`, `STRUCTURE`, `LABEL`,
+in that order, with the group opened when something in it is unset. All of that works.
+What defeats it is the typeface: `location_name` has a value and does not matter;
+`inventory_target_value` has no value and decides whether the run has an opinion at
+all. Rendered as two rows of one table they read as equally settled, and the eye
+goes to the rows with content. **Everything looks configured, so nothing looks asked** —
+and the two settings that most change what the run says were the two nobody had filled
+in since the screen was built.
+
+So M0 is not a prettier M2. It answers a different question, and it is the only screen
+whose question is about the planner rather than about the data: *of the things only you
+can know, which have you said?* Three, as of now:
+
+| | | Unset costs |
+|---|---|---|
+| **Warehouse locations** | what each storage-location code means | **blocks.** Quarantine summed into the position overstates it, so the run under-orders |
+| **Inventory cover target** | days of inventory the business intends to carry | a plan with no opinion about whether the plan is good |
+| **Service target** | CRSD on-time delivery the business commits to | the same, for service |
+
+Four decisions shape it, and each is the reason a more obvious version is worse:
+
+**The question is the heading, not the key name.** "What does each storage-location code
+mean?" is answerable by someone who has never read this repository.
+`location_status.json` is not, and a form whose labels are identifiers is a form only
+its author can fill in.
+
+**What the absence costs is stated beside it**, because that is the whole of why anyone
+stops and answers. "No frontier is computed, so the run has nothing to plan down to" is
+a consequence; "target — changes what is recommended" is a category, and M2 prints the
+category.
+
+**Settled items shrink.** The exact inversion of the page it sits above: what is
+answered gets one line and a badge, what is outstanding gets a card. A checklist whose
+completed rows are as loud as its open ones is a checklist nobody finishes.
+
+**It asks about the codes actually in front of the planner.** The location card reads
+the landed stock export and lists the codes it carries with the stock behind each.
+"Declare your storage locations" is a chore with no visible end; "02 holds 469 units and
+nothing says what it is" is a question with an answer, and the quantity is what makes it
+worth answering now.
+
+#### Only one of the three blocks, and that is a decision
+
+The temptation is to make all three required, because required is what produces the
+urgency that was missing. It is wrong, in both directions.
+
+An undeclared location code puts a wrong **number** in the position. The run refuses —
+in the interface and in a headless run alike, because the check lives in
+`consolidate_to_planning_grain` and not on the screen. A screen-only requirement is a
+suggestion with a modal in front of it.
+
+The two targets do not. `targets.json` says in as many words that null is not zero: no
+target stated means no frontier and no opinion, which is a legitimate state and
+sometimes the honest one. Stopping a first-time planner at the door over a question
+whose real answer is "we have not decided yet" teaches them that this screen is an
+obstacle to get past, and the next screen that asks them something will be got past the
+same way.
+
+The scoping of the blocking check matters for the same reason. **One location code, or
+none, needs no declaration** — there is nothing to separate, and the snapshot is the
+position by construction. A screen that demanded more than the run requires would be
+training planners to ignore it.
+
+#### The OTD target, and the objection it had to answer
+
+`targets.json` used to carry a block named `_not_here_yet` ruling this target out, and
+the reasoning was right: where request-date discipline is poor, OTD against the customer
+request date is met or missed by order entry rather than by the supply chain, so a
+target set against it measures whoever keys the orders.
+
+What makes it safe to ship now is not that the objection went away — it is that the
+objection has a consequence. `RequestDateQuality.is_trustworthy` already measured the
+discipline and the review already called the figure indicative below 70% clean. The
+review now **declines to score** the target there, and says what would have to be fixed
+first. A verdict a reader is told to discount is a verdict they will act on; a verdict
+the run refuses to issue, with the three counts behind the refusal, is a task.
+
+The same rule governs whether a setting may appear here at all, and it is
+`targets.json`'s own: *a key nothing reads is worse than a missing one — it reads as
+configured, and the first person to set it would be entitled to believe the run had
+taken it into account.* Every field on this screen landed with the thing that consumes
+it, in the same change.
+
+#### The target is stated in days
+
+`dioh_target_days` is the input and `inventory_target_value` is derived from it per run
+— days x daily cost of sales. Stating both is refused: they are one target in two units,
+and holding both lets them contradict with nothing to say which the run planned to.
+
+Days are the input rather than the money because a balance-sheet amount held fixed while
+cost and demand move underneath it quietly becomes a different amount of cover every
+month, which is the opposite of what anyone setting it meant. The currency figure is
+reported beside the days, recomputed each run, and labelled as derived. A planner whose
+target genuinely *is* an amount — a covenant, a board commitment — states that alone,
+and then nothing is derived.
+
+#### The editor
+
+Three editors now sit on `policy/edits.py`: the macro scalars, the rules, and the
+location map. The contract is identical and deliberately so — propose, read the diff,
+approve those bytes, with a reason and a name in the shared append-only log.
+
+The location map is a separate module rather than another `MacroSetting` because the
+shape differs. `macro.py` finds the one line a value sits on and replaces the value,
+which is what keeps a hand-maintained config file's prose and spacing intact. A map has
+no one line: declaring a code adds a row. `policy/locations.py` applies the same
+discipline to an object — locate the `statuses` block in the raw text and replace that
+span, leaving every other byte alone — because the diff is the thing being approved, and
+a two-line change arriving as a forty-line reformat cannot be reviewed.
+
 ### M3 — Browse the loaded data
 
 The request is CRUD. The store is append-only. Both are satisfiable, because the four

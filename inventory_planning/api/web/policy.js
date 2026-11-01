@@ -63,8 +63,13 @@ function valueField(s) {
 // in what is worth saying above the diff; they do not differ in the contract, and two
 // copies of a propose-then-approve loop would be two places for the Apply button to
 // stop carrying its basis.
-function changeForm({ endpoint, change, fields, describe, done, submit = "Show the diff",
-                      confirm = "Apply this change" }) {
+// Exported because the setup screen asks the same two questions about the same files
+// and must get the same answers. A second copy of propose-then-approve is a second
+// place for the Apply button to stop carrying its basis, which is the one property the
+// whole shape exists to hold.
+export function changeForm({ endpoint, change, fields, describe, done,
+                             submit = "Show the diff",
+                             confirm = "Apply this change" }) {
   const reason = el("input", { type: "text",
                                placeholder: "why — recorded with the change" });
   const by = el("input", { type: "text", placeholder: "who is making it" });

@@ -401,6 +401,19 @@ class Forecaster:
             candidates.append(
                 (f"ETS-seasonal{period}",
                  lambda: self._fit_ets(series, trend, period, horizon)))
+            # The multiplicative form MIT CTL section 3 actually specifies, beside the
+            # additive one the pool had. It refuses a series with a zero month, so on a
+            # sparse item it never appears.
+            #
+            # On the IN30 extract it is **inert**: never chosen, because that extract
+            # has no cycle at any lag, and the subset sweep scored every pair of subsets
+            # differing only by it identically to three decimal places. It is here for
+            # the history now being accumulated rather than for today's — a candidate
+            # that cannot be chosen cannot cost anything, and this is the one that
+            # starts earning as soon as a real season appears.
+            candidates.append(
+                (f"ETS-mul-seasonal{period}",
+                 lambda: self._fit_ets(series, trend, period, horizon, seasonal="mul")))
         if allow_arima:
             candidates.append(("ARIMA", lambda: self._fit_arima(series, horizon)))
         if allow_croston:
@@ -554,12 +567,19 @@ class Forecaster:
 
     # ── Smooth demand: ETS → ARIMA → SMA ─────────────────────────────────────
 
-    def _fit_ets(self, series: pd.Series, trend: bool, period=None, horizon: int = None):
+    def _fit_ets(self, series: pd.Series, trend: bool, period=None,
+                 horizon: int = None, seasonal: str = "add"):
         """
         `period` is the cycle length to fit a season for, or None for level and trend
         only. It used to be the pair (`seasonal: bool`, 12), so the one cycle this could
         ever fit was an annual one and the one history that could hold two of those was
         24 months long.
+
+        `seasonal` is "add" or "mul". MIT CTL section 3 specifies the multiplicative
+        form — `x / F` — on the grounds that a seasonal swing usually scales with the
+        level, and the pool fitted only the additive one. Multiplicative needs strictly
+        positive demand, so it is refused rather than patched where a zero month exists:
+        shifting the series to make it fit would change what is being modelled.
         """
         n = len(series)
         horizon = self.horizon if horizon is None else horizon
@@ -567,12 +587,14 @@ class Forecaster:
             return None
         if period is not None and n < 2 * period:
             return None
+        if period is not None and seasonal == "mul" and bool((series <= 0).any()):
+            return None
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = ExponentialSmoothing(
                 series,
                 trend="add" if trend else None,
-                seasonal="add" if period else None,
+                seasonal=seasonal if period else None,
                 seasonal_periods=period if period else None,
                 initialization_method="estimated",
             ).fit(optimized=True)

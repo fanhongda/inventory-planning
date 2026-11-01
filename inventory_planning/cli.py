@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from .ingest.location import warn_about_in_tree_adapters
+from .node import UndeclaredStockLocation
 from .orchestrator import InventoryPlanner
 
 
@@ -204,6 +205,30 @@ def _review(planner, policy, loaded) -> None:
 
 
 def main():
+    """
+    The entry point, and the one refusal worth catching here.
+
+    An undeclared storage location stops the run on purpose — summing quarantine into
+    the position under-orders, silently — and the message it carries is written to be
+    answered: it names the codes, the stock behind each, the file to put them in and
+    what each status does. Delivered as a traceback, none of that is read. The planner
+    sees a crash, and a tool that crashes is a tool that is broken rather than one
+    asking a question.
+
+    Scoped to that one exception rather than a blanket handler. Everything else that
+    reaches here is a defect, and a defect printed as a tidy message is a defect
+    nobody reports.
+    """
+    try:
+        return _main()
+    except UndeclaredStockLocation as refused:
+        print(f"\n  Refused — the stock snapshot cannot be read as a position.\n")
+        print(f"  {refused}".replace("\n", "\n  "))
+        print("\n  Nothing was written. Declare the codes and run this again.")
+        return 2
+
+
+def _main():
     args = build_parser().parse_args()
     if not args.setup and not args.inputs and not any(
             (args.sales, args.po_history, args.open_so, args.open_po, args.inventory)):
@@ -360,4 +385,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Through `sys.exit`, so `python -m inventory_planning.cli` reports what the
+    # console script reports. Without it a refusal returned 2 and the process exited
+    # 0 — and a scheduled run that declines to read the stock would be recorded as a
+    # run that succeeded, which is the one way a refusal can be worse than no check.
+    sys.exit(main())

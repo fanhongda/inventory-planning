@@ -98,6 +98,38 @@ class ShouldBeResult:
         return self.total_actual_value - self.total_should_be_value
 
     @property
+    def daily_cost_of_sales(self) -> float:
+        """
+        What the catalogue consumes per day, valued at cost.
+
+        The denominator a days-of-inventory target is converted through, and
+        value-weighted by construction: it is the sum of each SKU's daily demand at
+        that SKU's own cost, not an average of per-SKU DIOH figures. Averaging the
+        ratios would weight a slow-moving fastener the same as the item holding most
+        of the balance, which is the error `analytics/inventory_health.py` documents
+        at length for the reported figure and that applies identically here.
+        """
+        days = float(self.conventions.get("days_per_year", 365) or 365)
+        demand = pd.to_numeric(self.frame.get("demand_mean"), errors="coerce")
+        cost = pd.to_numeric(self.frame.get("unit_cost"), errors="coerce")
+        if demand is None or cost is None:
+            return 0.0
+        return float((demand.fillna(0.0) * 12.0 / days * cost.fillna(0.0)).sum())
+
+    def value_at_dioh(self, days: float) -> Optional[float]:
+        """
+        The balance a days-of-inventory target implies, in the reporting currency.
+
+        None where the catalogue consumes nothing valued — an unpriced or demandless
+        extract. Returning zero there would read as "hold no stock", which is a target
+        and a reachable one, so it must not be produced by an absence of data.
+        """
+        daily = self.daily_cost_of_sales
+        if not daily > 0:
+            return None
+        return float(days) * daily
+
+    @property
     def excess_value(self) -> float:
         """
         Capital tied up in SKUs that are over policy — the sum of positive gaps only.

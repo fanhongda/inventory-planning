@@ -229,7 +229,10 @@ class TestTheFirstRun:
 
         from inventory_planning import cli
 
-        body = inspect.getsource(cli.main)
+        # `_main` and not `main`: the entry point is a thin wrapper that catches the
+        # one refusal worth presenting as a sentence rather than as a traceback. The
+        # ordering this test is about is in the body it wraps.
+        body = inspect.getsource(cli._main)
         assert body.index("Workspace.resolve") < body.index("InventoryPlanner(")
 
 
@@ -315,7 +318,7 @@ class TestTheVisualReviewIsPartOfARun:
 
         from inventory_planning import cli
 
-        assert inspect.getsource(cli.main).count("_review(") == 2
+        assert inspect.getsource(cli._main).count("_review(") == 2
 
     def test_a_failure_there_does_not_fail_the_run(self, monkeypatch, tmp_path, capsys):
         """It runs last, after everything a planner acts on is already written."""

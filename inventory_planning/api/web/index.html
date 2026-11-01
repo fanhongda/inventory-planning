@@ -16,7 +16,21 @@
 <main>
 <div id="setup"></div>
 
-<div id="screen-review">
+<div id="screen-setup" hidden>
+  <p class="lede">
+    What a run needs from you, and what it has. These are the things only you can
+    know &mdash; what your location codes mean, and what the business is holding
+    itself to. <strong>Nothing here is measured from your data</strong>: every figure
+    on this page is one somebody stated, and the run is scored against them.
+  </p>
+  <div id="setup-body"></div>
+</div>
+
+<!-- Hidden like every other screen, and revealed by `show()`. It used to be the one
+     screen that started visible, which was harmless while it was also the only screen
+     anyone landed on; with a boot that can choose Setup instead, it meant the review
+     screen was painted and then replaced. -->
+<div id="screen-review" hidden>
   <p class="lede">
     Upload an export and see what it was read as. <strong>Nothing here enters a
     planning run</strong> — not until you say so.

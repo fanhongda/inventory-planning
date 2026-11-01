@@ -709,6 +709,180 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                                 key=lambda d: (not d["required"], d["doc_type"])),
         }
 
+    @app.get("/setup")
+    def setup() -> Dict[str, Any]:
+        """
+        What this run needs from the planner, and what it has.
+
+        The settings already existed and nobody filled them in, which is a design
+        finding rather than a user failing. `/policy/macro` lists every scalar the
+        engine reads, grouped by how often each is a decision — and then renders a
+        label that already has a value in the same typeface as a target that does not.
+        Everything looks configured, so nothing looks asked.
+
+        This endpoint answers a narrower question and is the one the screen leads with:
+        of the things only a planner can know, which have been said? Three, and they
+        are not interchangeable in how much their absence costs:
+
+          locations   **blocking.** An undeclared location code puts a wrong *number*
+                      in the position — quarantine stock summed into what can be sold,
+                      so the run under-orders. The run refuses rather than guesses.
+          dioh        a run without it still produces a plan; it produces one with no
+                      opinion about whether the plan is good.
+          otd         the same, for service rather than for stock.
+
+        The distinction is the whole reason this is not simply a required-fields list.
+        Blocking everything would stop a first-time planner at the door over two
+        questions whose honest answer is "we have not decided yet", and `targets.json`
+        says in as many words that null is a legitimate state. Blocking nothing leaves
+        the one setting that produces wrong arithmetic looking like a preference.
+        """
+        from ..policy import locations as location_edit
+        from ..policy import macro as macro_edit
+        from ..policy.target import StatedTargetError, stated_target
+
+        root = service.config_dir
+        items: List[Dict[str, Any]] = []
+
+        # ── The locations, and the codes actually in front of the planner ──
+        # Read from what has landed rather than asked in the abstract. "Declare your
+        # storage locations" is a chore; "02 holds 14,500 units and nothing says what
+        # it is" is a question with an answer, and the second is the one a planner can
+        # act on without leaving the screen.
+        declared = location_edit.current(root)
+        observed: List[Dict[str, Any]] = []
+        try:
+            landed = service.landed_documents()
+            inventory = landed.documents.get("inventory")
+            frame = getattr(inventory, "frame", None)
+            if frame is not None and "location_id" in frame.columns:
+                import pandas as _pd
+
+                codes = frame["location_id"].fillna("").astype(str).str.strip().str.upper()
+                qty = (_pd.to_numeric(frame.get("qty_on_hand"), errors="coerce")
+                       .fillna(0.0) if "qty_on_hand" in frame.columns
+                       else _pd.Series(0.0, index=frame.index))
+                for code in sorted(c for c in codes.unique() if c):
+                    rows = codes == code
+                    observed.append({
+                        "code": code,
+                        "rows": int(rows.sum()),
+                        "qty_on_hand": float(qty[rows].sum()),
+                        "status": declared["statuses"].get(code) or declared["wildcard"],
+                    })
+        except Exception:
+            # Never fails the screen. The declaration is answerable without the
+            # observed codes — they make it easier, not possible — and a setup page
+            # that errors because a landed file is malformed is a setup page nobody
+            # can use to fix the malformed file.
+            observed = []
+
+        undeclared = [o["code"] for o in observed if not o["status"]]
+        # One code needs no declaration: there is nothing to separate. This mirrors
+        # `consolidate_to_planning_grain` exactly, and it has to — a screen that asked
+        # for more than the run requires would be training planners to ignore it.
+        blocking_now = len(observed) > 1 and bool(undeclared)
+        items.append({
+            "key": "locations",
+            "title": "Warehouse locations",
+            "question": "What does each storage-location code mean?",
+            "why": ("Only sellable stock counts toward the position. Quarantine and "
+                    "blocked stock summed into it overstates what you have, so the "
+                    "run orders less than it should and nothing on the report says "
+                    "anything was assumed."),
+            "blocking": True,
+            "blocking_now": blocking_now,
+            "state": "set" if declared["declared"] else "missing",
+            "editor": "locations",
+            "file": declared["file"],
+            "detail": {**declared, "observed": observed, "undeclared": undeclared},
+        })
+
+        # ── The two targets ──
+        try:
+            stated = stated_target(root)
+            refusal = ""
+        except StatedTargetError as refused:
+            stated, refusal = None, str(refused)
+
+        def target_item(key, title, question, why, value, unit, note=""):
+            setting = macro_edit.BY_NAME.get(key)
+            items.append({
+                "key": key,
+                "title": title,
+                "question": question,
+                "why": why,
+                "blocking": False,
+                "blocking_now": False,
+                "state": "refused" if refusal else
+                         ("set" if value is not None else "missing"),
+                "editor": "macro",
+                "setting": key,
+                "file": setting.filename if setting else "targets.json",
+                "kind": setting.kind if setting else "number",
+                "value": value,
+                "unit": unit,
+                "impact": setting.impact if setting else "",
+                "note": refusal or note,
+            })
+
+        target_item(
+            "dioh_target_days", "Inventory cover target",
+            "How many days of inventory should the business carry?",
+            ("Without it the run reports what stock should be and offers no opinion "
+             "about what it must be — no frontier, no ordered set of moves, nothing "
+             "to plan down to. The currency figure is derived from this per run, so "
+             "the days are what you hold steady while cost and demand move."),
+            getattr(stated, "dioh_days", None), "days")
+
+        target_item(
+            "otd_target_crsd", "Service target (CRSD OTD)",
+            "What on-time delivery does the business commit to?",
+            ("Measured against the customer request date, which is the stricter of "
+             "the two baselines — the promise date was already renegotiated once. "
+             "Below 70% request-date discipline the review declines to score it "
+             "rather than turning an order-entry problem into a supply verdict."),
+            getattr(stated, "otd_target", None), "fraction",
+            note="0.95 is the shipped default, not a measurement of this business.")
+
+        outstanding = [i for i in items if i["state"] != "set"]
+        return {
+            "config_dir": str(root),
+            "items": items,
+            "set": len([i for i in items if i["state"] == "set"]),
+            "total": len(items),
+            "outstanding": len(outstanding),
+            "blocked": any(i["blocking_now"] for i in items),
+            "complete": not outstanding,
+        }
+
+    @app.put("/setup/locations")
+    def edit_locations(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Declare what the location codes mean — propose, then apply.
+
+        The same two-step contract as every other editor here: the proposal reports the
+        digest of the file it read, the apply quotes it back, and a file that moved in
+        between is a refusal rather than a surprise. See `policy/locations.py` for why
+        this is a separate editor from the macro scalars rather than another setting in
+        their registry.
+        """
+        from ..policy.locations import LocationError, apply as apply_locations, propose
+
+        statuses = payload.get("statuses")
+        if statuses is None:
+            raise HTTPException(status_code=400, detail="statuses is required")
+        try:
+            if not payload.get("apply"):
+                return propose(statuses, service.config_dir).as_dict()
+            return apply_locations(
+                statuses,
+                reason=payload.get("reason", ""), by=payload.get("by", ""),
+                basis=payload.get("basis", ""), config_dir=service.config_dir,
+            )
+        except LocationError as refused:
+            raise HTTPException(status_code=409, detail=str(refused))
+
     @app.get("/gates")
     def gates() -> Dict[str, Any]:
         """
@@ -1316,6 +1490,11 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                 # is derived whatever file it came out of.
                 "group": setting.group if setting else macro_edit.DERIVED,
                 "unset": setting is not None and setting.clearable and value is None,
+                # Whether a run is worth less for this being unset. The screen leads
+                # with these and counts them: sorting purely by group put a label that
+                # already had a value above a target that did not, so the settings
+                # already decided were the ones drawing the eye.
+                "asked_every_cycle": bool(setting and setting.asked_every_cycle),
             })
 
         try:
@@ -1359,13 +1538,23 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             stated = stated_target(root)
             note = ("" if stated else "no target stated — the run offers no opinion "
                                       "about what stock must be")
-            add("inventory_target_value", stated.value, "targets.json", note)
+            add("dioh_target_days", stated.dioh_days, "targets.json", note)
+            add("otd_target_crsd", stated.otd_target, "targets.json",
+                "" if stated.otd_target is not None else
+                "no service target stated — OTD is reported unscored")
+            # Shown as derived where the days are set, because that is what it is:
+            # stating both is refused, and a figure the planner cannot type is a figure
+            # the form must not present as an empty box waiting for them.
+            add("inventory_target_value", stated.value, "targets.json",
+                "derived per run from the days above — days x daily cost of sales"
+                if stated.dioh_days is not None else note)
             add("inventory_target_date",
                 stated.deadline.isoformat() if stated.deadline else None, "targets.json",
                 "planned without the burn-down limit" if stated.undated else "")
         except StatedTargetError as refused:
-            add("inventory_target_value", None, "targets.json", str(refused))
-            add("inventory_target_date", None, "targets.json", str(refused))
+            for key in ("dioh_target_days", "otd_target_crsd",
+                        "inventory_target_value", "inventory_target_date"):
+                add(key, None, "targets.json", str(refused))
 
         # Ordered by how often a planner has to decide, not by which file it lives in.
         # The file is the one dimension a reader does not care about, and sorting by it

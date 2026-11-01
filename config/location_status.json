@@ -1,0 +1,57 @@
+{
+  "_what_this_is": [
+    "What each storage-location code in your stock export means.",
+    "",
+    "A warehouse export is one row per SKU x storage location. `01` is usually",
+    "sellable stock, `02` is usually material under quality inspection, and other",
+    "codes are blocked, consignment or transfer staging. Nothing in the export says",
+    "so — the meaning of a location code is master data you hold and the ERP report",
+    "does not print.",
+    "",
+    "Only `sellable` nets into the planning position. Everything else is summed into",
+    "reported columns (`qty_quarantine`, `qty_blocked`, ...) so the stock stays",
+    "visible without being counted on."
+  ],
+
+  "_why_this_is_required": [
+    "Until this file existed the pipeline summed every location into one position.",
+    "That is wrong in one direction and it is the expensive one: quarantine stock",
+    "counted as available overstates the position, so the run orders *less* than it",
+    "should and the shortage arrives later, with no sign on the report that anything",
+    "was assumed.",
+    "",
+    "So there is no default. A snapshot carrying more than one location code with any",
+    "of them undeclared is refused, and the refusal names the codes and the quantity",
+    "sitting behind each one. A single-location snapshot needs nothing declared:",
+    "there is nothing to separate, and the snapshot is the position by construction."
+  ],
+
+  "_statuses": {
+    "sellable": "on hand and available to sell — nets into the planning position",
+    "quarantine": "under quality inspection — present, not available",
+    "blocked": "blocked stock — present, not available",
+    "consignment": "on site but not owned until consumed",
+    "in_transit_staging": "staged for a transfer, not available at this node"
+  },
+
+  "_the_wildcard": [
+    "\"*\": \"sellable\" declares every code sellable at once. It exists because a",
+    "bin-level export can carry dozens of codes that genuinely are all sellable, and",
+    "refusing to run until forty lines are typed gets the file filled in carelessly,",
+    "which is worse. It is reported on every run that uses it, so a blanket answer",
+    "stays visible as a blanket answer rather than passing for an inventory of codes.",
+    "",
+    "A code named explicitly wins over the wildcard, so `\"*\": \"sellable\"` plus",
+    "`\"02\": \"quarantine\"` is the common case: everything sellable except inspection."
+  ],
+
+  "_example": {
+    "statuses": {
+      "01": "sellable",
+      "02": "quarantine",
+      "05": "blocked"
+    }
+  },
+
+  "statuses": {}
+}

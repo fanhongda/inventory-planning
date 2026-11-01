@@ -28,7 +28,7 @@ from inventory_planning.cli import _target_date, build_parser  # noqa: E402
 from inventory_planning.policy import macro  # noqa: E402
 from inventory_planning.policy.macro import MacroError  # noqa: E402
 from inventory_planning.policy.target import (  # noqa: E402
-    StatedTarget, StatedTargetError, stated_target,
+    StatedTarget, StatedTargetError, resolve_stated_target, stated_target,
 )
 
 CONFIG_DIR = Path(__file__).parents[1] / "config"
@@ -147,7 +147,13 @@ class TestTheFormCanSetAndWithdrawIt:
         """
         _apply(config, "inventory_target_value", 5_000_000)
         raw = json.loads((config / "targets.json").read_text(encoding="utf-8"))
-        assert "_what_this_is" in raw and "_not_here_yet" in raw
+        # Asserted as a set rather than by naming two: the prose is what makes this
+        # file answerable without reading the source, and an edit that kept the value
+        # and dropped the explanation would pass a two-key check for as long as those
+        # two happened to survive.
+        prose = [k for k in raw if k.startswith("_")]
+        assert "_what_this_is" in prose
+        assert len(prose) >= 4, prose
 
 
 class TestTheCommandLine:
@@ -236,3 +242,131 @@ class TestTheSettingsAreGradedByWhoHasToDecide:
                 / "inventory_planning/api/web/policy.js").read_text(encoding="utf-8")
         named = [s.name for s in macro.SETTINGS if f'"{s.name}"' in page]
         assert named == [], f"settings named in the page: {named}"
+
+
+
+class _ShouldBeStub:
+    """
+    Stands in for `ShouldBeResult` in the conversion tests.
+
+    Only two members are used and building a real one needs a priced catalogue, a
+    lead-time table and a demand series — none of which this conversion depends on.
+    A stub keeps the test about the arithmetic it is named for.
+    """
+
+    def __init__(self, daily_cogs: float):
+        self.daily_cost_of_sales = daily_cogs
+
+    def value_at_dioh(self, days):
+        if not self.daily_cost_of_sales > 0:
+            return None
+        return float(days) * self.daily_cost_of_sales
+
+class TestTheBalanceTargetIsStatedInDays:
+    """
+    `dioh_target_days` is the input; the currency figure is derived per run.
+
+    The two are one target in two units — days x daily cost of sales — so the file is
+    not allowed to hold both. A balance-sheet amount held fixed while cost and demand
+    move underneath it quietly becomes a different amount of cover every month, which
+    is the opposite of what anyone setting it meant; days hold their meaning.
+    """
+
+    @staticmethod
+    def _targets(tmp_path, **keys):
+        (tmp_path / "targets.json").write_text(json.dumps(keys), encoding="utf-8")
+        return tmp_path
+
+    def test_days_are_read(self, tmp_path):
+        stated = stated_target(self._targets(tmp_path, dioh_target_days=45))
+        assert stated.dioh_days == 45.0
+        assert stated.value is None
+        assert stated.stated_in == "dioh_days"
+        assert bool(stated)
+
+    def test_stating_both_units_is_refused(self, tmp_path):
+        """
+        Nothing would say which one the run planned down to, and the report would
+        score against one while the frontier reached the other.
+        """
+        with pytest.raises(StatedTargetError, match="twice"):
+            stated_target(self._targets(tmp_path, dioh_target_days=45,
+                                        inventory_target_value=5_000_000))
+
+    def test_a_currency_target_alone_still_works(self, tmp_path):
+        """Kept for a target genuinely owned as a balance-sheet number."""
+        stated = stated_target(self._targets(tmp_path, inventory_target_value=5_000_000))
+        assert stated.value == 5_000_000.0
+        assert stated.dioh_days is None
+        assert stated.stated_in == "value"
+
+    def test_a_date_without_either_is_refused(self, tmp_path):
+        with pytest.raises(StatedTargetError, match="no balance"):
+            stated_target(self._targets(tmp_path, inventory_target_date="2026-12-31"))
+
+    def test_days_convert_through_the_run_not_the_file(self, tmp_path):
+        """
+        The conversion needs the catalogue: days x *this run's* daily cost of sales.
+        That is the reason it cannot be stored, and the reason days are the input.
+        """
+        should_be = _ShouldBeStub(daily_cogs=1_000.0)
+        stated = stated_target(self._targets(tmp_path, dioh_target_days=30))
+        value, note = resolve_stated_target(stated, should_be)
+        assert value == 30_000.0
+        assert "derived" in note
+
+    def test_no_cost_of_sales_computes_no_target(self, tmp_path):
+        """
+        Zero would read as "hold no stock", which is a target and a reachable one. An
+        absence of prices must not produce one.
+        """
+        stated = stated_target(self._targets(tmp_path, dioh_target_days=30))
+        value, note = resolve_stated_target(stated, _ShouldBeStub(daily_cogs=0.0))
+        assert value is None
+        assert "nothing to convert" in note
+
+    def test_a_currency_target_is_passed_through_unconverted(self, tmp_path):
+        stated = stated_target(self._targets(tmp_path, inventory_target_value=42.0))
+        value, note = resolve_stated_target(stated, _ShouldBeStub(daily_cogs=1_000.0))
+        assert value == 42.0
+        assert note is None
+
+
+class TestTheOTDTarget:
+    """
+    On-time delivery against the customer request date.
+
+    This target was absent on purpose for a long time, and the reason has not gone
+    away: where request-date discipline is poor the figure is decided by order entry
+    rather than by the supply chain. What makes it safe to state is the consequence —
+    the run declines to score it below the discipline threshold instead of scoring it
+    with a caveat attached.
+    """
+
+    @staticmethod
+    def _targets(tmp_path, **keys):
+        (tmp_path / "targets.json").write_text(json.dumps(keys), encoding="utf-8")
+        return tmp_path
+
+    def test_the_shipped_default_is_95_percent(self):
+        stated = stated_target(Path(__file__).parents[1] / "config")
+        assert stated.otd_target == 0.95
+
+    def test_a_percentage_typed_as_a_whole_number_is_refused(self, tmp_path):
+        """`95` would be a target no run could miss, reporting success for ever."""
+        with pytest.raises(StatedTargetError, match="fraction"):
+            stated_target(self._targets(tmp_path, otd_target_crsd=95))
+
+    def test_null_withdraws_it(self, tmp_path):
+        assert stated_target(self._targets(tmp_path, otd_target_crsd=None)).otd_target is None
+
+    def test_it_is_not_a_balance_target(self, tmp_path):
+        """
+        It enters no frontier. Stated because the two live in one file and one screen,
+        and a service commitment that started planning stock down would be a surprise
+        of the worst kind.
+        """
+        stated = stated_target(self._targets(tmp_path, otd_target_crsd=0.98))
+        assert not bool(stated)
+        value, _ = resolve_stated_target(stated, _ShouldBeStub(daily_cogs=1_000.0))
+        assert value is None

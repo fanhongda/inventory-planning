@@ -561,14 +561,45 @@ pooled points.
   work with. Needs `m`, the market potential, which no extract carries — a judgemental
   input, so it needs somewhere for a planner to state one before it needs code.
 
-### Two leads worth more than any of the above
+### Leads, including one withdrawn
 
-- **A flat 0.9x shrinkage of the level forecast beat every candidate tested** — 315.556
-  against a 320.111 baseline, the largest effect anyone measured here, and better than
-  `SBA` offered ungated (316.639), which is the same multiplication under a name that
-  claims to be about intermittence. **The pool systematically over-forecasts.** Diagnose
-  it — split held-out error into bias and spread per model — rather than shipping a
-  multiplier.
+- **The "systematic over-forecast" was ten items, and is withdrawn.** This entry used
+  to say that a flat 0.9x shrinkage of the level beat every candidate tested — 315.556
+  against a 320.111 baseline, the largest effect measured here — and that the pool
+  therefore over-forecasts and wants diagnosing. It was checked, and it does not.
+
+  The mean bias across 610 SKUs is `+70.72` units per SKU-month, which is what that
+  reading rested on. The **median is `+0.00`**, and **48% of items are over-forecast**:
+  a coin flip, which is what an unbiased forecast looks like. **Ten SKUs carry 47% of
+  all absolute bias**, and they are items whose demand moved in the held-out quarter by
+  amounts no model could anticipate — 57,994 to 42,982 a month, 12,294 to 3,503, 4,018
+  to 22, against 40 to 3,926 the other way. The largest movers happened to fall, so the
+  mean came out positive and a 10% haircut "helped". On a window where they rose it
+  would hurt by as much. Shrinkage was fitting one sample, not correcting a bias.
+
+  Three checks, in case this is proposed again: the held-out quarter is **+0.8%** on
+  aggregate demand against the 19 months before it, so it is not a low window; by model,
+  `Croston` is unbiased at `+1.06` while the concentration sits in `ARIMA` (+390) and
+  `SES` (+349), which are chosen for the largest and most volatile items; and per-SKU
+  median change over the same window is `-1.7%` against a mean of `+194%`, which is the
+  same heavy tail saying the same thing.
+
+  **The generalisable part is the mistake, not the result.** A mean over 610 items where
+  ten carry half the signal does not describe the catalogue, and this was read as if it
+  did — three times in one session, on three different quantities. `forecast_accuracy.py`
+  already argues the same thing in its own docstring and refuses to publish a weighted
+  average for it: *"a single accuracy number is a scoreboard, and a scoreboard closes a
+  discussion."* It is right, and it applies to diagnostics as much as to the report.
+
+- **What the concentration actually implies, and it is not a modelling change.** Half
+  the plan's error is a handful of large items moving 26% to 99% in a quarter. No
+  candidate model catches that; an item going from 4,018 a month to 22 is an event, not
+  a forecasting failure. What catches it is the review loop, and what measures it is the
+  per-item ranked accuracy report that already exists — `ForecastAccuracy.by_sku`,
+  ranked by value deviation with direction attached, built for exactly this. The thing
+  to do is get a committed plan through one S&OP cycle so that report has something to
+  score, which is already the open item under the snapshot work, not to add models.
+
 - **Measure through `_select_by_backtest`, never around it.** The first sweep
   reimplemented the chooser and reported `-4.70%` for a combination worth `-0.69%`,
   because the reimplementation ranked on MASE always where the real code ranks on MAPE

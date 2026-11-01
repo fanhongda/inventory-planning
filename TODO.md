@@ -477,95 +477,110 @@ manifest now records exactly that, so one is cheap. Not written.
   layer; this is one more reason it is the right one.
 - **Nothing checks that the documented outputs are the outputs.** See above.
 
-## Forecasting models: what was measured, and what to re-test (2026-11-01)
+## Forecasting models: six measured, none adopted (2026-11-01)
 
-Nine models from MIT CTL section 3 were checked against the pool, six candidates were
-measured on the IN30 extract, and two were kept. **The numbers below are the point of
-this entry** — without them the same six get re-derived from the same literature in a
-year, and the two that were rejected get rejected for the wrong reason or adopted for
-none.
+Nine models from MIT CTL section 3 and the intermittent-demand literature were checked
+against the pool. Six were implemented and measured. **None of them is in the pool**,
+and one thing was added that cannot be chosen yet. This entry exists so that nobody
+re-derives the same six from the same papers in a year and adopts them on the same
+reasoning that did not survive measurement here.
 
-### The measurement, and its noise floor
+### Read the noise floor first
 
 Method: select a model on the pipeline's own rolling backtest, then score *the chosen
-forecast* on three months held out of the selection entirely. 610 SKUs.
+forecast* on three months held out of the selection entirely. 610 SKUs of the IN30
+extract.
 
-    none of the three added          320.111     —
-    SBA                              320.085   -0.01%
-    ADIDA (quarterly buckets)        320.640   +0.17%
-    Cumulative                       318.532   -0.49%
-    SBA + ADIDA                      320.490   +0.12%
-    SBA + Cumulative                 318.804   -0.41%
-    ADIDA + Cumulative               317.606   -0.78%
-    SBA + ADIDA + Cumulative         317.907   -0.69%
-    all three, SBA offered ungated   316.639   -1.08%
+    same pool, scored at 4 backtest origins instead of 6     2.43%
 
-**Read the noise floor before reading the table.** The same pool scored at four folds
-instead of six moves **2.43%**, from nothing but which origins the backtest used. The
-whole table above spans 1.25%. No candidate's effect here is distinguishable from zero,
-so `SBA` and `Cumulative` are in the pool on the argument for them — a documented
-estimator bias and MIT naming the model — and not on these numbers. Anything that gets
-decided on a sub-1% difference on one three-month window is being decided by noise.
+That is the spread from nothing but which origins were used. Every candidate effect
+measured below is smaller than it. Nothing here was decided on these numbers alone, and
+nothing should be.
 
-An earlier sweep reported `-4.70%` for `SBA + ADIDA + Cumulative` and put `SBA` first in
-all ten best subsets. **That sweep had reimplemented the chooser** and diverged from it
-three ways: it ranked on MASE always where `_select_by_backtest` ranks on MAPE wherever
-the window holds no zero actual; it decided the ARIMA and Croston gates per fold where
-the real code decides them once per series; and it had no "no demand in the window,
-defer to TSB" branch. It was measuring a different selector. **Measure through
-`_select_by_backtest`, never around it** — that is the lesson worth more than the table.
+### At three origins, which is what ships
 
-### Rejected, and why it will not change with more data
+    neither                     318.019     —
+    SBA                         317.894   -0.04%
+    Cumulative                  319.615   +0.50%
+    SBA + Cumulative            319.635   +0.51%
 
-- **Holt's method with written-down constants** (+2.95%). The fitted version is already
-  in the pool as `ETS-trend`; more history makes the fitted one better, not the fixed
-  one. Does not need re-testing.
-- **The cumulative model's own argument against it.** It should get *worse* as history
-  lengthens, since the distant past becomes less relevant. It measured best of the three
-  on 22 months. That is a prediction against a measurement — re-test it, below.
+### At six origins, which does not
 
-### Rejected on today's data, and worth re-testing on more
+    none                        320.111     —
+    SBA                         320.085   -0.01%
+    ADIDA (quarterly buckets)   320.640   +0.17%
+    Cumulative                  318.532   -0.49%
+    ADIDA + Cumulative          317.606   -0.78%
+    SBA + ADIDA + Cumulative    317.907   -0.69%
+
+**`Cumulative` changes sign between the two tables** — helpful at six origins, harmful
+at three. That is the thin-pool argument measured directly: a candidate pays only when
+the chooser has enough evidence to tell whether it is paying, and three origins is nine
+pooled points.
+
+### Rejected, with the reason
+
+- **`SBA` (Syntetos-Boylan).** The bias it corrects is real and the correction is a flat
+  `1 - beta/2`, a 10% reduction. But **the dominant Croston over-forecast was the
+  `n_hat = 1.0` initialisation, and `_croston` already fixes it** — a quarterly item
+  used to come out 92% too high. Measured on the items Croston wins, its mean bias is
+  already only `+1.06`; the textbook 10% on top takes it to `-3.84`. The correction is
+  calibrated for an estimator this one is no longer. Tried three ways — as a rival
+  entrant, as a correction inside `_croston`, and not at all — and all three scored
+  within 0.05% of each other on MAE, so the bias is the only thing that distinguished
+  them.
+- **`Cumulative`** — MIT section 3's cumulative model. +0.50% at the shipping origin
+  count. Its own theory also says it should get *worse* as history lengthens, since the
+  distant past becomes less relevant, so it is unlikely to come back.
+- **`Holt-fixed`** — Holt's method with the constants asserted rather than fitted
+  (+2.95%). `ETS-trend` already fits the same two, and more history improves the fitted
+  one, not the written-down one. Will not change.
+- **Scaling the backtest origin count with history.** Built, measured, removed. The
+  argument is good — nine pooled points cannot rank nine candidates — but the measured
+  benefit was `320.391 -> 320.111`, **0.09%**, against **+60%** backtest cost (6.5 to
+  10.5 minutes per 30,000 SKUs). Not worth it at this history length. If the pool is ever
+  enlarged this is the prerequisite, and the arithmetic affords 11 origins at 22 months
+  and 25 at 36.
+
+### Worth re-testing on more data
 
 - **Damped trend (phi)** — MIT section 3 has it, and names it as the fix for Holt's on a
-  non-linear trend. It measured 0/10 in the best subsets and 5/5 in the worst, and
-  -0.04% in the first sweep. But trend fires on only 11% of this extract and the scoring
-  window is three months, which is where damping has least to offer. Re-test when a
-  substantial share of items has 36 months, scoring six steps out rather than three.
-- **ADIDA / temporal aggregation** (Nikolopoulos 2011) and **iMAPA** (Petropoulos and
-  Kourentzes 2015). The bucket width was assumed quarterly rather than chosen; iMAPA
-  combines across levels and was never implemented. Re-test together, with the level
-  selected per item.
-- **Multiplicative seasonality.** In the pool now as `ETS-mul-seasonal<m>` and **inert**
-  on this extract — never chosen, because there is no cycle at any lag. Both sweeps
-  agree on that. It is there for the history being accumulated, and the thing to check
-  is whether it ever wins once a real season exists.
-- **Bass diffusion** for a newly launched item, where no model in the pool has history
-  to work with. Needs `m`, the market potential, which no extract carries — it is a
-  judgemental input, so this needs a place for a planner to state one before it needs
-  code.
+  non-linear trend; the literature recommends it more strongly than anything else here.
+  It measured 0/10 in the best candidate subsets and 5/5 in the worst. But trend fires on
+  only 11% of this extract and the scoring window is three months, which is where
+  damping has least to offer. Re-test at 36 months, scoring six steps out.
+- **`ADIDA` / temporal aggregation** (Nikolopoulos 2011) and **iMAPA** (Petropoulos and
+  Kourentzes 2015). The bucket width was assumed quarterly rather than chosen per item,
+  and iMAPA — combining across aggregation levels — was never implemented.
+- **`ETS-mul-seasonal<m>`** is **in the pool now and inert**: never chosen, because this
+  extract has no cycle at any lag. MIT section 3 specifies the multiplicative form and
+  the pool only fitted the additive one, so it is there for the history being
+  accumulated. A candidate that cannot be chosen cannot cost anything. The thing to
+  check is whether it ever wins once a real season exists.
+- **Bass diffusion** for a newly launched item, where no model in the pool has history to
+  work with. Needs `m`, the market potential, which no extract carries — a judgemental
+  input, so it needs somewhere for a planner to state one before it needs code.
 
 ### Two leads worth more than any of the above
 
 - **A flat 0.9x shrinkage of the level forecast beat every candidate tested** — 315.556
-  against a baseline of 320.111, the largest effect anyone measured here, and larger
-  than offering `SBA` ungated (316.639) which is the same multiplication under a name
-  that claims to be about intermittence. That says the pool **systematically
-  over-forecasts**, and the thing to do is find out why rather than ship a magic
-  multiplier. Start by splitting the held-out error into bias and spread per model.
-- **The fold count is the lever, and its benefit is unproven.** `_fold_count` scales 3 to
-  `_BACKTEST_FOLDS_MAX` with available history, on the argument that nine pooled points
-  cannot rank nine candidates. Measured benefit on this extract: 320.391 to 320.111,
-  **0.09%, which is nothing**, against +60% backtest cost (6.5 to 10.5 minutes per
-  30,000 SKUs). It is in on the principle. The cap of six is where the measurement
-  stopped, not where the benefit did — the arithmetic affords 11 folds at 22 months and
-  25 at 36. Re-test the cap, and the cost, before raising it.
+  against a 320.111 baseline, the largest effect anyone measured here, and better than
+  `SBA` offered ungated (316.639), which is the same multiplication under a name that
+  claims to be about intermittence. **The pool systematically over-forecasts.** Diagnose
+  it — split held-out error into bias and spread per model — rather than shipping a
+  multiplier.
+- **Measure through `_select_by_backtest`, never around it.** The first sweep
+  reimplemented the chooser and reported `-4.70%` for a combination worth `-0.69%`,
+  because the reimplementation ranked on MASE always where the real code ranks on MAPE
+  wherever the window holds no zero actual, decided the ARIMA and Croston gates per fold
+  where the real code decides them once per series, and had no "no demand in the window,
+  defer to TSB" branch. A recommendation went out on that number before it was caught.
 
 ### Not diverging by accident
 
 MIT section 3's **MSE estimate via exponential smoothing** (`MSE_t = w(x_t - F_t)^2 +
-(1-w)MSE_{t-1}`) is not implemented, and that is deliberate: sigma-DL comes from the
-backtest error instead, which is out-of-sample where the smoothed MSE is in-sample. If
-anyone wonders later why the handbook formula is absent, this is why.
+(1-w)MSE_{t-1}`) is deliberately absent: sigma-DL comes from the backtest error, which is
+out-of-sample where the smoothed MSE is in-sample.
 
 ## Smaller items
 

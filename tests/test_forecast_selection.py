@@ -462,11 +462,10 @@ class TestIntermittentDemandIsScoredHonestly:
         describes the item. The window has measured nothing, and the run has to say so
         rather than take the answer.
         """
-        # Quiet across the whole backtest window, which is wider than it was: the fold
-        # count now scales with history, so the last two orders have to sit earlier than
-        # they did for the window to miss them. That the old fixture stopped deferring is
-        # the fold change working — a window of eighteen points caught the demand three
-        # folds had straddled.
+        # Quiet across the whole backtest window. The last two orders sit a month
+        # earlier than they first did: a wider window caught the demand the narrower one
+        # straddled, which was worth knowing — the deferral is a property of the window,
+        # not of the item — and the fixture now misses it at any origin count tried.
         bursty = [0, 0, 200, 180, 0, 0, 0, 0, 0, 0, 0,
                   0, 190, 210, 0, 0, 0, 0, 0, 0, 0, 0]
         _, row = _run(bursty)
@@ -968,120 +967,52 @@ class TestTheRateModelsAllAnswerTheSameNumber:
                 assert np.allclose(values, values[0]), f"{name} is not a level model"
 
 
-class TestTheChooserGetsMoreEvidenceAsHistoryAccumulates:
+class TestTheCandidatesThatWereMeasuredAndLeftOut:
     """
-    `_BACKTEST_FOLDS` was the constant 3, so the ranking rested on nine pooled points
-    however long the history was — and nine points cannot reliably rank nine candidates.
-    That is the winner's curse, and it was measurable on the real extract: six extra
-    candidates scored **2.4% worse** than none at three folds and **4.7% better** at
-    six. The candidates were never the problem; the evidence to choose between them was.
+    Six models from MIT CTL section 3 and the intermittent-demand literature were
+    measured against this pool and none of them is in it. The numbers are in TODO.md;
+    what is pinned here is the *absence*, with the reason, so that nobody adds them back
+    from the same reading of the same papers.
 
-    So this is the part of the forecaster that improves as the system is used, with
-    nobody deciding anything. A longer history buys the chooser more origins, which is
-    what makes a larger pool safe.
-    """
-
-    def test_a_short_history_keeps_the_old_fold_count(self):
-        f = Forecaster(horizon=6)
-        assert f._fold_count(15, 3) == 4
-        assert f._fold_count(12, 3) >= 3
-
-    def test_a_longer_history_buys_more_folds(self):
-        f = Forecaster(horizon=6)
-        assert f._fold_count(22, 3) == 6
-        assert f._fold_count(36, 3) == 6, "capped where the measurement stops"
-
-    def test_the_fold_count_never_falls_below_the_old_constant(self):
-        """A series barely long enough to backtest must still get a competition."""
-        f = Forecaster(horizon=6)
-        for n in range(12, 40):
-            assert f._fold_count(n, 3) >= 3
-
-    def test_the_earliest_training_window_stays_long_enough_to_fit_on(self):
-        """
-        The floor the fold count trades against: an origin below
-        `_MIN_BACKTEST_POINTS - steps` leaves a training window too short to fit, and
-        `_select_by_backtest` would drop the fold, so buying folds past that point buys
-        nothing.
-        """
-        f = Forecaster(horizon=6)
-        for n in range(15, 40):
-            folds = f._fold_count(n, 3)
-            assert n - 3 - folds + 1 >= 12 - 3
-
-
-class TestTheAdditionsThatEarnedTheirPlace:
-    """
-    Six candidates were measured against the IN30 extract by held-out error of the
-    *chosen* forecast, then every one of the 64 subsets was scored at six folds. Three
-    were kept.
-
-        baseline, no additions                 319.116
-        SBA + ADIDA + Cumulative               304.114   -4.70%
-        SBA + Cumulative                       304.982   -4.43%
-        SBA + ADIDA                            306.507   -3.95%
-
-    `SBA` was in all ten of the ten best subsets, `Cumulative` in eight, `ADIDA` in six.
-    `ETS-damped` was in none of them and in all five of the worst, so it is not here
-    despite being the one the literature recommends most strongly — on this data it does
-    not pay. `Holt-fixed` is not here either: the fitted version of Holt's method is
-    already in the pool as `ETS-trend`, and writing the constants down made it worse.
+    `SBA` is the one worth stating in code. Syntetos-Boylan corrects a real bias in
+    Croston's estimator and the correction is a flat `1 - beta/2`, a 10% reduction. But
+    **the dominant Croston over-forecast was the `n_hat = 1.0` initialisation, and
+    `_croston` already fixes it** — a quarterly item used to come out 92% too high.
+    Measured on the items Croston wins, its mean bias is already only `+1.06`; applying
+    the textbook 10% on top takes it to `-3.84`, a larger error in the other direction.
+    The correction is calibrated for an estimator this one is not.
     """
 
-    def test_sba_is_offered_wherever_croston_is(self):
-        """It is Croston with a known estimator bias removed, so it shares the gate."""
+    def test_no_second_croston_competes_with_croston(self):
         f = Forecaster(horizon=6)
         sparse = pd.Series([float(v) for v in LUMPY], index=PERIODS)
-        dense = pd.Series([100.0 + i for i in range(22)], index=PERIODS)
-        assert "SBA" in f._candidates(sparse, 6)
-        assert "SBA" not in f._candidates(dense, 6)
+        offered = set(f._candidates(sparse, 6))
+        assert "Croston" in offered
+        assert "SBA" not in offered, "see the class docstring: it over-corrects here"
 
-    def test_sba_is_croston_reduced_by_the_correction_factor(self):
-        f = Forecaster(horizon=6)
-        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
-        croston = f._croston(series, 6)[1]
-        assert f._sba(series, 6)[0] == pytest.approx(croston[0] * 0.9)
-
-    def test_the_correction_follows_the_smoothing_constant(self):
-        """A magic 0.9 would stop meaning anything the day beta is tuned."""
-        from inventory_planning.analytics import forecaster as mod
-        f = Forecaster(horizon=6)
-        series = pd.Series([float(v) for v in LUMPY], index=PERIODS)
-        original = mod._CROSTON_BETA
-        try:
-            mod._CROSTON_BETA = 0.4
-            assert f._sba(series, 6)[0] == pytest.approx(
-                f._croston(series, 6)[1][0] * 0.8)
-        finally:
-            mod._CROSTON_BETA = original
-
-    def test_cumulative_is_the_mean_of_everything(self):
-        f = Forecaster(horizon=6)
-        series = pd.Series([float(v) for v in RAMP], index=PERIODS)
-        assert f._cumulative(series, 6)[0] == pytest.approx(float(np.mean(RAMP)))
-
-    def test_cumulative_is_in_the_pool_for_any_series(self):
-        f = Forecaster(horizon=6)
-        offered = f._candidates(pd.Series([float(v) for v in RAMP], index=PERIODS), 6)
-        assert "Cumulative" in offered
-
-    def test_adida_is_not_in_the_pool(self):
+    def test_the_rejected_candidates_are_not_in_the_pool(self):
         """
-        Temporal aggregation was added on the strength of a sweep that turned out to be
-        scoring a different chooser, and came out at +0.17% through this one. It is in
-        TODO.md to be tried again with the aggregation level chosen rather than assumed.
+        `Cumulative` measured -0.49% at six backtest origins and **+0.50% at three**,
+        which is what ships — the sign flips with the amount of evidence the chooser
+        has, which is the whole reason a thin pool is kept thin. `ETS-damped` was 0/10
+        in the best candidate subsets and 5/5 in the worst. `Holt-fixed` is dominated by
+        `ETS-trend`, which fits the same two constants instead of asserting them.
+        `ADIDA` measured +0.17% on its own.
         """
         f = Forecaster(horizon=6)
         for values in (RAMP, LUMPY):
             series = pd.Series([float(v) for v in values], index=PERIODS)
-            assert "ADIDA" not in f._candidates(series, 6)
-
-    def test_the_rejected_candidates_are_not_in_the_pool(self):
-        f = Forecaster(horizon=6)
-        for series in (pd.Series([float(v) for v in RAMP], index=PERIODS),
-                       pd.Series([float(v) for v in LUMPY], index=PERIODS)):
             offered = set(f._candidates(series, 6))
-            assert not {"ETS-damped", "Holt-fixed"} & offered
+            assert not {"Cumulative", "ETS-damped", "Holt-fixed", "ADIDA"} & offered
+
+    def test_the_backtest_still_decides_on_three_origins(self):
+        """
+        Scaling the origin count with history was built, measured at 0.09% against +60%
+        backtest cost, and taken out again. Three origins is what the ranking rests on.
+        """
+        from inventory_planning.analytics import forecaster as mod
+        assert mod._BACKTEST_FOLDS == 3
+        assert not hasattr(Forecaster, "_fold_count")
 
 
 class TestTheMultiplicativeSeasonIsThereForDataNotYetCollected:

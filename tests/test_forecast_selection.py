@@ -140,13 +140,34 @@ class TestTheCompetitionPicksOnEvidence:
         assert row["selected_by"].startswith("backtest")
         assert row["forecast_qty"] == pytest.approx(float(np.mean(LUMPY)), rel=0.35)
 
-    def test_where_no_model_helps_the_naive_one_wins(self):
+    def test_flat_noisy_demand_lands_on_a_level_and_not_on_the_last_point(self):
         """
-        Flat demand with noise: there is nothing to model, and the honest answer is to
-        repeat the last observation rather than dress it up.
+        This asserted that Naive wins, on the grounds that flat noisy demand has
+        nothing to model and the honest answer is to repeat the last observation. The
+        second half of that is wrong, and `Cumulative` winning is what showed it: on a
+        flat series the mean of the history is a strictly better estimate of the level
+        than one period's observation, which carries that period's noise and nothing
+        else. The all-history mean is not a model dressing anything up — it is the
+        plainest level estimate there is.
+
+        So what the fixture actually demands is a level, and the test says that.
         """
         noisy = 100 + np.random.default_rng(0).normal(0, 5, 22)
-        _, row = _run(noisy, "MTS")
+        detail, row = _run(noisy, "MTS")
+        qty = detail["forecast_qty"].tolist()
+        assert np.allclose(qty, qty[0]), f"nothing here justifies a shape: {qty}"
+        assert row["forecast_qty"] == pytest.approx(100.0, abs=8)
+        assert row["model_used"] in ("Cumulative", "SES", "SMA", "ETS", "Naive")
+
+    def test_a_random_walk_lands_on_the_last_observation(self):
+        """
+        The case Naive is actually right for, and the one the fixture above was reaching
+        for. A random walk has no level to average towards — the best estimate of next
+        month is this month — so the pool has nothing to add and says so with
+        `vs_naive` at 1.0.
+        """
+        walk = np.clip(200 + np.cumsum(np.random.default_rng(1).normal(0, 12, 22)), 1, None)
+        _, row = _run(walk, "MTS")
         assert row["model_used"] == "Naive"
         assert row["vs_naive"] == 1.0
 
@@ -307,7 +328,12 @@ class TestTheModelIsPerSkuNotPerRun:
             ts, policy=pd.DataFrame({"sku": ["A"], "stocking_policy": ["MTS"]}))
         assert len(detail) == 6
         assert detail["model_used"].nunique() == 1
-        assert detail["model_used"].iloc[0] in ("ETS", "ARIMA", "SMA", "Croston", "Naive")
+        # Whichever model won, not a list of names — the pool gains entrants, and a
+        # hardcoded list turns that into a failure. What matters here is that one model
+        # is recorded for the whole horizon of one SKU.
+        f = Forecaster(horizon=6)
+        offered = set(f._candidates(pd.Series([float(v) for v in RAMP], index=PERIODS), 6))
+        assert detail["model_used"].iloc[0] in offered
 
 
 class TestVsNaive:
@@ -320,8 +346,13 @@ class TestVsNaive:
     """
 
     def test_one_means_no_model_beat_repeating_last_month(self):
-        noisy = 100 + np.random.default_rng(0).normal(0, 5, 22)
-        _, row = _run(noisy, "MTS")
+        """
+        A random walk, which is the series Naive is optimal for. This used flat noisy
+        demand, where the all-history mean beats the last observation — see
+        `test_flat_noisy_demand_lands_on_a_level_and_not_on_the_last_point`.
+        """
+        walk = np.clip(200 + np.cumsum(np.random.default_rng(1).normal(0, 12, 22)), 1, None)
+        _, row = _run(walk, "MTS")
         assert row["model_used"] == "Naive"
         assert row["vs_naive"] == 1.0
 
@@ -431,8 +462,12 @@ class TestIntermittentDemandIsScoredHonestly:
         describes the item. The window has measured nothing, and the run has to say so
         rather than take the answer.
         """
+        # Quiet across the whole backtest window. The last two orders sit a month
+        # earlier than they first did: a wider window caught the demand the narrower one
+        # straddled, which was worth knowing — the deferral is a property of the window,
+        # not of the item — and the fixture now misses it at any origin count tried.
         bursty = [0, 0, 200, 180, 0, 0, 0, 0, 0, 0, 0,
-                  0, 0, 190, 210, 0, 0, 0, 0, 0, 0, 0]
+                  0, 190, 210, 0, 0, 0, 0, 0, 0, 0, 0]
         _, row = _run(bursty)
         assert row["forecast_qty"] > 0
         assert "deferred to TSB" in row["selected_by"]
@@ -930,3 +965,103 @@ class TestTheRateModelsAllAnswerTheSameNumber:
         for name, values in f._candidates(series, 6).items():
             if name in ("Croston", "TSB", "SES", "SMA", "ETS", "Naive"):
                 assert np.allclose(values, values[0]), f"{name} is not a level model"
+
+
+class TestTheCandidatesThatWereMeasuredAndLeftOut:
+    """
+    Six models from MIT CTL section 3 and the intermittent-demand literature were
+    measured against this pool and none of them is in it. The numbers are in TODO.md;
+    what is pinned here is the *absence*, with the reason, so that nobody adds them back
+    from the same reading of the same papers.
+
+    `SBA` is the one worth stating in code. Syntetos-Boylan corrects a real bias in
+    Croston's estimator and the correction is a flat `1 - beta/2`, a 10% reduction. But
+    **the dominant Croston over-forecast was the `n_hat = 1.0` initialisation, and
+    `_croston` already fixes it** — a quarterly item used to come out 92% too high.
+    Measured on the items Croston wins, its mean bias is already only `+1.06`; applying
+    the textbook 10% on top takes it to `-3.84`, a larger error in the other direction.
+    The correction is calibrated for an estimator this one is not.
+    """
+
+    def test_no_second_croston_competes_with_croston(self):
+        f = Forecaster(horizon=6)
+        sparse = pd.Series([float(v) for v in LUMPY], index=PERIODS)
+        offered = set(f._candidates(sparse, 6))
+        assert "Croston" in offered
+        assert "SBA" not in offered, "see the class docstring: it over-corrects here"
+
+    def test_the_rejected_candidates_are_not_in_the_pool(self):
+        """
+        `Cumulative` measured -0.49% at six backtest origins and **+0.50% at three**,
+        which is what ships — the sign flips with the amount of evidence the chooser
+        has, which is the whole reason a thin pool is kept thin. `ETS-damped` was 0/10
+        in the best candidate subsets and 5/5 in the worst. `Holt-fixed` is dominated by
+        `ETS-trend`, which fits the same two constants instead of asserting them.
+        `ADIDA` measured +0.17% on its own.
+        """
+        f = Forecaster(horizon=6)
+        for values in (RAMP, LUMPY):
+            series = pd.Series([float(v) for v in values], index=PERIODS)
+            offered = set(f._candidates(series, 6))
+            assert not {"Cumulative", "ETS-damped", "Holt-fixed", "ADIDA"} & offered
+
+    def test_the_backtest_still_decides_on_three_origins(self):
+        """
+        Scaling the origin count with history was built, measured at 0.09% against +60%
+        backtest cost, and taken out again. Three origins is what the ranking rests on.
+        """
+        from inventory_planning.analytics import forecaster as mod
+        assert mod._BACKTEST_FOLDS == 3
+        assert not hasattr(Forecaster, "_fold_count")
+
+
+class TestTheMultiplicativeSeasonIsThereForDataNotYetCollected:
+    """
+    MIT CTL section 3 specifies the multiplicative seasonal form — `x / F` — on the
+    grounds that a seasonal swing usually scales with the level. The pool fitted only
+    the additive one.
+
+    On the IN30 extract this candidate is **inert**: never chosen, because that extract
+    has no cycle at any lag, and in the subset sweep every pair of subsets differing
+    only by it scored identically to three decimal places. It is in the pool for the
+    longer history now being accumulated — a candidate that cannot be chosen cannot cost
+    anything, and this is the one that starts earning as soon as a real season appears.
+    """
+
+    @staticmethod
+    def _wave(n, period, level=100.0, amp=60.0):
+        return pd.Series(level + amp * np.sin(2 * np.pi * np.arange(n) / period),
+                         index=pd.period_range("2022-01", periods=n, freq="M"))
+
+    def test_it_is_offered_beside_the_additive_one(self):
+        f = Forecaster(horizon=6)
+        offered = f._candidates(self._wave(36, 4), 6)
+        assert "ETS-seasonal4" in offered and "ETS-mul-seasonal4" in offered
+
+    def test_neither_is_offered_without_a_cycle(self):
+        f = Forecaster(horizon=6)
+        offered = set(f._candidates(pd.Series([float(v) for v in RAMP], index=PERIODS), 6))
+        assert not [n for n in offered if "seasonal" in n]
+
+    def test_it_refuses_a_series_with_an_empty_month(self):
+        """
+        Multiplicative needs strictly positive demand. Shifting the series to make it
+        fit would change what is being modelled, so it is refused instead — which is why
+        it never appears on a sparse item.
+        """
+        f = Forecaster(horizon=6)
+        wave = self._wave(36, 4)
+        wave.iloc[5] = 0.0
+        assert f._fit_ets(wave, False, 4, 6, seasonal="mul") is None
+        assert f._fit_ets(wave, False, 4, 6, seasonal="add") is not None
+
+    def test_it_tracks_a_cycle_whose_swing_scales_with_the_level(self):
+        """The case the multiplicative form exists for."""
+        f = Forecaster(horizon=6)
+        n = 36
+        level = 100 + np.arange(n) * 8.0
+        series = pd.Series(level * (1 + 0.5 * np.sin(2 * np.pi * np.arange(n) / 4)),
+                           index=pd.period_range("2022-01", periods=n, freq="M"))
+        got = f._fit_ets(series, True, 4, 6, seasonal="mul")
+        assert got is not None
+        assert not np.allclose(got, got[0])

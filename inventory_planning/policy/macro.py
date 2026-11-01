@@ -100,6 +100,19 @@ class MacroSetting:
     # cost of these settings is wildly uneven: `location_name` is a label and
     # `cycle_stock_basis` silently restates every should-be figure in the workbook.
     impact: str = ""
+    # Whether a run is worth less for this being unset. Not the same as `clearable`,
+    # which says whether "not set" is a legal state — a target is both: it may be
+    # cleared, and a run with no target still produces a plan, but it produces one with
+    # no opinion about whether the plan is good. The settings screen leads with these
+    # and counts them, because the previous arrangement sorted a label with a value
+    # above a target without one, and so showed the settings that were already decided
+    # as the ones demanding attention.
+    #
+    # Nothing here blocks a run. The one setting that does is the location status map,
+    # and it is not a scalar — see `node.load_stock_status`. The difference is what the
+    # absence costs: an undeclared location puts a wrong *number* in the position, and
+    # an unset target leaves a right number unjudged.
+    asked_every_cycle: bool = False
 
 
 SETTINGS: Tuple[MacroSetting, ...] = (
@@ -158,13 +171,35 @@ SETTINGS: Tuple[MacroSetting, ...] = (
     # figure is worked out; these decide what it ought to be, and move no figure at all
     # — they decide which actions the run recommends and whether it recommends any.
     MacroSetting(
+        "dioh_target_days", "targets.json", JSON, "number", group=TARGET, clearable=True,
+        asked_every_cycle=True,
+        note="target — how much cover the business intends to carry",
+        impact="days of inventory on hand for the whole catalogue, value-weighted. "
+               "This is the balance target: the currency figure is derived from it per "
+               "run — days x daily cost of sales — and the action frontier plans down "
+               "to that. Days are the input because a balance-sheet amount held fixed "
+               "while cost and demand move underneath it quietly becomes a different "
+               "amount of cover every month. Cleared, no frontier is computed and the "
+               "run offers no opinion about what stock must be"),
+    MacroSetting(
+        "otd_target_crsd", "targets.json", JSON, "number", group=TARGET, clearable=True,
+        asked_every_cycle=True,
+        note="target — the service level the business commits to, as a fraction",
+        impact="on-time delivery against the customer request date, which is the "
+               "stricter of the two baselines: the promise date was already "
+               "renegotiated once. The KPI review scores against it — and declines to "
+               "score where request-date discipline is below 70% clean, because below "
+               "that the figure is decided by order entry rather than by supply. "
+               "0.95, not 95. Cleared, OTD is reported unscored"),
+    MacroSetting(
         "inventory_target_value", "targets.json", JSON, "number", group=TARGET, clearable=True,
-        note="target — changes what is recommended, not what is measured",
-        impact="the balance to plan down to, in the reporting currency. Setting it "
-               "produces an ordered set of moves that reaches it — free and reversible "
-               "first, service last — and says what was deliberately not recommended. "
-               "Cleared, no frontier is computed and the run offers no opinion about "
-               "what stock must be"),
+        note="target — derived from the days above unless stated on its own",
+        impact="the balance to plan down to, in the reporting currency. Normally left "
+               "clear: with dioh_target_days set this figure is derived per run and "
+               "stating both is refused, because they are one target in two units and "
+               "nothing would say which the run planned to. State it alone only where "
+               "the amount itself is what was promised — a covenant, a board "
+               "commitment — and then nothing is derived"),
     MacroSetting(
         "inventory_target_date", "targets.json", JSON, "text", group=TARGET, clearable=True,
         note="target — what bounds the burn-down",

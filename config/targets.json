@@ -13,25 +13,27 @@
     "person uses."
   ],
 
-  "_not_here_yet": [
-    "Inventory turnover and an on-time-delivery target belong beside the one below and",
-    "are deliberately absent rather than stubbed. A key nothing reads is worse than a",
-    "missing one: it reads as configured, and the first person to set it would be",
-    "entitled to believe the run had taken it into account.",
+  "_the_balance_target_is_stated_in_days": [
+    "`dioh_target_days` is the balance target, and `inventory_target_value` is derived",
+    "from it per run — days × the catalogue's daily cost of sales. They are one target",
+    "in two units, so stating both is refused: nothing would say which the run planned",
+    "down to, and the report would score against one while the plan reached the other.",
     "",
-    "OTD in particular is not ready to be a target. The KPI review already refuses to",
-    "score one: where request-date discipline is poor it says so and declines, because a",
-    "target set against a number half of whose lines carry a date nobody meant is a",
-    "target met or missed by order entry. It is a measuring stick first, and the",
-    "attribution — how much of the gap stock could close at all — comes before any",
-    "number here."
+    "Days are the input and the currency figure is the output, not the other way round.",
+    "A balance-sheet amount held fixed while cost and demand move underneath it quietly",
+    "becomes a different amount of cover every month — which is the opposite of what",
+    "anyone setting it meant. Days hold their meaning; the money figure is reported",
+    "beside them, recomputed each run, and labelled as derived.",
+    "",
+    "`inventory_target_value` can still be stated on its own, and then nothing is",
+    "derived. It is kept for a target genuinely owned as a balance-sheet number — a",
+    "covenant, a board commitment — where the amount is the thing that was promised."
   ],
 
   "_how_the_target_is_used": [
-    "`inventory_target_value` is a balance-sheet figure in the reporting currency, and",
-    "it produces an ordered set of actions rather than a number: free and reversible",
-    "first (stop buying, push out inbound), then recurring cost, then service. What was",
-    "deliberately not recommended is part of the output.",
+    "The balance target produces an ordered set of actions rather than a number: free",
+    "and reversible first (stop buying, push out inbound), then recurring cost, then",
+    "service. What was deliberately not recommended is part of the output.",
     "",
     "`inventory_target_date` is what makes it honest. Excess stock converts to cash only",
     "as fast as demand consumes it, so a SKU with 300 days of cover cannot contribute",
@@ -40,11 +42,32 @@
     "larger reduction than the calendar can deliver; the frontier says so where it",
     "applies.",
     "",
-    "Both may be null. Null is not zero: no target is stated, no frontier is computed,",
-    "and the run reports what stock should be without an opinion about what it must be.",
-    "A target of 0 is a target."
+    "All of these may be null. Null is not zero: no target is stated, no frontier is",
+    "computed, and the run reports what stock should be without an opinion about what it",
+    "must be. A target of 0 is a target."
   ],
 
+  "_otd_is_scored_only_where_it_can_be": [
+    "`otd_target_crsd` is on-time delivery against the customer *request* date — the",
+    "stricter of the two baselines, because measuring against the promise date flatters",
+    "performance: the promise was already renegotiated once.",
+    "",
+    "This target used to be deliberately absent, and the reason it was absent has not",
+    "gone away: where request-date discipline is poor, a target set against this number",
+    "is met or missed by order entry rather than by the supply chain. Lines with no",
+    "request date, lines where the request date equals the order date ('as soon as",
+    "possible', unwinnable by construction) and lines already past due when raised are",
+    "each counted, and below 70% clean the run reports the figure as indicative and",
+    "**declines to score it against this target** rather than scoring it anyway.",
+    "",
+    "So the target is safe to state: it cannot turn a data-entry problem into a",
+    "supply-chain verdict. 0.95 is the shipped default — a stated convention, not a",
+    "measurement of this business — and it is what a distribution centre is usually",
+    "held to. Null withdraws the target and the OTD figure is reported unscored."
+  ],
+
+  "dioh_target_days": null,
   "inventory_target_value": null,
-  "inventory_target_date": null
+  "inventory_target_date": null,
+  "otd_target_crsd": 0.95
 }

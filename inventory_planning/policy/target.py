@@ -56,14 +56,29 @@ class StatedTarget:
     value: Optional[float] = None
     deadline: Optional[date] = None
     source: str = "not stated"
+    # Days of inventory on hand. The *primary* way the balance target is stated, with
+    # `value` derived from it per run — see `dioh_days` below.
+    dioh_days: Optional[float] = None
+    # Customer-request-date on-time delivery. Not a balance target and it enters no
+    # frontier: it is what the service figure is scored against.
+    otd_target: Optional[float] = None
 
     def __bool__(self) -> bool:
-        return self.value is not None
+        return self.value is not None or self.dioh_days is not None
 
     @property
     def undated(self) -> bool:
         """A target with no deadline: planned, but without the burn-down limit."""
-        return self.value is not None and self.deadline is None
+        return bool(self) and self.deadline is None
+
+    @property
+    def stated_in(self) -> Optional[str]:
+        """Which unit the planner stated the balance target in, if they stated one."""
+        if self.dioh_days is not None:
+            return "dioh_days"
+        if self.value is not None:
+            return "value"
+        return None
 
 
 def stated_target(config_dir: Union[str, Path, None]) -> StatedTarget:
@@ -91,21 +106,100 @@ def stated_target(config_dir: Union[str, Path, None]) -> StatedTarget:
         raise StatedTargetError(f"{path} could not be read: {exc}") from exc
 
     value, deadline = raw.get("inventory_target_value"), raw.get("inventory_target_date")
-    if value is None:
+    dioh = _as_number(raw.get("dioh_target_days"), "dioh_target_days", path, floor=0.0)
+    otd = _as_number(raw.get("otd_target_crsd"), "otd_target_crsd", path,
+                     floor=0.0, ceiling=1.0)
+
+    # One balance target, in one unit. DIOH days and a currency amount are the same
+    # target expressed two ways — days x daily cost of sales — so accepting both as
+    # inputs lets them disagree, and the run would then plan down to one while the
+    # report scored against the other. Neither is more correct, so the file is not
+    # allowed to say both and the planner is told which one to clear.
+    if dioh is not None and value is not None:
+        raise StatedTargetError(
+            f"{path} states the balance target twice: dioh_target_days ({dioh}) and "
+            f"inventory_target_value ({value}). They are one target in two units — "
+            f"days x daily cost of sales — so holding both lets them contradict, with "
+            f"nothing to say which the run planned to. Keep dioh_target_days, which is "
+            f"the unit a planner holds steady while cost and demand move underneath "
+            f"it, and clear inventory_target_value; the currency figure is then derived "
+            f"per run and reported beside it.")
+
+    if value is None and dioh is None:
         if deadline is not None:
             raise StatedTargetError(
-                f"{path} gives inventory_target_date ({deadline}) but no "
-                f"inventory_target_value. A date on its own plans nothing, and "
-                f"ignoring it would hide a target somebody meant to set. Give a value, "
-                f"or clear the date too — to withdraw a target, clear the date first "
-                f"and the value second, since the state in between is this one.")
-        return StatedTarget(source=str(path))
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                f"{path} gives inventory_target_date ({deadline}) but no balance "
+                f"target. A date on its own plans nothing, and ignoring it would hide "
+                f"a target somebody meant to set. Give dioh_target_days, or clear the "
+                f"date too — to withdraw a target, clear the date first and the target "
+                f"second, since the state in between is this one.")
+        return StatedTarget(source=str(path), otd_target=otd)
+    if value is not None and (isinstance(value, bool)
+                              or not isinstance(value, (int, float))):
         raise StatedTargetError(
             f"{path}: inventory_target_value must be a number in the reporting "
             f"currency — {value!r} is not.")
-    return StatedTarget(value=float(value), deadline=_as_date(deadline, path),
-                        source=str(path))
+    return StatedTarget(value=float(value) if value is not None else None,
+                        deadline=_as_date(deadline, path), source=str(path),
+                        dioh_days=dioh, otd_target=otd)
+
+
+def resolve_stated_target(stated: StatedTarget, should_be) -> Tuple[Optional[float],
+                                                                      Optional[str]]:
+    """
+    The currency figure the frontier plans to, from however the planner stated it.
+
+    A days-of-inventory target is converted here and nowhere else, because the
+    conversion needs the run: days x daily cost of sales, and the daily cost of sales
+    is a property of this catalogue at these costs. That is also the reason DIOH is the
+    unit the planner states and the currency figure is derived rather than the other
+    way round — a balance-sheet number held fixed while cost and demand move under it
+    silently becomes a different amount of cover every month, which is the opposite of
+    what anyone setting it meant.
+
+    Returns `(value, note)`. The note is for the planner and says which way round the
+    two figures were worked out, so the report never shows a derived number in a place
+    a stated one would sit without saying so.
+    """
+    if stated.dioh_days is None:
+        return stated.value, None
+    value = should_be.value_at_dioh(stated.dioh_days) if should_be is not None else None
+    if value is None:
+        return None, (
+            f"    dioh_target_days is {stated.dioh_days:g} and no frontier was "
+            f"computed: the catalogue's daily cost of sales is zero, so there is "
+            f"nothing to convert the days through. Prices or demand are missing, not "
+            f"the target.")
+    return value, (
+        f"    target stated as {stated.dioh_days:g} days of inventory — "
+        f"${value:,.0f} at this run's daily cost of sales "
+        f"(${should_be.daily_cost_of_sales:,.0f}/day). The currency figure is derived; "
+        f"it moves with cost and demand while the days do not.")
+
+
+def _as_number(raw: Any, key: str, path: Path, floor: float = None,
+               ceiling: float = None) -> Optional[float]:
+    """
+    One numeric target, or None where none is stated.
+
+    Refused rather than coerced, and bounded. `otd_target_crsd: 95` is the shape this
+    catches: a percentage typed where a fraction is read would set a target of 9,500%,
+    which no run could miss, so the figure would report success for ever.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise StatedTargetError(f"{path}: {key} must be a number — {raw!r} is not.")
+    number = float(raw)
+    if floor is not None and number < floor:
+        raise StatedTargetError(f"{path}: {key} must be at least {floor} — "
+                                f"{number} is not.")
+    if ceiling is not None and number > ceiling:
+        raise StatedTargetError(
+            f"{path}: {key} must be between {floor} and {ceiling} — {number} is not. "
+            f"A service level is a fraction, so 95% is 0.95; {number} would be a "
+            f"target no run could miss and the figure would report success for ever.")
+    return number
 
 
 def _as_date(raw: Any, path: Path) -> Optional[date]:

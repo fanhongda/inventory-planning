@@ -266,6 +266,12 @@ class KPIReport:
         frontier=None,
         fx=None,
         service_target: float = None,
+        # The stated OTD commitment from `config/targets.json`, against the customer
+        # request date. Distinct from `service_target`, which is the modal cycle
+        # service level the safety stock is sized on — a different measure of a
+        # different thing, and the two are not interchangeable. See `_otd_verdict`.
+        otd_target: float = None,
+        dioh_target: float = None,
         attributes=None,
         recommendations=None,
         open_po=None,
@@ -289,7 +295,7 @@ class KPIReport:
             self._kpi_row(service, should_be, forward),
             self._currency_note(fx),
             self._chapter_past(service, should_be, ordering, cadence, service_target,
-                               attributes, inventory_health),
+                               attributes, inventory_health, otd_target, dioh_target),
             self._chapter_future(forward, frontier, recommendations, open_po,
                                  attributes, suggestions, siop, accuracy),
             self._footer(as_of),
@@ -448,15 +454,21 @@ class KPIReport:
 
     def _chapter_past(self, service, should_be, ordering, cadence=None,
                       service_target=None, attributes=None,
-                      inventory_health=None) -> str:
+                      inventory_health=None, otd_target=None,
+                      dioh_target=None) -> str:
         parts = ["<h2>Chapter 1 · What happened</h2><hr class='chapter-rule'>"]
         parts.append(self._service_section(service, attributes))
-        parts.append(self._otd_trend_section(service, service_target))
+        parts.append(self._otd_verdict(service, otd_target))
+        # The stated target is the line drawn, where one is stated. The modal cycle
+        # service level stands in otherwise — it is what the stock was sized for, which
+        # is the nearest thing to a commitment the run can infer when nobody has made
+        # one, and it is labelled as inferred in the chart.
+        parts.append(self._otd_trend_section(service, otd_target or service_target))
         parts.append(self._inventory_section(should_be))
         # Directly after the position, because it is the same stock read a second way:
         # the section above says how much there is against policy, this one says how
         # long it lasts and which of it is not moving.
-        parts.append(self._dioh_section(inventory_health))
+        parts.append(self._dioh_section(inventory_health, dioh_target))
         parts.append(self._ordering_section(ordering))
         parts.append(self._cadence_section(cadence))
         return "".join(parts)
@@ -780,6 +792,58 @@ class KPIReport:
         return "".join(out)
 
     # ── Service over time ────────────────────────────────────────────────────
+
+    def _otd_verdict(self, service, target: float = None) -> str:
+        """
+        OTD against the target the business stated — or a statement of why not.
+
+        This target was deliberately absent from `targets.json` for a long time and the
+        reason has not gone away: where request-date discipline is poor, a target set
+        against this number is met or missed by order entry, not by the supply chain.
+        `RequestDateQuality.is_trustworthy` already measures that, and the figure is
+        already reported as indicative below its threshold. What was missing was the
+        consequence — so the target is not scored there, rather than scored anyway with
+        a caveat beside it.
+
+        Declining to score is the whole point of this section. A verdict a planner is
+        told to discount is a verdict they will act on; one the run refuses to issue,
+        naming what would have to be fixed first, is a task.
+        """
+        if service is None or target is None:
+            return ""
+        clean = service.otd_line_rate_clean
+        quality = service.quality
+        if not quality.is_trustworthy:
+            return (
+                "<h3>OTD against target</h3>"
+                "<div class='card'><div class='callout crit'>"
+                f"<strong>Not scored against the {_pct(target, 0)} target.</strong> "
+                f"Only {_pct(quality.clean_rate, 0)} of lines carry a request date that "
+                f"reflects a real requirement, so this figure is currently decided by "
+                f"order-entry practice rather than by supply performance — a target set "
+                f"against it would be met or missed by whoever keys the orders. "
+                f"Fix the request dates and the target starts scoring itself: "
+                f"{quality.missing:,} lines have none, {quality.same_as_order_date:,} "
+                f"carry the order date (that is &lsquo;as soon as possible&rsquo;, not a "
+                f"requirement), and {quality.before_order_date:,} were already past due "
+                f"when raised.</div></div>"
+            )
+        if not np.isfinite(clean):
+            return ""
+        gap = clean - target
+        met = gap >= 0
+        tone, word = ("ok", "met") if met else ("warn", "missed")
+        return (
+            "<h3>OTD against target</h3>"
+            "<div class='card'>"
+            f"<div class='callout {tone}'><strong>{_pct(clean)} against a "
+            f"{_pct(target, 0)} target — {word} by {abs(gap):.1%}.</strong> "
+            f"Measured on the {quality.clean:,} lines whose request date represents a "
+            f"real requirement ({_pct(quality.clean_rate, 0)} of the book), against the "
+            f"customer request date rather than the promise date — the promise was "
+            f"already renegotiated once, so scoring against it flatters the result."
+            f"</div></div>"
+        )
 
     def _otd_trend_section(self, service, target: float = None) -> str:
         """
@@ -1696,10 +1760,42 @@ class KPIReport:
             + review
         )
 
-    def _dioh_section(self, health) -> str:
+    def _dioh_verdict(self, health, target: float = None) -> str:
+        """
+        The catalogue's days on hand against the stated target.
+
+        Days rather than the currency amount, because days are what was stated: the
+        money figure is derived from them per run — days x daily cost of sales — and
+        showing the derived number as the headline would invite a comparison against a
+        balance that moves whenever cost or demand does.
+        """
+        if target is None or health is None:
+            return ""
+        actual = health.overall_dioh
+        if not np.isfinite(actual):
+            return ("<div class='callout warn'>Days on hand are not measurable against "
+                    f"the {_num(target)}-day target: the catalogue's daily cost of sales "
+                    "is zero, so there is nothing to divide the stock by. Prices or "
+                    "demand are missing, not the target.</div>")
+        over = actual - target
+        tone = "ok" if over <= 0 else "warn"
+        word = "under" if over <= 0 else "over"
+        implied = target * health.total_daily_cogs
+        return (
+            f"<div class='callout {tone}'><strong>{_num(actual)} days on hand against a "
+            f"{_num(target)}-day target — {_num(abs(over))} days {word}.</strong> "
+            f"Value-weighted: {_money(health.total_value)} of stock over "
+            f"{_money(health.total_daily_cogs)} a day at cost. The target implies a "
+            f"balance of {_money(implied)} at this run's run rate, which is what the "
+            f"action frontier plans down to — a derived figure, not a stated one, and "
+            f"it moves with cost and demand while the days do not.</div>"
+        )
+
+    def _dioh_section(self, health, target: float = None) -> str:
         """Days on hand by product line, and the two tails worth acting on."""
         if health is None or not len(getattr(health, "by_family", [])):
             return ""
+        verdict = self._dioh_verdict(health, target)
         rows = []
         for _, row in health.by_family.head(12).iterrows():
             dioh = row["dioh"]
@@ -1745,6 +1841,10 @@ class KPIReport:
 
         return (
             "<h3>Days on hand by product line</h3>"
+            # The catalogue against its target leads, the breakdown follows. A planner
+            # holding a DIOH commitment opens this section to find out whether they are
+            # meeting it, and a table of twelve product lines makes them add up.
+            + verdict +
             "<div class='scroll'><table>"
             "<thead><tr><th>Product line</th><th class='n'>SKUs</th>"
             "<th class='n'>Stock value</th><th class='n'>DIOH</th>"

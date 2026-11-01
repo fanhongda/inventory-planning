@@ -12,6 +12,8 @@ Tests for two changes that alter what the pipeline recommends.
    the forecast and the realizable backlog due inside the horizon.
 """
 
+import json
+import shutil
 import sys
 from datetime import date
 from pathlib import Path
@@ -29,6 +31,7 @@ from inventory_planning.readers.inventory_reader import (
     consolidate_to_planning_grain,
 )
 from inventory_planning.readers.open_so_reader import OpenSOReader
+from inventory_planning.node import StockStatusMap, UndeclaredStockLocation
 
 CONFIG_DIR = Path(__file__).parents[1] / "config"
 
@@ -62,42 +65,195 @@ def safety_stock_frame():
 # ── 1. Grain ─────────────────────────────────────────────────────────────────
 
 
-class TestInventoryGrain:
+@pytest.fixture
+def declared():
+    """`01` sellable, `02` quality quarantine — what the planner knows and the export does not."""
+    return StockStatusMap(statuses={"01": "sellable", "02": "quarantine"},
+                          source="test")
 
-    def test_collapses_to_one_row_per_sku(self, two_location_inventory):
-        out = consolidate_to_planning_grain(two_location_inventory, "DC-01", verbose=False)
+
+@pytest.fixture
+def config_with_statuses(tmp_path):
+    """
+    A config directory with the location statuses declared.
+
+    `InventoryReader` loads the declaration itself, so a test that builds one cannot
+    inject the map — and pointing it at the repository's own `config/` gives it the
+    shipped file, which declares nothing on purpose. Copying the directory is also the
+    shape a planner's own config has, which is what these tests are standing in for.
+    """
+    target = tmp_path / "config"
+    shutil.copytree(CONFIG_DIR, target)
+    (target / "location_status.json").write_text(
+        json.dumps({"statuses": {"01": "sellable", "02": "quarantine"}}),
+        encoding="utf-8",
+    )
+    return target
+
+
+class TestInventoryGrain:
+    """
+    Two questions, and they used to be answered as one.
+
+    *Is a SKU one planning row?* Yes — that is what the collapse is for, and the
+    fan-out it prevents is the whole reason this class exists.
+
+    *Does every location count toward the position?* No, and the collapse used to say
+    yes by summing them. SKU-A here holds 20 sellable units in `01` and 500 under
+    inspection in `02`, and a position of 520 is not merely imprecise: it is the figure
+    the reorder point is compared against, so the run sees a well-stocked item, orders
+    nothing, and the shortage lands later with nothing on the report admitting that 500
+    units of the cover could not be sold. The assertion that used to read `== 520.0` is
+    the defect, written as a test.
+    """
+
+    def test_collapses_to_one_row_per_sku(self, two_location_inventory, declared):
+        out = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                            verbose=False, stock_status=declared)
         assert len(out) == 2
         assert not out["sku"].duplicated().any()
 
-    def test_quantities_are_summed_across_locations(self, two_location_inventory):
-        out = consolidate_to_planning_grain(two_location_inventory, "DC-01", verbose=False)
+    def test_sellable_quantities_are_summed_across_locations(self, declared):
+        """Within one status the sum is still the answer — two bins, one position."""
+        two_sellable = pd.DataFrame({
+            "sku": ["SKU-A", "SKU-A"],
+            "location_id": ["01", "03"],
+            "qty_on_hand": [20.0, 30.0],
+            "unit_cost": [12.0, 12.0],
+        })
+        statuses = StockStatusMap(statuses={"01": "sellable", "03": "sellable"},
+                                  source="test")
+        out = consolidate_to_planning_grain(two_sellable, "DC-01", verbose=False,
+                                            stock_status=statuses)
+        assert out["qty_on_hand"].iloc[0] == 50.0
+        assert out["qty_not_sellable"].iloc[0] == 0.0
+
+    def test_quarantine_is_withheld_from_the_position(self, two_location_inventory,
+                                                      declared):
+        """
+        The defect this replaces asserted 520.0 — 20 sellable plus 500 under
+        inspection, summed into the number the reorder point is checked against.
+        """
+        out = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                            verbose=False, stock_status=declared)
+        row = out[out["sku"] == "SKU-A"].iloc[0]
+        assert row["qty_on_hand"] == 20.0
+        assert row["qty_quarantine"] == 500.0
+        assert row["qty_not_sellable"] == 500.0
+        assert row["stock_locations_excluded"] == "02"
+        # Still visible as having been there: withheld is not discarded.
+        assert row["stock_locations"] == "01,02"
+
+    def test_inbound_on_a_quarantine_row_still_counts(self, declared):
+        """
+        Goods in transit are not in a storage location at all, so an inbound quantity
+        reported on a row coded `02` has not been quarantined — it has not arrived.
+        Withholding it would understate inbound and over-order, which is the mirror of
+        the defect this split exists to fix.
+        """
+        frame = pd.DataFrame({
+            "sku": ["SKU-A", "SKU-A"],
+            "location_id": ["01", "02"],
+            "qty_on_hand": [20.0, 500.0],
+            "qty_in_transit": [10.0, 7.0],
+        })
+        out = consolidate_to_planning_grain(frame, "DC-01", verbose=False,
+                                            stock_status=declared)
+        assert out["qty_in_transit"].iloc[0] == 17.0
+        assert out["qty_on_hand"].iloc[0] == 20.0
+
+    def test_undeclared_location_is_refused_not_summed(self, two_location_inventory):
+        """
+        No declaration, two codes: refuse. Defaulting either way is a decision about
+        500 units that nobody made, and summing them is the direction that under-orders.
+        """
+        with pytest.raises(UndeclaredStockLocation) as caught:
+            consolidate_to_planning_grain(two_location_inventory, "DC-01", verbose=False)
+        message = str(caught.value)
+        # The refusal has to be answerable, which means naming the codes and the stock
+        # behind each. A message that only says a declaration is missing gets the
+        # shortest declaration that makes it stop.
+        assert "02" in message and "500" in message
+        assert "location_status.json" in message
+
+    def test_one_code_needs_no_declaration(self):
+        """
+        A single-location snapshot is the position by construction — there is nothing
+        to separate, so a single-node planner is not made to describe a distinction
+        they do not have.
+        """
+        df = pd.DataFrame({"sku": ["X", "Y"], "location_id": ["01", "01"],
+                           "qty_on_hand": [5.0, 6.0]})
+        out = consolidate_to_planning_grain(df, "DC-01", verbose=False)
+        assert out["qty_on_hand"].sum() == 11.0
+
+    def test_no_location_column_needs_no_declaration(self, two_location_inventory):
+        df = two_location_inventory.drop(columns=["location_id"])
+        out = consolidate_to_planning_grain(df, "DC-01", verbose=False)
         assert out.loc[out["sku"] == "SKU-A", "qty_on_hand"].iloc[0] == 520.0
 
-    def test_unit_cost_is_not_summed(self, two_location_inventory):
+    def test_wildcard_declares_every_code_at_once(self, two_location_inventory):
+        """An explicit code still outranks the wildcard — the common real shape."""
+        blanket = StockStatusMap(statuses={}, source="test", wildcard="sellable")
+        out = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                            verbose=False, stock_status=blanket)
+        assert out.loc[out["sku"] == "SKU-A", "qty_on_hand"].iloc[0] == 520.0
+
+        with_exception = StockStatusMap(statuses={"02": "quarantine"}, source="test",
+                                        wildcard="sellable")
+        out = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                            verbose=False, stock_status=with_exception)
+        assert out.loc[out["sku"] == "SKU-A", "qty_on_hand"].iloc[0] == 20.0
+
+    def test_unit_cost_is_not_summed(self, two_location_inventory, declared):
         """Cost belongs to the SKU, not the bin. Summing it doubles every valuation."""
-        out = consolidate_to_planning_grain(two_location_inventory, "DC-01", verbose=False)
+        out = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                            verbose=False, stock_status=declared)
         assert out.loc[out["sku"] == "SKU-A", "unit_cost"].iloc[0] == 12.0
 
-    def test_merged_locations_stay_visible(self, two_location_inventory):
-        out = consolidate_to_planning_grain(two_location_inventory, "DC-01", verbose=False)
+    def test_merged_locations_stay_visible(self, two_location_inventory, declared):
+        out = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                            verbose=False, stock_status=declared)
         assert out.loc[out["sku"] == "SKU-A", "stock_locations"].iloc[0] == "01,02"
 
-    def test_consolidating_twice_is_the_same_as_once(self, two_location_inventory):
+    def test_consolidating_twice_is_the_same_as_once(self, two_location_inventory,
+                                                     declared):
         """
         The orchestrator consolidates again in the policy and KPI phases, on a frame the
         reader may already have consolidated. A stale `stock_locations` column collided
         with the freshly computed one on merge.
+
         """
-        once = consolidate_to_planning_grain(two_location_inventory, "DC-01", verbose=False)
-        # Re-split it the way a caller passing the raw export a second time would.
+        once = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                             verbose=False, stock_status=declared)
         again = consolidate_to_planning_grain(
             pd.concat([once, once.assign(qty_on_hand=0.0)], ignore_index=True),
-            "DC-01", verbose=False,
+            "DC-01", verbose=False, stock_status=declared,
         )
         assert list(again["stock_locations"]) == list(once["stock_locations"])
         assert again["qty_on_hand"].sum() == once["qty_on_hand"].sum()
 
-    def test_blank_provenance_does_not_mask_real_location_codes(self, two_location_inventory):
+    def test_an_already_split_frame_passes_through_unchanged(
+            self, two_location_inventory, declared):
+        """
+        What the orchestrator actually does: it consolidates again in the policy and KPI
+        phases, on the frame the reader already consolidated. That frame carries `01,02`
+        in `stock_locations`, and re-reading those codes as a fresh claim would withhold
+        the sellable stock a second time — 20 units becoming 0 between the plan and the
+        report it is described in.
+        """
+        once = consolidate_to_planning_grain(two_location_inventory, "DC-01",
+                                             verbose=False, stock_status=declared)
+        again = consolidate_to_planning_grain(once, "DC-01", verbose=False,
+                                              stock_status=declared)
+        for column in ("qty_on_hand", "qty_not_sellable", "qty_quarantine"):
+            assert list(again[column]) == list(once[column]), column
+        assert list(again["stock_locations"]) == list(once["stock_locations"])
+        assert list(again["stock_locations_excluded"]) == \
+            list(once["stock_locations_excluded"])
+
+    def test_blank_provenance_does_not_mask_real_location_codes(
+            self, two_location_inventory, declared):
         """
         A frame loaded from an export with no location column carries an empty
         `stock_locations`. It must not then take precedence over real codes added
@@ -105,7 +261,8 @@ class TestInventoryGrain:
         to catch.
         """
         df = two_location_inventory.assign(stock_locations="")
-        out = consolidate_to_planning_grain(df, "DC-01", verbose=False)
+        out = consolidate_to_planning_grain(df, "DC-01", verbose=False,
+                                            stock_status=declared)
         assert out.loc[out["sku"] == "SKU-A", "stock_locations"].iloc[0] == "01,02"
 
     def test_single_location_frame_is_untouched(self):
@@ -114,23 +271,32 @@ class TestInventoryGrain:
         assert len(out) == 1
         assert out["qty_on_hand"].iloc[0] == 5.0
 
-    def test_open_po_is_counted_once_not_once_per_location(self, two_location_inventory):
-        """The fan-out bug: the same 100-unit PO landing on both of a SKU's rows."""
+    def test_open_po_is_counted_once_not_once_per_location(
+            self, two_location_inventory, config_with_statuses):
+        """
+        The fan-out bug: the same 100-unit PO landing on both of a SKU's rows.
+
+        The position is 120 — 20 sellable plus the PO — and not 620. The 500 quarantined
+        units are reported, not available, and this assertion used to say 620.0.
+        """
         open_po = pd.DataFrame({"sku": ["SKU-A"], "total_open_po_qty": [100.0]})
-        eff = InventoryReader(CONFIG_DIR).effective_inventory(two_location_inventory, open_po)
+        eff = InventoryReader(config_with_statuses).effective_inventory(
+            two_location_inventory, open_po)
 
         rows = eff[eff["sku"] == "SKU-A"]
         assert len(rows) == 1
         assert rows["total_open_po_qty"].iloc[0] == 100.0
-        assert rows["effective_position"].iloc[0] == 620.0
+        assert rows["effective_position"].iloc[0] == 120.0
 
-    def test_one_sku_gets_one_recommendation(self, two_location_inventory, safety_stock_frame):
+    def test_one_sku_gets_one_recommendation(self, two_location_inventory,
+                                             safety_stock_frame, config_with_statuses):
         """
         End of the chain: one SKU, one action. Before the fix this SKU appeared twice
         — PURCHASE-REQUEST on the 20-unit row and PUSH-OUT-OPEN-PO on the 500-unit row.
         """
         open_po = pd.DataFrame({"sku": ["SKU-A"], "total_open_po_qty": [100.0]})
-        eff = InventoryReader(CONFIG_DIR).effective_inventory(two_location_inventory, open_po)
+        eff = InventoryReader(config_with_statuses).effective_inventory(
+            two_location_inventory, open_po)
         projection = InventoryProjector(CONFIG_DIR).project(safety_stock_frame, eff, open_po)
 
         backlog = pd.DataFrame({"sku": ["SKU-A"], "backlog_qty": [80.0],
@@ -139,6 +305,24 @@ class TestInventoryGrain:
 
         assert (recs["sku"] == "SKU-A").sum() == 1
         assert not recs["sku"].duplicated().any()
+
+    def test_quarantined_cover_no_longer_hides_a_shortage(
+            self, two_location_inventory, safety_stock_frame, config_with_statuses):
+        """
+        What the split is for, stated as an outcome rather than a quantity.
+
+        SKU-A needs 250 (200 lead-time demand + 50 safety stock). It holds 20 sellable,
+        500 under inspection and 100 inbound. Summed, the position reads 620 and the run
+        has nothing to say. Counting only what can be sold, it is 120 against a 250
+        requirement — short, and the run asks for the difference.
+        """
+        open_po = pd.DataFrame({"sku": ["SKU-A"], "total_open_po_qty": [100.0]})
+        eff = InventoryReader(config_with_statuses).effective_inventory(
+            two_location_inventory, open_po)
+        projection = InventoryProjector(CONFIG_DIR).project(safety_stock_frame, eff, open_po)
+        row = projection[projection["sku"] == "SKU-A"].iloc[0]
+        assert row["effective_position"] == 120.0
+        assert row["surplus_deficit"] < 0
 
     def test_projector_refuses_a_frame_it_would_fan_out(self, safety_stock_frame):
         duplicated = pd.DataFrame({

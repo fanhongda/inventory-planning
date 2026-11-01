@@ -61,7 +61,26 @@ class InventoryHealth:
     aging_measured: bool = False
     aging_basis: str = ""
     total_value: float = 0.0
+    # What the whole catalogue consumes per day at cost. Carried rather than derived
+    # from `by_family`, which is grouped on dimensions a SKU may be missing — summing
+    # the groups would quietly leave those SKUs out of the denominator and read the
+    # catalogue as slower-moving than it is.
+    total_daily_cogs: float = 0.0
     currency: str = "USD"
+
+    @property
+    def overall_dioh(self) -> float:
+        """
+        Days on hand for the catalogue, value-weighted.
+
+        Stock value over daily cost of sales, never the mean of the per-SKU figures:
+        that statistic weights a dead fastener the same as the line holding most of the
+        balance, which is the error documented at the top of this module for the
+        reported table and applies identically here.
+        """
+        if not self.total_daily_cogs > 0:
+            return float("inf")
+        return self.total_value / self.total_daily_cogs
 
     @property
     def slow_value(self) -> float:
@@ -160,6 +179,8 @@ def build_inventory_health(
         aging_measured=measured,
         aging_basis=basis,
         total_value=total,
+        total_daily_cogs=float(pd.to_numeric(detail["daily_cogs"], errors="coerce")
+                               .fillna(0.0).sum()),
         currency=currency,
     )
 

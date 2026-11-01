@@ -1316,6 +1316,11 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                 # is derived whatever file it came out of.
                 "group": setting.group if setting else macro_edit.DERIVED,
                 "unset": setting is not None and setting.clearable and value is None,
+                # Whether a run is worth less for this being unset. The screen leads
+                # with these and counts them: sorting purely by group put a label that
+                # already had a value above a target that did not, so the settings
+                # already decided were the ones drawing the eye.
+                "asked_every_cycle": bool(setting and setting.asked_every_cycle),
             })
 
         try:
@@ -1359,13 +1364,23 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             stated = stated_target(root)
             note = ("" if stated else "no target stated — the run offers no opinion "
                                       "about what stock must be")
-            add("inventory_target_value", stated.value, "targets.json", note)
+            add("dioh_target_days", stated.dioh_days, "targets.json", note)
+            add("otd_target_crsd", stated.otd_target, "targets.json",
+                "" if stated.otd_target is not None else
+                "no service target stated — OTD is reported unscored")
+            # Shown as derived where the days are set, because that is what it is:
+            # stating both is refused, and a figure the planner cannot type is a figure
+            # the form must not present as an empty box waiting for them.
+            add("inventory_target_value", stated.value, "targets.json",
+                "derived per run from the days above — days x daily cost of sales"
+                if stated.dioh_days is not None else note)
             add("inventory_target_date",
                 stated.deadline.isoformat() if stated.deadline else None, "targets.json",
                 "planned without the burn-down limit" if stated.undated else "")
         except StatedTargetError as refused:
-            add("inventory_target_value", None, "targets.json", str(refused))
-            add("inventory_target_date", None, "targets.json", str(refused))
+            for key in ("dioh_target_days", "otd_target_crsd",
+                        "inventory_target_value", "inventory_target_date"):
+                add(key, None, "targets.json", str(refused))
 
         # Ordered by how often a planner has to decide, not by which file it lives in.
         # The file is the one dimension a reader does not care about, and sorting by it

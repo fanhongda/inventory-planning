@@ -231,12 +231,13 @@ class InventoryPlanner:
         from .policy.levers import LeverAnalyzer
         from .policy.should_be import ShouldBeCalculator
         from .policy.suggestions import SuggestionBuilder
-        from .policy.target import TargetPlanner, stated_target
+        from .policy.target import TargetPlanner, resolve_stated_target, stated_target
 
         print("\n[8/9] Policy analysis — should-be, levers, target...")
 
         inventory_df = consolidate_to_planning_grain(
-            inventory_df, planning_location=self.inv_reader.location_id, verbose=False
+            inventory_df, planning_location=self.inv_reader.location_id, verbose=False,
+            stock_status=self.inv_reader.stock_status,
         )
         # The planning run already resolved these against the same file. Reusing them
         # is not an optimisation — rebuilding would give the policy layer its own copy
@@ -338,7 +339,10 @@ class InventoryPlanner:
         # "what if we had to reach $4M" is asking about this run, not editing policy.
         stated = stated_target(self.config_dir)
         if target_value is None:
-            target_value, deadline = stated.value, stated.deadline
+            target_value, target_note = resolve_stated_target(stated, should_be)
+            deadline = stated.deadline
+            if target_note:
+                print(target_note)
         if target_value is not None:
             if deadline is None:
                 print("    target has no date — planned without the burn-down limit, "
@@ -417,7 +421,8 @@ class InventoryPlanner:
         print("\n[9/9] KPI attribution — service, ordering, forward risk...")
 
         inventory_df = consolidate_to_planning_grain(
-            inventory_df, planning_location=self.inv_reader.location_id, verbose=False
+            inventory_df, planning_location=self.inv_reader.location_id, verbose=False,
+            stock_status=self.inv_reader.stock_status,
         )
 
         # One anchor for the whole review, taken from the data. Mixing a data-derived
@@ -473,14 +478,24 @@ class InventoryPlanner:
         print()
         print(forward.summary())
 
+        # Loaded unconditionally, because two of the three standing commitments are not
+        # about the balance at all and so do not depend on whether a frontier runs. The
+        # OTD and DIOH targets are what this review scores against; a target in force
+        # that the report ignored would be one the planner believes is being measured
+        # and cannot see.
+        from .policy.target import resolve_stated_target as _resolve
+        from .policy.target import stated_target as _stated
+        stated_commitments = _stated(self.config_dir)
+
         frontier = policy.get("frontier")
         if frontier is None and target_value is None:
             # Same fall-back as the policy stage, for the case this is called without
             # one having run: a standing target the report ignored would be a target
             # the planner believes is in force and cannot see.
-            from .policy.target import stated_target as _stated
-            stated = _stated(self.config_dir)
-            target_value, deadline = stated.value, stated.deadline
+            target_value, target_note = _resolve(stated_commitments, should_be)
+            deadline = stated_commitments.deadline
+            if target_note:
+                print(target_note)
         if frontier is None and target_value is not None:
             from .policy.target import TargetPlanner
             holding = float(policy["parameters"].defaults.get("holding_cost_rate", 0.22))
@@ -508,6 +523,13 @@ class InventoryPlanner:
         # not show the one output that is a picture.
         try:
             KPIReport(title).render(
+                # The stated commitments, so the review scores against what the
+                # business said rather than against what the parameters imply. Read
+                # here rather than inside the report: a report that loads its own
+                # config can disagree with the run that produced the figures it is
+                # describing.
+                otd_target=stated_commitments.otd_target,
+                dioh_target=stated_commitments.dioh_days,
                 service=service, should_be=should_be, ordering=ordering,
                 cadence=cadence, forward=forward, levers=policy.get("levers"),
                 frontier=frontier, fx=self._fx, service_target=service_target,
@@ -967,7 +989,8 @@ class InventoryPlanner:
         # is the whole argument for writing the store before anything reads it.
         inventory_as_read = inventory_df
         inventory_df = consolidate_to_planning_grain(
-            inventory_df, planning_location=self.inv_reader.location_id
+            inventory_df, planning_location=self.inv_reader.location_id,
+            stock_status=self.inv_reader.stock_status,
         )
         from .policy.service import latest_observed_date
         as_of, stale = latest_observed_date(sales_df, open_so_df, po_history_df)

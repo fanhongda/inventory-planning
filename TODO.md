@@ -373,6 +373,42 @@ Two items above depend on master data the coverage worksheet locates: the P0 top
 needs `MARD-INSME` / `SPEME` to tell quarantine from sellable, and the P1 phase-out cap
 needs `MARC-AUSDT` for the end date.
 
+**What a replicated source changes, and the one thing it breaks (2026-11-01).** Four
+findings from scoping the move, in the order they have to be dealt with.
+
+- **A Snowflake-sourced run would silently claim to be a repeat of the last one.**
+  `input_fingerprint` means "two runs sharing this read the same bytes", and
+  `InputRecord.identity` delivers that from `sha256`, failing that `batch_id`, failing
+  that `<unhashed:{name}>` (`provenance.py:106-114`). A query has no file to hash, so two
+  extracts a week apart would reduce to the same name and `compare()` would return
+  `identical` — taking drift, scenario and feedback learning with it, since all three
+  rest on that verdict. The mechanism that fixes it is already there and already
+  commented for exactly this case: a landed batch carries `batch_id`. So the rule is not
+  a preference. **Snowflake lands in the fact store and planning reads the store; the
+  pipeline never queries Snowflake directly.** One extract per doc_type per run, which
+  also makes an as-of replay possible at all.
+- **The adapter's freezing mechanism is header-shaped.** `ingest/adapter.py` pins a
+  mapping by header fingerprint. A SQL source has no header row; its equivalent is the
+  result-set column signature plus a hash of the query text. This is a second *source
+  binding* on the same contract, not a second contract. Two contracts per doc_type — an
+  Excel one and a Snowflake one — would split the semantics the contracts exist to hold,
+  and the divergence would show up as a reconciliation difference nobody could attribute.
+- **The overrides layer stops being optional.** The coverage worksheet puts 46 of 131
+  canonical fields (35%) in `planner本地` or `派生` — Snowflake will never carry them. It
+  does not exist yet: `grep override` finds the ingest declarations and the parameter
+  rules, not a master-data overrides table. While everything arrives in one workbook a
+  planner can type a MOQ into the file; once facts come from a replicated source and
+  parameters do not, there is nowhere to type it. This also forces the convergence this
+  document already asks for — one SKU dimension — from advisable to required, because
+  Snowflake's zero-padded MATNR and Excel's stripped one are otherwise two entities.
+- **Run the probe's section 4 before section 1.** `docs/data_layer/snowflake_probe.sql`
+  §4 asks `distinct_load_days`. If the replicated stock table is a current-state
+  overwrite (= 1), Snowflake supplies *freshness and no history*, the store remains the
+  only place history accumulates, and shadow write becomes the urgent item rather than a
+  staged one — history not collected cannot be recovered later. That one query decides
+  whether the weekly execution layer below is months away or a year away, so it is worth
+  the first afternoon of access rather than the last.
+
 Deliberately not here: moving the rule engine into the database. The front end this
 section used to rule out was built once the reason changed from correctness to planner
 adoption — [INTERFACE.md](INTERFACE.md) carries that decision and its constraint, which
@@ -476,6 +512,163 @@ manifest now records exactly that, so one is cheap. Not written.
   readers reading through the contracts is the end state already named under the data
   layer; this is one more reason it is the right one.
 - **Nothing checks that the documented outputs are the outputs.** See above.
+
+## Weekly execution layer (P1)
+
+Decided 2026-11-01. **The planning parameters stay monthly and nothing in them is
+re-derived weekly.** That is the substance of the decision and it goes first, because
+the obvious reading of "plan weekly" is the wrong one. Re-estimating on weekly buckets
+would move `cycles_per_year`, `demand_rolling_cycles`, `min_active_cycles`, the six
+`× 12` annualisations and the Croston/TSB eligibility thresholds all at once, reclassify
+a large share of the catalogue, and buy nothing: aggregation lowers CV, so a weekly fit
+on a C item is worse than the monthly fit divided by 4.33. Monthly parameterisation is
+the normal practice and it is kept.
+
+What changes is that a second, thinner layer sits under it at weekly cadence, and the
+two answer different questions:
+
+| | Cadence | Question | Mechanism |
+|---|---|---|---|
+| **Planning** | monthly | what rate should this SKU replenish at, and how far may it drift before the rate itself is wrong | forecast, σ, safety stock, review period, lot — all unchanged |
+| **Execution** | weekly | has the balance moved as that rate implies; absorb the difference or escalate it | three flow rates against a stock-snapshot difference — fits nothing, estimates nothing |
+
+The execution layer is a difference engine, not a planning run. It reads two stock
+snapshots and three transaction streams, compares the result to a rate handed down from
+the month end, and decides between two actions: order at the baseline, or escalate. The
+quantities it works in are rates per week; the only month-to-week conversion in the
+design happens once, at the handoff below, rather than being spread through the
+arithmetic.
+
+### The handoff is the missing object
+
+`analytics/purchase_recommender.py` publishes fifty columns and none of them is a rate.
+`order_quantity`, `suggested_po_qty` and `net_requirement` are one-shot quantities;
+`forecast_avg_monthly` is a demand rate, not a replenishment rate, and neither carries a
+tolerance or an expiry. So the month end has nothing to hand down.
+
+Three fields, derived from figures the recommender already computes:
+
+```
+baseline_rate   qty/week   the replenishment rate the policy implies, spread over R
+band            qty/week   how far a week may deviate before it means anything
+valid_until     date       when the baseline is re-set rather than deviated from
+```
+
+**The band comes down from the planning layer; the execution layer never computes its
+own.** This is the load-bearing constraint of the whole arrangement. A tolerance derived
+weekly from weekly data is an estimate, and an execution layer that estimates is just the
+planning layer run four times a month at a grain that does not support it. Scaling the
+monthly σ to a weekly band is the one legitimate conversion and it belongs here, in one
+place, where it can be read.
+
+The home for this is `feedback/snapshot.py`'s `_published_plan` — already "every period
+of the horizon as it was planned" — as additional fields, not a new file. The baseline
+is part of the published plan, and scoring it later is the same act as scoring the plan.
+
+### Three flow rates, and the one thing that blocks them
+
+The measurements the planner actually watches week to week are the balance delta and
+three rates. Every field they need is already declared in the contracts; **no new
+ingestion is required**:
+
+| Weekly measure | Source |
+|---|---|
+| New order intake rate | `open_so.order_date` |
+| Shipment rate | `sales_history.ship_date` |
+| Receipt rate | `po_history` / `open_po` dates |
+| Balance delta | the difference between two stock snapshots |
+
+The first three are transactional sums over weekly buckets — robust, and nothing in them
+needs a distribution. The fourth is the bottleneck, and it is a data-layer problem rather
+than an analytics one:
+
+- `store/query.py` already has both time axes and four named readings, so *"what was the
+  position on the Wednesday of week 3"* is mechanically answerable today. What is missing
+  is that planning is not on the store read path — data layer **phase two / three**.
+- **Per-document `valid_time` is a prerequisite, not a refinement.** It is already listed
+  under the data layer as open: one run anchor stands in for all five documents. For
+  monthly planning that is imprecise. For a weekly difference it is fatal and silent —
+  an inventory snapshot sharing the sales anchor's `valid_time` attributes stock movement
+  to the wrong week, and the result does not raise; it merely looks slightly odd.
+
+This is the precise sense in which the weekly layer depends on Snowflake, and it is
+narrower than "better data". A weekly difference needs snapshots taken on a dependable
+cadence with trustworthy per-document timestamps. A hand-exported snapshot will not
+happen four times a month reliably, and worse, two exports taken under different filters
+difference into a number that is wrong and looks fine. A replicated source supplies both
+the cadence and the per-table load timestamp that fills the gap above.
+
+### The deviation rule, and when the baseline is wrong instead
+
+Two bands, because the layering's real question is which layer owns the problem:
+
+- **Inside the band** — order at the baseline. The week needs no planner attention at
+  all, which is the point: the default action is "same as the baseline", and attention
+  goes only to exceptions.
+- **Outside the band, same direction, N consecutive weeks** — do not keep deviating.
+  Re-set the baseline, which returns the problem to the planning layer. Without this the
+  planner chases with weekly deviations indefinitely, and that end state already has a
+  name in `policy/cadence.py`: `oscillating`, the most expensive of its four verdicts.
+
+`cadence.py` is the precedent for the arithmetic and deliberately **not** the host for
+it. It computes the cumulative flow balance `cum = Σ(po_qty − sales_qty)` monthly, over
+two streams, against sales. The execution layer is the same shape over three streams,
+weekly, against an explicit baseline. Same curve, different parameterisation, and folding
+one into the other would give the diagnostic two meanings.
+
+### The guard
+
+**A weekly run must not call the orchestrator's planning path.** It would re-fit the
+forecast and re-derive safety stock on a series one week longer, so the monthly
+parameters would drift week to week — the layering's value destroyed in the first month —
+and `compare()` would report `mixed` every week, taking drift and scenario analysis down
+with it.
+
+The mechanism for pinning it already exists: the **baseline is an input**, fingerprinted
+as one. `config_fingerprint` does not move, `input_fingerprint` does as new facts arrive,
+and `provenance.compare()` classifies the week correctly as `new_data`. No new concept is
+needed, but the baseline has to be passed in rather than recomputed for that
+classification to be true.
+
+It follows that the layer belongs in **`feedback/`, not `analytics/`**. `FeedbackCollector`
+already records `actual_demand` / `actual_eom_inv` / `actual_receipt_qty` against a
+published plan; the weekly layer is that same loop at weekly cadence, with three flow
+rates and a baseline to compare against instead of a single monthly actual. `feedback/`
+is already the layer whose premise is that it does not estimate.
+
+### Order
+
+1. **Per-document `valid_time`** (already open under the data layer). Nothing downstream
+   is trustworthy without it.
+2. **Data layer phase two / three.** The weekly layer reads two instants out of the
+   store; it cannot read them from files.
+3. **The baseline handoff** — `baseline_rate` / `band` / `valid_until` into
+   `_published_plan`, derived in `purchase_recommender`. Independent of 1 and 2, buildable
+   now, and it completes the monthly layer's output whether or not the weekly layer
+   follows. Touches no existing arithmetic.
+4. **The weekly `feedback` loop and the deviation rule**, scoped to A-class first —
+   `R-001` already carries `review_period_days: 7`, and `cadence.py`'s
+   `CRITICAL_CLASSES = ("A",)` agrees with that boundary. Weekly attention on a C-class
+   consumable pays an ordering cost that dwarfs the cycle stock it saves.
+5. **Snowflake** turns 1 and 2 from "can run" into "runs every week without anyone
+   exporting anything".
+
+### What is deliberately not here
+
+- **A weekly statistical forecast.** See the opening paragraph. If a weekly demand signal
+  is ever wanted, the shape is to profile the monthly forecast down to weeks — which
+  preserves the model competition in `forecaster.py` — not to fit weekly from scratch.
+- **A per-SKU weekly DRP grid.** Projected on-hand / planned receipts / planned orders by
+  week is the natural-looking artefact and it is not what the layering asks for: it is a
+  planning output at a weekly grain, which puts estimation back in the weekly layer. The
+  planner's question is the deviation from a rate, and that is four numbers, not a grid.
+- **Re-tuning the monthly configs.** `cycles_per_year`, `demand_rolling_cycles`,
+  `min_active_cycles`, `forecast_horizon_months` and the `× 12` annualisations all stay
+  as they are. The one genuine untidiness found while scoping this is that
+  `DAYS_PER_MONTH` is `30.0` in `purchase_recommender.py`, `should_be.py` and
+  `suggestions.py` and `30.44` in `cadence.py`, with bare `/ 30.0` inline in
+  `safety_stock.py` and `inventory_projector.py`. It is a latent inconsistency worth one
+  constant, and it is not a prerequisite for anything above.
 
 ## Smaller items
 

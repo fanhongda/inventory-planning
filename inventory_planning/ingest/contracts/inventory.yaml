@@ -30,11 +30,36 @@ fields:
   location_id:
     type: string
     role: identifier
-    description: DC / plant / warehouse. Carried on every output for multi-echelon readiness.
+    description: >
+      The storage location the stock sits in — 01 unrestricted, 02 inspection, and so
+      on. This is the level at which stock has a *status*, which is why this document
+      reads it here and not the plant: `config/location_status.json` declares what
+      each code means and only sellable stock nets into the position. Carried on every
+      output for multi-echelon readiness.
     normalize: upper_strip
-    aliases: [location, location id, location code, warehouse, warehouse code,
-              warehouse id, plant, plnt, storage location, sloc, site, dc, wh, wrh,
-              branch, facility, stock location, werks]
+    # Storage-location spellings rank above plant-level ones, and the order is the
+    # whole of what this field means for *this* document. A stock export carries both
+    # — MB52 has `Plant` beside `Storage Location`, WERKS beside LGORT — and `plant`
+    # used to come first, so the plant won on every such file and the storage location
+    # was dropped as unmatched. Everything downstream then asked the wrong question:
+    # `consolidate_to_planning_grain` asked whether plant 5051 was sellable or
+    # quarantine, and a plant is neither, because it holds both. The quarantine stock
+    # was summed into the available position, which overstates it, which under-orders.
+    #
+    # Plant-level spellings stay as the fallback, for the export that carries no
+    # storage location at all. A file carrying two plants is still not handled — that
+    # is the multi-node work in TODO.md — but the plant column now reads as unmatched
+    # on the resolution screen rather than silently standing in for the location.
+    #
+    # `s loc` is the spelling MB52 actually prints, via the normaliser rather than the
+    # file: `SLoc` has a lower-to-upper boundary, so it splits to `s loc` and never
+    # matched `sloc`. It had no effect while the plant was winning anyway. The reader
+    # path in `schema.py` does not split camel case, so `SLoc` already matched `sloc`
+    # there and the entry is not needed in that list.
+    aliases: [storage location, sloc, s loc, lgort, stock location,
+              location, location id, location code, warehouse, warehouse code,
+              warehouse id, plant, plnt, site, dc, wh, wrh,
+              branch, facility, werks]
 
   line_number:
     type: string

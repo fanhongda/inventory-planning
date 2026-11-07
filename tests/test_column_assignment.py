@@ -232,6 +232,100 @@ class TestSiblingContractsAgreeOnTheSameParty:
         assert "vendor supplying plant" in aliases
 
 
+class TestAStockLineIsLocatedByItsStorageLocationNotItsPlant:
+    """
+    MB52 carries `Plant` beside `Storage Location`, and `plant` was ranked first, so
+    the plant won on every real stock export and the storage location was dropped as
+    unmatched.
+
+    Which is the wrong level, and the rest of the pipeline already knew it.
+    `inventory_reader` opens "SKU x storage location — normal stock in 01, quarantine
+    in 02"; `consolidate_to_planning_grain` nets only the codes
+    `config/location_status.json` declares sellable; the setup screen asks "what does
+    each storage-location code mean?". All of them were handed a plant. A plant is
+    neither sellable nor quarantine — it holds both — so the question had no correct
+    answer, and the quarantine stock was summed into the available position, which
+    overstates it, which under-orders.
+
+    Nothing covered the precedence, which is how it survived: every fixture in this
+    file carries a `Plant` column and none of them carries both.
+    """
+
+    @staticmethod
+    def _stock(**columns):
+        rows = 12
+        frame = {"Material": [f"{5164745 + i}" for i in range(rows)]}
+        for name, value in columns.items():
+            frame[name.replace("_", " ")] = [value] * rows
+        frame["Unrestricted"] = [10] * rows
+        return pd.DataFrame(frame)
+
+    @pytest.mark.parametrize("plant,sloc", [
+        ("Plant", "Storage Location"),
+        ("Plant", "SLoc"),
+        ("Werks", "Lgort"),
+        ("Plant", "Stock Location"),
+    ])
+    def test_the_storage_location_wins_when_the_export_carries_both(
+            self, registry, plant, sloc):
+        frame = self._stock(**{plant: "5051", sloc: "01"})
+        assigned = _assign(registry, frame, "inventory")
+        assert assigned.get("location_id") == sloc.replace("_", " ")
+
+    def test_column_order_does_not_decide_it(self, registry):
+        """It is a ranking, not a scan: the plant used to win from either position."""
+        rows = 12
+        frame = pd.DataFrame({
+            "Material": [f"{5164745 + i}" for i in range(rows)],
+            "Storage Location": ["01"] * rows,
+            "Plant": ["5051"] * rows,
+            "Unrestricted": [10] * rows,
+        })
+        assert _assign(registry, frame, "inventory").get("location_id") == "Storage Location"
+
+    def test_the_plant_is_still_the_fallback_when_there_is_no_storage_location(
+            self, registry):
+        """
+        An export with only a plant is a real export and must keep working. Demoting
+        the plant-level spellings is a ranking, not a ban.
+        """
+        frame = self._stock(Plant="5051")
+        assert _assign(registry, frame, "inventory").get("location_id") == "Plant"
+
+    def test_the_reader_path_ranks_them_the_same_way(self):
+        """
+        `schema.py` is the second alias table — the readers use it, the contracts do
+        not — and the two have to agree about this or a CLI run and an upload read
+        the same file differently.
+        """
+        from inventory_planning.readers.base_reader import _detect_mapping
+        from inventory_planning.schema import INVENTORY_SCHEMA
+
+        mapping, _ = _detect_mapping(
+            ["Material", "Plant", "Storage Location", "Unrestricted"],
+            INVENTORY_SCHEMA)
+        assert mapping.get("location_id") == "Storage Location"
+
+    def test_an_order_is_still_located_by_its_plant(self, registry):
+        """
+        Only the stock snapshot moves. An open order has no stock status to declare
+        and its location means which node it is going to, so the plant stays first
+        there — and `location_id` is in no other document's natural key, so the two
+        readings do not have to meet.
+        """
+        rows = 12
+        frame = pd.DataFrame({
+            "Material": [f"{5164745 + i}" for i in range(rows)],
+            "PO Number": [f"45{i:05d}" for i in range(rows)],
+            "Item": [str(10 * (i + 1)) for i in range(rows)],
+            "Plant": ["5051"] * rows,
+            "Storage Location": ["01"] * rows,
+            "Order Quantity": [100] * rows,
+            "Still to be delivered (qty)": [40] * rows,
+        })
+        assert _assign(registry, frame, "open_po").get("location_id") == "Plant"
+
+
 class TestTheStockExportsOwnVocabulary:
     """
     MB52 names the two halves of a stock line `Unrestricted` and `Value Unrestricted`.

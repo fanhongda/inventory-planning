@@ -123,10 +123,18 @@ INVENTORY_SCHEMA = {
     "open_po_qty_inv":      ["openpo quantity", "openpo qty", "openpo", "open po qty",
                              "openpoquantity", "open po quantity"],
     "uom":                  ["uom", "unit", "unit of measure", "base unit"],
-    "location_id":          ["location_id", "location", "location code", "warehouse",
-                             "warehouse code", "plant", "plnt", "storage location",
-                             "sloc", "site", "dc", "wrh", "wh", "branch", "facility",
-                             "werks"],
+    # Storage location ahead of plant, and only on this document. A stock snapshot is
+    # the one export where the location has a *status* — `location_status.json`
+    # declares which codes are sellable — and status is a storage-location fact. MB52
+    # carries `Plant` beside `Storage Location`; with `plant` ranked first the plant
+    # won, the storage location was never mapped, and the run was asked whether a
+    # whole plant was quarantine. See the same note in `contracts/inventory.yaml`.
+    # The other documents keep plant first: for an order there is no stock status, and
+    # the location means which node it is going to.
+    "location_id":          ["storage location", "sloc", "lgort", "stock location",
+                             "location_id", "location", "location code", "warehouse",
+                             "warehouse code", "plant", "plnt", "site", "dc", "wrh",
+                             "wh", "branch", "facility", "werks"],
     "snapshot_date":        ["snapshot_date", "snapshot date", "report date",
                              "as of date", "date"],
 }

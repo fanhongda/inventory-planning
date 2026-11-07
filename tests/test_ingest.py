@@ -20,7 +20,7 @@ from inventory_planning.ingest.capabilities import CapabilityResolver
 from inventory_planning.ingest.contract import default_registry
 from inventory_planning.ingest.contract_tests import ContractTester
 from inventory_planning.ingest.expressions import Expression, ExpressionError
-from inventory_planning.ingest.intake import Intake
+from inventory_planning.ingest.intake import Intake, is_tabular
 from inventory_planning.ingest.profiler import (
     detect_date_order,
     detect_decimal_style,
@@ -651,6 +651,68 @@ class TestAmbiguousRouting:
         assert AdapterRegistry().route(
             self._order_book(shipped=True), "a.xlsx"
         ).doc_type != "open_po"
+
+
+class TestTellingAPivotFromAnExport:
+    """
+    `is_tabular` is the gate every uploaded sheet passes through, and until the India
+    FDT master was rejected by it there was nothing here at all. Both failures below
+    threw away a whole export over the spelling of one header.
+    """
+
+    @staticmethod
+    def _sheet(columns, rows=3):
+        frame = pd.DataFrame(columns=list(columns))
+        for i in range(rows):
+            frame.loc[i] = [f"v{i}"] * len(frame.columns)
+        return frame
+
+    def test_a_marker_is_not_matched_across_a_column_boundary(self):
+        """
+        The headers used to be joined into one string before the search, so `count of`
+        was found between the end of one header and the start of the next — a phrase
+        neither column contains.
+        """
+        ok, why = is_tabular(self._sheet(["Total Count", "Of Units", "Qty"]))
+        assert ok, why
+
+    def test_one_leftover_value_field_does_not_condemn_the_sheet(self):
+        """
+        A column someone kept when they flattened a pivot. A real pivot names every
+        value column `Sum of`/`Count of`; one of them beside the export's own headers
+        is a leftover, and the sheet is the export.
+        """
+        ok, why = is_tabular(self._sheet(
+            ["PN#", "Tyco Part #", "Description", "Count of Qty", "Oct18", "Nov18"]))
+        assert ok, why
+
+    @pytest.mark.parametrize("columns", [
+        ["Row Labels", "Oct18", "Nov18"],
+        ["Column Labels", "Oct18"],
+        ["Material", "Sum of Qty", "Grand Total"],
+    ])
+    def test_a_structural_marker_still_rejects_however_few_columns_carry_it(self, columns):
+        """`Row Labels`, `Column Labels` and `Grand Total` are the pivot's own
+        furniture, not a field name, so one of them is enough."""
+        ok, why = is_tabular(self._sheet(columns))
+        assert not ok
+        assert "pivot-table marker" in why
+
+    def test_a_sheet_of_value_fields_is_still_a_pivot(self):
+        ok, why = is_tabular(self._sheet(
+            ["Row", "Sum of Oct", "Sum of Nov", "Sum of Dec"]))
+        assert not ok
+        assert "pivot value fields" in why
+
+    def test_the_reason_names_the_columns_it_objected_to(self):
+        """A rejection the planner cannot act on is a rejection they cannot fix."""
+        _, why = is_tabular(self._sheet(["Row Labels", "Oct18"]))
+        assert "'row labels'" in why
+
+    def test_an_ordinary_wide_export_passes(self):
+        ok, why = is_tabular(self._sheet(
+            ["PN#", "Tyco Part #", "Description", "Supplier", "Oct18", "Nov18"]))
+        assert ok, why
 
 
 class TestIntakeMultiSheet:

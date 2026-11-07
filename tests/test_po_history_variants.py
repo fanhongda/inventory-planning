@@ -29,6 +29,7 @@ the grain test cannot see it because `receive_date` is in the natural key and th
 rows differ on exactly that column.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -38,6 +39,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
+from inventory_planning.ingest.adapter import Adapter
+from inventory_planning.ingest.contract import DocContract
 from inventory_planning.ingest.intake import Intake
 from inventory_planning.ingest.registry import AdapterRegistry
 from inventory_planning.readers.po_history_reader import (
@@ -362,3 +365,173 @@ class TestAConfirmationGrainExport:
         processed = POHistoryReader(CONFIG_DIR)._post_process(df)
         assert len(processed) == 3
         assert processed["po_qty"].sum() == 350
+
+
+# ── Fourth shape: a dispatch date and no goods receipt ────────────────────────
+
+
+def _dispatch_rows(confirmations: bool = False) -> pd.DataFrame:
+    """
+    A purchase export with no goods receipt: the supplier's confirmed delivery date is
+    the furthest the clock can be measured.
+
+    One row per PO line by default — the shape the frame has by the time the lead time
+    is computed, because the intake collapses the confirmation rows first. Pass
+    `confirmations=True` for the raw shape, two rows per line carrying the same date,
+    which is what `Adapter._collapse_repeats` is given.
+    """
+    rows = []
+    for po, sku, vendor, qty, ordered, confirmed in (
+        ("4500001", "SKU-001", "V-ALPHA", 100, "2026-01-05", "2026-02-20"),
+        ("4500002", "SKU-001", "V-ALPHA", 200, "2026-02-05", "2026-03-20"),
+        ("4500003", "SKU-002", "V-BETA", 50, "2026-02-20", "2026-03-18"),
+    ):
+        common = {"po_number": po, "po_line_number": "10", "sku": sku,
+                  "supplier": vendor, "po_date": pd.Timestamp(ordered),
+                  "po_qty": qty, "open_qty": 0,
+                  "confirmed_delivery_date": pd.Timestamp(confirmed)}
+        if confirmations:
+            rows.append({**common, "confirmation_category": "AB"})
+            rows.append({**common, "confirmation_category": "LA"})
+        else:
+            rows.append({**common, "confirmation_category": "LA"})
+    return pd.DataFrame(rows)
+
+
+class TestTheSameLineToldTwice:
+    """
+    With no goods receipt the two confirmation rows of a line differ on nothing but the
+    category, the natural key degrades to the line, and `Adapter._apply_rollup` sums
+    their measures — 100 + 100 into 200, before anything downstream can see there was
+    ever more than one row. The sum is not recoverable, so this has to run inside the
+    intake rather than after it, which is why the receipt-grain consolidation in the
+    reader cannot cover this case.
+    """
+
+    @staticmethod
+    def _collapse(df):
+        contract = DocContract.load(
+            Path(__file__).parents[1] / "inventory_planning" / "ingest" /
+            "contracts" / "po_history.yaml")
+        adapter = Adapter.__new__(Adapter)
+        log = []
+        return adapter._collapse_repeats(df, contract, log), log
+
+    def test_the_repeat_is_dropped_before_the_rollup_can_sum_it(self):
+        out, log = self._collapse(_dispatch_rows(confirmations=True))
+        assert len(out) == 3
+        assert out["po_qty"].sum() == 350
+        assert any("told twice" in str(s) for s in log)
+
+    def test_a_row_differing_anywhere_else_is_a_different_row(self):
+        """
+        What keeps partial deliveries and schedule lines intact: only a row identical
+        outside the marker is a repeat. "Identical measures within the group" would
+        also describe two schedule lines that happen to be equal halves of a line, and
+        summing those is correct.
+        """
+        df = _dispatch_rows(confirmations=True)
+        df.loc[df["confirmation_category"] == "LA", "po_qty"] = 999
+        out, _ = self._collapse(df)
+        assert len(out) == 6
+
+    def test_a_file_with_no_category_column_is_untouched(self):
+        df = _dispatch_rows(confirmations=True).drop(columns=["confirmation_category"])
+        out, log = self._collapse(df)
+        assert len(out) == len(df)
+        assert not log
+
+
+def _transit_config(tmp_path: Path, suppliers: dict, default=None) -> Path:
+    out = tmp_path / "config"
+    out.mkdir(exist_ok=True)
+    for src in CONFIG_DIR.glob("*.json"):
+        (out / src.name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    path = out / "transit_times.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["suppliers"] = suppliers
+    raw["default_days"] = default
+    path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    return out
+
+
+class TestADispatchDateAndNoReceipt:
+
+    def test_the_lead_time_is_the_dispatch_leg_plus_the_stated_transit(self, tmp_path):
+        """
+        Before this, such a file measured nothing: `receive_date` refuses the bare
+        "delivery date" spellings — rightly, since ending the clock at a date the goods
+        had not arrived on understates every lead time by the whole transit leg — so
+        every item fell back to the item master's planned delivery time.
+        """
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21, "V-BETA": 7}))
+        out = reader._post_process(_dispatch_rows())
+        rows = out.set_index("po_number")
+        # 2026-01-05 -> 2026-02-20 is 46 days to dispatch, plus 21 in transit.
+        assert rows.loc["4500001", "lead_time_days"] == 67.0
+        assert rows.loc["4500003", "lead_time_days"] == 33.0
+        assert set(out["lt_basis"]) == {"dispatch_plus_transit"}
+
+    def test_the_stated_leg_is_named_on_the_row(self, tmp_path):
+        """
+        Part measured, part stated, and both halves visible. `transit_days` is also what
+        `should_be._transit_days` reads in place of its `transit_share_of_lt` guess.
+        """
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21, "V-BETA": 7}))
+        out = reader._post_process(_dispatch_rows())
+        assert out.set_index("po_number").loc["4500001", "transit_days"] == 21.0
+
+    def test_a_supplier_with_no_transit_time_gets_no_lead_time(self, tmp_path):
+        """
+        Not a short one. Treating a missing transit time as zero understates the reorder
+        point, so the order goes out late and the shortage lands before the goods — the
+        item falls back to a stated planned delivery time instead, labelled as such.
+        """
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21}))
+        out = reader._post_process(_dispatch_rows())
+        beta = out[out["supplier"] == "V-BETA"]
+        assert len(beta) == 1
+        assert pd.isna(beta["lead_time_days"].iloc[0])
+        assert pd.isna(beta["transit_days"].iloc[0])
+
+    def test_a_default_covers_the_unlisted_suppliers_when_one_is_set(self, tmp_path):
+        reader = POHistoryReader(
+            _transit_config(tmp_path, {"V-ALPHA": 21}, default=14))
+        out = reader._post_process(_dispatch_rows())
+        assert out[out["supplier"] == "V-BETA"]["transit_days"].iloc[0] == 14.0
+
+    def test_the_longest_matching_prefix_wins(self):
+        """
+        Export columns carry the code and the name in one field, so matching is on the
+        prefix — the rule `supplier_incoterm.json` already uses. Longest wins, so a
+        specific vendor can override a group.
+        """
+        table = {"SIM": 99.0, "SIM001": 30.0}
+        assert POHistoryReader._transit_for("SIM001 TYCO", table, None) == 30.0
+        assert POHistoryReader._transit_for("SIM002 OTHER", table, None) == 99.0
+        assert POHistoryReader._transit_for("ACME", table, None) is None
+        assert POHistoryReader._transit_for("ACME", table, 12.0) == 12.0
+
+    def test_a_receipt_date_still_wins_where_the_file_has_one(self, tmp_path):
+        """
+        A measured order-to-arrival lead time beats a measured order-to-dispatch one
+        plus a number from a config file, so the receipt path stays the default.
+        """
+        df = _dispatch_rows()
+        df["receive_date"] = pd.NaT
+        df.loc[df["confirmation_category"] == "LA", "receive_date"] = pd.Timestamp("2026-03-01")
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21, "V-BETA": 7}))
+        out = reader._post_process(df)
+        assert set(out["lt_basis"]) == {"receipt"}
+
+    def test_a_present_but_empty_receipt_column_does_not_win(self, tmp_path):
+        """
+        It used to: the branch tested whether the column existed, not whether anything
+        was in it, so a file carrying an empty `receive_date` beside a populated
+        dispatch date produced a column of nulls and no lead time at all.
+        """
+        df = _dispatch_rows()
+        df["receive_date"] = pd.NaT
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21, "V-BETA": 7}))
+        out = reader._post_process(df)
+        assert set(out["lt_basis"]) == {"dispatch_plus_transit"}

@@ -103,7 +103,12 @@ def build_sku_attributes(
         # that weakness. Carrying the count is what lets a suggestion say so.
         keep = {"sku": "sku", "wma_lead_time_days": "lead_time_days",
                 "lt_std_days": "lt_sigma_days", "supplier": "supplier",
-                "incoterm": "incoterm", "sample_count": "lt_samples"}
+                "incoterm": "incoterm", "sample_count": "lt_samples",
+                # How far the measurement actually reached, and the stated leg where it
+                # stopped short. `should_be._transit_days` prefers a real `transit_days`
+                # over its `transit_share_of_lt` convention, so carrying it here is what
+                # stops the pipeline-stock figure guessing at a split the data knows.
+                "lt_basis": "lt_basis", "transit_days": "transit_days"}
         available = {k: v for k, v in keep.items() if k in chosen.columns}
         df = df.merge(chosen[list(available)].rename(columns=available), on="sku", how="left")
 

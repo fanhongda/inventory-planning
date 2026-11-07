@@ -1009,6 +1009,13 @@ class InventoryPlanner:
         # collected cannot be recovered later.
         po_history_as_read = po_history_df
         po_history_df = consolidate_to_receipt_grain(po_history_df)
+        # And the lead-time clock, for the same reason: the intake path never runs the
+        # reader, and the contract's own derivation is `days_between(receive_date,
+        # po_date)` — precisely the one that cannot evaluate on an extract carrying a
+        # confirmed-dispatch date and no goods receipt. Idempotent: a frame that already
+        # has a measured lead time keeps it.
+        if po_history_df is not None and len(po_history_df):
+            po_history_df = self.po_reader.ensure_lead_time(po_history_df)
         from .policy.service import latest_observed_date
         as_of, stale = latest_observed_date(sales_df, open_so_df, po_history_df)
         if as_of and stale > 45:

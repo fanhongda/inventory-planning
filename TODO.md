@@ -813,7 +813,7 @@ is already the layer whose premise is that it does not estimate.
   constant, and it is not a prerequisite for anything above.
 
 
-## Document cleaning sits after intake, so two views keep the raw grain (2026-11-07)
+## Purchase history: two cleaning layers, and what each one cannot reach (2026-11-07)
 
 `readers.po_history_reader.consolidate_to_receipt_grain` drops the rows of a PO line
 that carry no goods receipt, where that line has one. It exists because a
@@ -832,10 +832,32 @@ the two rows of one line differ on exactly the column that would have exposed th
 
 It runs in two places because the entry paths meet nowhere earlier: the reader's
 `_post_process`, and `run_planning` / `run_kpi_review` in the orchestrator. The intake
-path never runs the reader — the contract derives `lead_time_days` itself.
+path never runs the reader — the contract derives `lead_time_days` itself. The same is
+true of `POHistoryReader.ensure_lead_time`, and for the same reason.
 
-**What is still at the raw grain.** The cleaning happens downstream of intake, so two
-views of the file keep the confirmation rows:
+**The other layer, and why it has to be separate.** Where the extract carries *no*
+goods receipt, the two confirmation rows of a line differ on nothing at all: the
+natural key degrades to the line, `_apply_rollup` fires, and it **sums** — 100 + 100
+into 200. That sum is not recoverable, so nothing downstream of intake can fix it.
+The contract therefore declares `repeat_markers: [confirmation_category]`, and
+`Adapter._collapse_repeats` drops rows identical but for a marker, between the filters
+and the rollup.
+
+Two mechanisms at two layers is not duplication; the cases are genuinely different:
+
+| | rows differ on | rollup | fixed by |
+|---|---|---|---|
+| receipt in the extract | `receive_date` | does not fire — keys are distinct | `consolidate_to_receipt_grain`, downstream, keyed on the receipt |
+| no receipt | nothing but the marker | fires and sums | `repeat_markers`, inside intake, before the sum |
+
+The marker rule is deliberately an exact-duplicate test. "The measures are identical
+within the group" would also describe two schedule lines that happen to be equal
+halves of a line, and summing *those* is correct — only a column naming the telling
+can separate the two cases. A row differing anywhere outside the marker is kept, which
+is what leaves partial deliveries and schedule lines intact.
+
+**What is still at the raw grain.** Only the receipt case, since the other is cleaned
+inside intake now. Two views of such a file keep the confirmation rows:
 
 - the fact store, which is handed `po_history_as_read` deliberately, for the same
   reason the stock snapshot is: the dropped rows are a real property of the export,
@@ -853,12 +875,15 @@ rather than toward false comfort. So this is a legibility gap, not a wrong plan:
 planner reconciling `Σ po_qty` against their ERP sees twice their number, with the
 explanation several lines earlier instead of beside it.
 
-**Why it is not simply moved into intake.** Three options, none free:
+**Why the receipt case is not moved into intake too.** Three options, none free:
 
-- *Clean in the intake, before the frame is published.* The store then holds a frame
-  that is not what was exported, against the principle above — unless intake hands out
-  two frames, one published and one as-read, which is a change to what a document *is*
-  at that layer rather than a tweak.
+- *Clean it in the intake as well.* The store then holds a frame that is not what was
+  exported, against the principle above — unless intake hands out two frames, one
+  published and one as-read, which is a change to what a document *is* at that layer
+  rather than a tweak. Note the asymmetry this would remove: the repeat-marker case is
+  already cleaned in intake, so the store already does not hold those rows. The
+  principle is being honoured in one case and not the other because in one case the
+  sum forced the issue, not because the two were weighed and decided differently.
 - *Give `_resting_on` a per-document grain correction.* Narrow and cheap, but it puts
   knowledge of one document type's defect inside the exposure module, which is the
   coupling that docstring is written against.
@@ -868,6 +893,38 @@ explanation several lines earlier instead of beside it.
   under *Smaller items* (transfer and rework receipts mixed into purchase lead times)
   is the same family of defect. The signal is specific enough to test for: a natural
   key containing a timestamp that is null on some rows of an otherwise identical key.
+
+**A routing trap next door.** A purchase export with no goods receipt needs a delivered
+or open quantity column to be recognised as history: `po_history`'s discriminators are
+`not_null(receive_date)` and `open_qty == 0`, and with neither evaluable such a file
+scores as an open PO and is counted as inbound supply — the exact failure
+`test_po_history_variants` was written for, which inflates the position and stops the
+run recommending purchases. Reproduced at 87% confidence on a dispatch-date extract
+stripped of its delivered-quantity column. Nothing is wrong in the code; the shape is
+genuinely ambiguous. But a file one column away from being misread as its own opposite
+deserves a check that says so, rather than a confidence score nobody reads.
+
+## Lead time measured to dispatch: the variance it cannot see (2026-11-07)
+
+`POHistoryReader.ensure_lead_time` runs the best clock the extract supports. Where
+there is a confirmed-delivery or dispatch date and no goods receipt, that is
+`(confirmed_delivery_date - po_date) + transit_days`, with the transit leg stated per
+supplier in `config/transit_times.json`. `lt_basis` says `dispatch_plus_transit` on
+every row it produced, and `transit_days` travels as far as `policy.should_be`, which
+prefers it over the `transit_share_of_lt` convention it otherwise guesses with.
+
+Two limits, both inherent rather than bugs:
+
+- **The stated leg has no variance.** A constant adds none, so `lt_std_days` on this
+  basis is the variability of the dispatch leg alone and safety stock covers less
+  lead-time risk than the number suggests. Reported on every run that uses the basis.
+  The fix is not a better constant — it is a second source with real arrival dates
+  (an inbound delivery report, a warehouse receipt log), measured per lane.
+- **A supplier absent from the table gets no lead time**, falling through to the item
+  master's planned delivery time, rather than a lead time short by the whole transit
+  leg. That direction is deliberate: short understates the reorder point, which is the
+  one that stocks out. `default_days` exists for sites that would rather have one
+  number than a gap.
 
 Until then: the drop is reported on every run that triggers it, naming the row and line
 counts, the confirmation codes actually found, and the quantity that would have been

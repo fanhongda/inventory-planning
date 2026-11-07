@@ -19,6 +19,17 @@ DEFAULT_LT_ROLLING_MONTHS = 6
 # codes in the finding — the consolidation keys on the goods receipt, not on this.
 CONFIRMATION_CATEGORY = "confirmation_category"
 
+# The supplier's own date, where the extract has no goods receipt. Never a receipt —
+# `receive_date` refuses the bare "delivery date" spellings on purpose.
+CONFIRMED_DELIVERY_DATE = "confirmed_delivery_date"
+TRANSIT_TIMES_FILE = "transit_times.json"
+
+# Which clock produced `lead_time_days`. Orthogonal to `lt_source`, which says whether
+# the number was measured at all and from which window.
+BASIS_RECEIPT = "receipt"
+BASIS_DISPATCH_PLUS_TRANSIT = "dispatch_plus_transit"
+BASIS_PRECALC = "precalc_column"
+
 
 def consolidate_to_receipt_grain(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     """
@@ -105,6 +116,94 @@ def consolidate_to_receipt_grain(df: pd.DataFrame, verbose: bool = True) -> pd.D
 class POHistoryReader(BaseReader):
     doc_type = "po_history"
 
+    def _load_transit_times(self) -> tuple:
+        """
+        Transit days per supplier, and the default for the ones not listed.
+
+        Prefix matching, longest key first, because an export's supplier column
+        routinely carries the code and the name in one field — the same rule
+        `supplier_incoterm.json` is read by.
+        """
+        cfg = self.config_dir / TRANSIT_TIMES_FILE
+        if not cfg.exists():
+            return {}, None
+        try:
+            raw = json.loads(cfg.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {}, None
+        table = {}
+        for key, value in (raw.get("suppliers") or {}).items():
+            days = pd.to_numeric(value, errors="coerce")
+            if pd.notna(days) and days >= 0:
+                table[str(key).strip().upper()] = float(days)
+        default = pd.to_numeric(raw.get("default_days"), errors="coerce")
+        return table, (float(default) if pd.notna(default) and default >= 0 else None)
+
+    @staticmethod
+    def _transit_for(supplier, table: dict, default):
+        """The transit days for one supplier: longest matching prefix, else the default."""
+        text = str(supplier or "").strip().upper()
+        if not text:
+            return default
+        matches = [(len(k), v) for k, v in table.items() if text.startswith(k)]
+        return max(matches)[1] if matches else default
+
+    def _lead_time_from_dispatch(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Measure the clock as far as the supplier's dispatch, and state the rest.
+
+        For an extract that carries a confirmed-delivery or dispatch date and no goods
+        receipt. `receive_date` deliberately refuses the bare "delivery date" spellings,
+        so without this such a file yields no measured lead time at all and every item
+        falls back to the planned delivery time in the item master.
+
+        What this produces is part measured and part stated, and both halves are named:
+        `lt_basis` says `dispatch_plus_transit`, and `transit_days` carries the stated
+        leg — which `policy.should_be._transit_days` then uses in place of its
+        `transit_share_of_lt` convention, so the pipeline-stock figure stops guessing
+        too.
+
+        A supplier with no entry gets no lead time rather than a short one. Treating a
+        missing transit time as zero understates the reorder point, and that is the
+        direction that stocks out.
+        """
+        table, default = self._load_transit_times()
+        dispatch = (df[CONFIRMED_DELIVERY_DATE] - df["po_date"]).dt.days
+        suppliers = df["supplier"] if "supplier" in df.columns else pd.Series(
+            None, index=df.index)
+        transit = suppliers.map(
+            lambda v: self._transit_for(v, table, default)
+        ).astype("float64")
+
+        df["transit_days"] = transit
+        df["lead_time_days"] = dispatch + transit
+        df["lt_basis"] = np.where(df["lead_time_days"].notna(),
+                                  BASIS_DISPATCH_PLUS_TRANSIT, "")
+
+        known = int(transit.notna().sum())
+        print(f"  No goods-receipt date — lead time measured to the supplier's dispatch "
+              f"({CONFIRMED_DELIVERY_DATE}) plus a stated transit leg")
+        if known:
+            print(f"      {known:,} of {len(df):,} rows: transit from "
+                  f"{TRANSIT_TIMES_FILE}"
+                  + (f", default {default:g}d where the supplier is unlisted"
+                     if default is not None else "")
+                  + f". Median total {df['lead_time_days'].median():.0f}d "
+                    f"({dispatch.median():.0f}d to dispatch + "
+                    f"{transit.median():.0f}d transit)")
+            print(f"      The transit leg is a constant, so it adds no variance: "
+                  f"lt_std_days here is the dispatch leg's variability only, and "
+                  f"safety stock covers less lead-time risk than it appears to.")
+        missing = df.loc[transit.isna(), "supplier"].dropna().unique() if known < len(df) else []
+        if len(missing):
+            shown = ", ".join(str(m) for m in missing[:4])
+            print(f"      {len(df) - known:,} rows across {len(missing):,} supplier(s) "
+                  f"have no transit time and so no measured lead time — they fall back "
+                  f"to the item master's planned delivery time. Add them to "
+                  f"{TRANSIT_TIMES_FILE}: {shown}"
+                  + (" ..." if len(missing) > 4 else ""))
+        return df
+
     def _load_supplier_incoterms(self) -> dict:
         cfg = self.config_dir / "supplier_incoterm.json"
         if cfg.exists():
@@ -119,19 +218,59 @@ class POHistoryReader(BaseReader):
         # padded with acknowledgement rows that carry no lead time by construction.
         df = consolidate_to_receipt_grain(df)
 
-        # Use pre-computed LT column if available, else compute from dates
+        return self.ensure_lead_time(df)
+
+    def ensure_lead_time(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Put `lead_time_days` and `lt_basis` on the frame, by the best basis it supports.
+
+        Public and idempotent because the two entry paths meet nowhere earlier. The
+        reader calls it from `_post_process`; the intake path never runs the reader —
+        the contract derives `lead_time_days` itself from `days_between(receive_date,
+        po_date)`, which is exactly the derivation that cannot evaluate on an extract
+        with no goods receipt — so the orchestrator calls it too. Without that second
+        call the dispatch basis below would be unreachable on the path the pipeline
+        actually uses.
+        """
+        if df is None or len(df) == 0 or "po_date" not in df.columns:
+            return df
+        # Already measured, by this or by the contract's own derivation. Re-running
+        # would overwrite a receipt-based lead time with a dispatch-based one on a
+        # frame that has both.
+        if ("lead_time_days" in df.columns
+                and pd.to_numeric(df["lead_time_days"], errors="coerce").notna().any()):
+            if "lt_basis" not in df.columns:
+                df = df.copy()
+                df["lt_basis"] = BASIS_RECEIPT
+            return df
+
+        # Which clock to run, best basis first. Presence of a column is not enough:
+        # a `receive_date` that is present and entirely empty used to take this branch
+        # and produce a column of nulls, which reads downstream as "no lead time
+        # measurable" when a dispatch date sitting in the same file could have measured
+        # most of one.
+        usable = lambda col: col in df.columns and df[col].notna().any()
         if "lt_days_precalc" in df.columns:
             df["lt_days_precalc"] = pd.to_numeric(df["lt_days_precalc"], errors="coerce")
             valid_precalc = df["lt_days_precalc"].notna() & (df["lt_days_precalc"] > 0)
             if valid_precalc.sum() > len(df) * 0.5:
                 df["lead_time_days"] = df["lt_days_precalc"]
+                df["lt_basis"] = BASIS_PRECALC
                 print(f"  Using pre-computed LT column ({valid_precalc.sum()} valid rows)")
+            elif usable(CONFIRMED_DELIVERY_DATE) and not usable("receive_date"):
+                df = self._lead_time_from_dispatch(df)
             else:
                 df = self._compute_lt_from_dates(df)
-        elif "receive_date" in df.columns:
+        elif usable("receive_date"):
             df = self._compute_lt_from_dates(df)
+        elif usable(CONFIRMED_DELIVERY_DATE):
+            # Measured as far as the dispatch, stated the rest of the way. Better than
+            # no lead time at all, which is what this file produced before — and worse
+            # than a receipt date, which is why it is third.
+            df = self._lead_time_from_dispatch(df)
         else:
-            print("  Warning: no receive_date or LT column found — cannot compute lead time")
+            print("  Warning: no receive_date, dispatch date or LT column found — "
+                  "cannot compute lead time")
             df["lead_time_days"] = np.nan
             return df
 
@@ -147,6 +286,7 @@ class POHistoryReader(BaseReader):
             df["lead_time_days"] = np.nan
             return df
         df["lead_time_days"] = (df["receive_date"] - df["po_date"]).dt.days
+        df["lt_basis"] = BASIS_RECEIPT
         print(f"  Computed LT from receive_date - po_date")
         return df
 
@@ -247,6 +387,13 @@ class POHistoryReader(BaseReader):
                 # history at all, so the column reads as one scale end to end.
                 "lt_source": "measured" if in_window else "measured_outside_window",
                 "lt_window_months": int(rolling_months),
+                # Which clock produced it. `lt_source` says whether it was measured and
+                # from which window; this says how far the measurement actually reached.
+                "lt_basis": (grp["lt_basis"].dropna().iloc[0]
+                             if "lt_basis" in grp.columns and grp["lt_basis"].notna().any()
+                             else BASIS_RECEIPT),
+                "transit_days": (pd.to_numeric(grp["transit_days"], errors="coerce").median()
+                                 if "transit_days" in grp.columns else np.nan),
             })
 
         out = pd.DataFrame(results)

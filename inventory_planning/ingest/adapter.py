@@ -738,11 +738,23 @@ class Adapter:
             # is a legitimate outcome the contract tests already report on.
             return df
 
-        key = [k for k in contract.natural_key if k in df.columns]
-        if not key:
-            log.append(TransformStep("<rollup>", "rolled_up",
-                                     f"SKIPPED — natural key {contract.natural_key} not available"))
+        # The *whole* key, or none of it. A key missing a component is not a coarser
+        # key, it is a different one: grouping `[sku, period]` down to `[sku]` merges
+        # every period of a SKU into one row and sums the measures, so eight years of
+        # demand arrives as a single number per part with nothing downstream able to
+        # see it ever had periods. Partial-key grouping produces a plausible frame of
+        # the wrong shape, which is the failure mode this whole layer exists to stop,
+        # so it is refused and said out loud rather than attempted.
+        missing = [k for k in contract.natural_key if k not in df.columns]
+        if missing or not contract.natural_key:
+            detail = (f"SKIPPED — natural key {contract.natural_key} not available"
+                      if not contract.natural_key or len(missing) == len(contract.natural_key)
+                      else f"SKIPPED — natural key {contract.natural_key} is incomplete: "
+                           f"{', '.join(missing)} not in the frame, and grouping on the "
+                           f"rest would merge rows that differ by {', '.join(missing)}")
+            log.append(TransformStep("<rollup>", "rolled_up", detail))
             return df
+        key = list(contract.natural_key)
 
         before = len(df)
         agg: Dict[str, Any] = {}

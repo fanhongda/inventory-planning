@@ -374,6 +374,31 @@ class TestAdapterApply:
         assert any(s.field == "open_qty" and s.action == "derived" for s in log)
         assert any(s.action == "value_mapped" for s in log)
 
+    def test_an_incomplete_natural_key_refuses_to_roll_up(self, sap_open_po):
+        """
+        A key missing a component is not a coarser key, it is a different one.
+
+        `[sku, period]` grouped down to `[sku]` merges every period of a SKU into one
+        row and sums the measures, so eight years of demand come back as one number
+        per part — a frame of the right dtypes, the right columns and entirely the
+        wrong shape. Refusing is the only safe answer, and saying which component was
+        missing is what makes it fixable.
+        """
+        from inventory_planning.ingest.adapter import TransformStep
+
+        contract = default_registry().get("demand_timeseries")
+        adapter = AdapterRegistry().route(sap_open_po, "ZMM.xlsx").adapter
+        adapter.grain, adapter.rollup_to = "sku_period__fine", "sku_period"
+        frame = pd.DataFrame({"sku": ["A", "A", "B"], "qty": [1.0, 2.0, 4.0]})
+
+        log: list[TransformStep] = []
+        out = adapter._apply_rollup(frame, contract, log)
+
+        assert len(out) == 3                      # untouched, not grouped to 2
+        assert out["qty"].tolist() == [1.0, 2.0, 4.0]
+        detail = " ".join(s.detail for s in log)
+        assert "SKIPPED" in detail and "incomplete" in detail and "period" in detail
+
 
 # ── Contract tests ───────────────────────────────────────────────────────────
 

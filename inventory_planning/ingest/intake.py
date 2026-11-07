@@ -90,6 +90,16 @@ def unsupplied_capabilities(frame: pd.DataFrame, contract) -> set:
     return missing
 
 
+# Markers Excel writes as *structure* rather than as a field name: `Row Labels` and
+# `Column Labels` are the pivot's own axis headers and `Grand Total` is its footer.
+# A sheet carrying one of these is a pivot however few columns it has.
+_PIVOT_STRUCTURE = ("row labels", "column labels", "grand total")
+
+# Markers that are a *field name* — what Excel calls a value field it aggregated.
+# Counted rather than vetoed on; see `is_tabular`.
+_PIVOT_VALUE_FIELD = ("sum of", "count of")
+
+
 def is_tabular(df: pd.DataFrame) -> Tuple[bool, str]:
     """
     Whether a sheet is a data table at all.
@@ -104,10 +114,27 @@ def is_tabular(df: pd.DataFrame) -> Tuple[bool, str]:
     if _unnamed_share(df.columns) > 0.5:
         return False, "over half the columns have no header — pivot table or scratch sheet"
 
-    header_text = " ".join(str(c).lower() for c in df.columns)
-    for marker in ("sum of ", "count of ", "column labels", "row labels", "grand total"):
-        if marker in header_text:
-            return False, f"pivot-table marker {marker.strip()!r} in the header row"
+    columns = [str(c).strip().lower() for c in df.columns]
+
+    # Per column, not against the headers joined into one string. Joined, a marker
+    # matches across a column boundary that does not exist: `Total Count` beside
+    # `Of Units` reads as `count of` and the sheet is thrown away for a phrase neither
+    # header contains.
+    structural = [c for c in columns if any(m in c for m in _PIVOT_STRUCTURE)]
+    if structural:
+        return False, (f"pivot-table marker in the header row: "
+                       f"{', '.join(repr(c) for c in structural[:3])}")
+
+    # A share, not an any-match. `Sum of` and `Count of` are what Excel names a value
+    # field it aggregated, and a real pivot names *every* value column that way — so
+    # one of them beside twenty real headers is a column someone kept when they
+    # flattened a pivot, not a pivot. Vetoing the sheet on it threw away the whole
+    # export for one leftover column name.
+    aggregated = [c for c in columns if c.startswith(_PIVOT_VALUE_FIELD)]
+    if len(aggregated) * 2 > len(columns):
+        return False, (f"{len(aggregated)} of {len(columns)} columns are pivot value "
+                       f"fields ({', '.join(repr(c) for c in aggregated[:3])}) — "
+                       f"this is a pivot table, not an export")
 
     density = df.notna().mean().mean()
     if density < 0.15:

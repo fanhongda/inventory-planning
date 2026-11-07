@@ -386,6 +386,87 @@ class TestABlankTemplateSaysWhatIsWrongWithIt:
         assert "`data` sheet" in detail
 
 
+class TestAnUploadThatFailsSaysWhereAndWhy:
+    """
+    The one POST a planner makes is the one that reads an unseen export, so it is the
+    one that a real file breaks in ways no fixture anticipated. What it must not do is
+    answer with a bare 500: the only description of the failure then lives in the
+    server console, and the person holding the file is the only one who can act on it.
+    """
+
+    def test_a_routing_failure_names_the_file_the_sheet_and_the_error(
+            self, client, monkeypatch, tmp_path):
+        import inventory_planning.api.app as app_module
+
+        def explode(*_args, **_kwargs):
+            raise ValueError("column 'Material' is not unique")
+
+        monkeypatch.setattr(app_module, "resolve_frame", explode)
+
+        book = tmp_path / "master.xlsx"
+        pytest.importorskip("openpyxl")
+        import pandas as pd
+        pd.DataFrame({"Material": ["A"], "Qty": [1]}).to_excel(
+            book, index=False, sheet_name="Item Master")
+        with open(book, "rb") as fh:
+            response = client.post("/uploads", files={"file": (book.name, fh.read())})
+
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert "master.xlsx" in detail
+        assert "Item Master" in detail
+        assert "ValueError: column 'Material' is not unique" in detail
+        assert "not landed" in detail
+
+    def test_nothing_is_landed_when_routing_fails(self, client, monkeypatch, tmp_path):
+        import inventory_planning.api.app as app_module
+
+        monkeypatch.setattr(app_module, "resolve_frame",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        _upload(client)  # noqa: F841 — the call is the assertion's subject
+        assert client.get("/batches").json() == []
+
+    @pytest.mark.parametrize("case", ["unreadable", "blank template", "good"])
+    def test_the_uploaded_copy_is_never_left_behind(self, client, tmp_path,
+                                                    monkeypatch, case):
+        """
+        The temp copy is an un-anonymised extract sitting outside both the repository
+        and the store's retention, and the paths that do not reach the end of the
+        handler — an unreadable file, a blank template — are the ones a planner hits
+        most. Cleanup belongs on all of them, which is why it is a `finally`.
+        """
+        from inventory_planning.ingest.templates import emit
+
+        spool = tmp_path / "spool"
+        spool.mkdir()
+        made = iter(range(100))
+
+        def under_the_spool(*_a, **_k):
+            path = spool / f"u{next(made)}"
+            path.mkdir()
+            return str(path)
+
+        monkeypatch.setattr("tempfile.mkdtemp", under_the_spool)
+
+        if case == "unreadable":
+            bad = tmp_path / "export.xls"
+            bad.write_text("Material,Qty\nA,1\n", encoding="utf-8")
+            with open(bad, "rb") as fh:
+                assert client.post(
+                    "/uploads", files={"file": (bad.name, fh.read())}
+                ).status_code == 400
+        elif case == "blank template":
+            blank = emit("substitution", tmp_path)
+            with open(blank, "rb") as fh:
+                assert client.post(
+                    "/uploads", files={"file": (blank.name, fh.read())}
+                ).status_code == 400
+        else:
+            assert _upload(client).status_code == 200
+
+        assert list(spool.iterdir()) == []
+
+
 class TestTheReviewScreenIsServedWithoutShadowingTheApi:
 
     def test_the_page_and_its_module_load(self, client):

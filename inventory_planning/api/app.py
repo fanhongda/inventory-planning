@@ -29,6 +29,7 @@ returning an empty list, which would read as "no data".
 # dependency of a package that must install without it.
 
 import hashlib
+import logging
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -52,6 +53,12 @@ from ..store.query import (
     FactQuery, KeyIncomplete, MixedLayers, NoSuchColumn, QueryUnavailable,
 )
 from ..store.ledger import BatchLedger
+
+# The server's own log. An upload that fails inside routing is the one place in this
+# surface where the exception is worth keeping in full: the response says which sheet
+# and what went wrong, which is what the planner can act on, and the traceback that
+# names the line stays here for whoever is reading the console.
+logger = logging.getLogger(__name__)
 
 # How far back /policy looks for a run under the rules on disk. Bounded because each
 # candidate costs a manifest read, and named because the number appears in the sentence
@@ -530,69 +537,93 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         # anything useful.
         name = Path(file.filename or "").name or "upload"
         target = workdir / name
-        with open(target, "wb") as fh:
-            shutil.copyfileobj(file.file, fh)
-        # The bytes, hashed, carried onto the landing record and from there onto the
-        # fact batch. Without it every batch's content key is (nothing, config, as-of),
-        # so two *different* files promoted at the same as-of date collide and the
-        # second is dropped as a duplicate of the first — silently, since a duplicate
-        # is a legitimate no-op.
-        source_sha = hashlib.sha256(target.read_bytes()).hexdigest()
-
-        try:
-            sheets = load_sheets(target)
-        except Exception as exc:
-            raise HTTPException(400, f"could not read {target.name}: {exc}") from exc
-
-        meta = read_meta(target)
-        hint = meta.doc_type if meta else None
-        declarations = service.declarations()
-
-        landed: List[Dict[str, Any]] = []
-        skipped: List[Dict[str, str]] = []
-        for sheet_name, raw in sheets:
-            if sheet_name in NON_DATA_SHEETS:
-                continue
-            tabular, why = is_tabular(raw)
-            if not tabular:
-                skipped.append({"sheet": sheet_name, "reason": why})
-                continue
-            resolution = resolve_frame(raw, source_name=target.name,
-                                       declarations=declarations,
-                                       doc_type_hint=hint, sheet_name=sheet_name)
-            record = service.landing.land(target, sheet=sheet_name or 0,
-                                          doc_type=resolution.doc_type,
-                                          source_sha=source_sha)
-            landed.append({
-                "batch_id": record["batch_id"],
-                "doc_type": resolution.doc_type,
-                "rows": record["rows"],
-                "duplicate_headers": record.get("duplicate_headers", []),
-                "resolution": resolution.to_dict(),
-            })
-
+        # Everything from here to the `finally` works on a copy of the planner's file.
         # The landed parquet is the durable record; this copy was only ever needed for
         # the length of the request. Leaving it behind accumulated one copy of every
         # file ever uploaded in the temp directory — un-anonymised extracts among them,
-        # outside both the repository and the store's retention.
-        shutil.rmtree(workdir, ignore_errors=True)
+        # outside both the repository and the store's retention. It is a `finally` and
+        # not a line at the end of the happy path because the paths that *don't* reach
+        # the end are the unreadable file and the blank template, which is to say the
+        # ones a planner hits most.
+        try:
+            with open(target, "wb") as fh:
+                shutil.copyfileobj(file.file, fh)
+            # The bytes, hashed, carried onto the landing record and from there onto
+            # the fact batch. Without it every batch's content key is (nothing, config,
+            # as-of), so two *different* files promoted at the same as-of date collide
+            # and the second is dropped as a duplicate of the first — silently, since a
+            # duplicate is a legitimate no-op.
+            source_sha = hashlib.sha256(target.read_bytes()).hexdigest()
 
-        if not landed:
-            # A blank template is the likeliest way to arrive here and it deserves its
-            # own sentence: "no tabular sheet" is true and unhelpful about a file that
-            # visibly has one, and the person who uploaded it is the person least able
-            # to work out that the headers alone are not data.
-            if meta is not None:
+            try:
+                sheets = load_sheets(target)
+            except Exception as exc:
+                raise HTTPException(400, f"could not read {name}: {exc}") from exc
+
+            meta = read_meta(target)
+            hint = meta.doc_type if meta else None
+            declarations = service.declarations()
+
+            landed: List[Dict[str, Any]] = []
+            skipped: List[Dict[str, str]] = []
+            for sheet_name, raw in sheets:
+                if sheet_name in NON_DATA_SHEETS:
+                    continue
+                tabular, why = is_tabular(raw)
+                if not tabular:
+                    skipped.append({"sheet": sheet_name, "reason": why})
+                    continue
+                try:
+                    resolution = resolve_frame(raw, source_name=name,
+                                               declarations=declarations,
+                                               doc_type_hint=hint,
+                                               sheet_name=sheet_name)
+                    record = service.landing.land(target, sheet=sheet_name or 0,
+                                                  doc_type=resolution.doc_type,
+                                                  source_sha=source_sha)
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    # Routing and landing are the two steps that read the contents, so
+                    # they are the two that a real export can break in ways no test
+                    # anticipated. A bare 500 puts the only description of what went
+                    # wrong in the server console and leaves the screen saying nothing
+                    # — and the person holding the file is the only one who can act on
+                    # it. Name the sheet, name the error, and keep the traceback in the
+                    # log for whoever is reading the console.
+                    logger.exception("upload failed: %s sheet %r", name, sheet_name)
+                    where = f"{name}, sheet {sheet_name!r}" if sheet_name else name
+                    raise HTTPException(
+                        500,
+                        f"{where} was read, but routing it failed: "
+                        f"{type(exc).__name__}: {exc}. The file was not landed. The "
+                        f"server log carries the traceback.") from exc
+                landed.append({
+                    "batch_id": record["batch_id"],
+                    "doc_type": resolution.doc_type,
+                    "rows": record["rows"],
+                    "duplicate_headers": record.get("duplicate_headers", []),
+                    "resolution": resolution.to_dict(),
+                })
+
+            if not landed:
+                # A blank template is the likeliest way to arrive here and it deserves
+                # its own sentence: "no tabular sheet" is true and unhelpful about a
+                # file that visibly has one, and the person who uploaded it is the
+                # person least able to work out that the headers alone are not data.
+                if meta is not None:
+                    raise HTTPException(
+                        400, f"{name} is a {meta.doc_type} template with no rows "
+                             f"filled in. Enter the data under the headers on the "
+                             f"`data` sheet and upload it again.")
                 raise HTTPException(
-                    400, f"{target.name} is a {meta.doc_type} template with no rows "
-                         f"filled in. Enter the data under the headers on the `data` "
-                         f"sheet and upload it again.")
-            raise HTTPException(
-                400, f"no tabular sheet in {target.name}: {skipped or 'file is empty'}")
-        return {"source_name": target.name,
-                "template": meta.doc_type if meta else None,
-                "stale_template": meta.staleness(service.contracts) if meta else None,
-                "landed": landed, "skipped": skipped}
+                    400, f"no tabular sheet in {name}: {skipped or 'file is empty'}")
+            return {"source_name": name,
+                    "template": meta.doc_type if meta else None,
+                    "stale_template": meta.staleness(service.contracts) if meta else None,
+                    "landed": landed, "skipped": skipped}
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
     @app.get("/batches")
     def batches(doc_type: Optional[str] = Query(None)) -> List[Dict[str, Any]]:

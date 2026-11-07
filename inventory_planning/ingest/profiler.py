@@ -38,6 +38,21 @@ import pandas as pd
 _PUNCT_RE = re.compile(r"[#./()\\\[\]{}:;,'\"*&%$@!?<>|+=~`^]")
 _SPACE_RE = re.compile(r"[\s_\-]+")
 
+# `#` is the numero sign, not punctuation. Stripped as punctuation it takes the only
+# thing it said with it: `Tyco Part #` normalised to `tyco part`, which is a superset
+# of no alias at all — both `part no` and `part number` keep a token it no longer has
+# — so the column the purchase orders are keyed on matched nothing, the sheet routed
+# with no `sku`, and the melt had no identifier to drop on. `Part #`, `Item #`, `PO #`
+# and `Invoice #` are all the same shape, and all of them were unmatchable.
+#
+# `number` folds onto `no` in the same pass, and the fold is safe because it applies
+# to both sides of the comparison: aliases are normalised through this function too,
+# so `material number`, `material no` and `material #` become one token set rather
+# than three spellings each contract has to remember to list. That is the enumeration
+# treadmill the alias matching exists to avoid.
+_NUMERO_RE = re.compile(r"#")
+_NUMBER_WORD_RE = re.compile(r"\bnumber\b")
+
 
 # Word boundaries a header carries in its capitalisation instead of in a separator.
 # `OrderDate` is two words and matched none of `order date`'s three matching rules —
@@ -59,8 +74,13 @@ def normalize_header(s: Any) -> str:
     # Before lowercasing — the capitalisation is the only evidence of the boundary.
     text = _ACRONYM_RE.sub(" ", _CAMEL_RE.sub(" ", text))
     text = text.lower()
+    # Before the punctuation class, which contains `#` and would otherwise eat it.
+    text = _NUMERO_RE.sub(" no ", text)
     text = _PUNCT_RE.sub(" ", text)
     text = _SPACE_RE.sub(" ", text)
+    # After separators have collapsed to single spaces, so `Part_Number` and
+    # `PartNumber` have both become two words by the time the fold looks for one.
+    text = _NUMBER_WORD_RE.sub("no", text)
     return text.strip()
 
 

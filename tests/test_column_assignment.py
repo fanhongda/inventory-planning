@@ -168,11 +168,24 @@ class TestRunTogetherWordsAreStillWords:
         ("OrderDate", "order date"),
         ("ShipDate", "ship date"),
         ("MaterialNo", "material no"),
-        ("PONumber", "po number"),
+        # `po no`, not `po number`: the boundary is still what this asserts — the
+        # alternative is `ponumber` — but `number` folds onto `no` afterwards, so
+        # `PONumber`, `PO No` and `PO #` are one token set instead of three.
+        ("PONumber", "po no"),
         ("GRDate", "gr date"),
     ])
     def test_the_boundary_is_found(self, header, expected):
         assert normalize_header(header) == expected
+
+    @pytest.mark.parametrize("header", ["Part #", "Part No", "Part Number",
+                                        "PartNumber", "Part_Number", "Part#"])
+    def test_every_spelling_of_a_numbered_column_is_one_token_set(self, header):
+        """
+        `#` is the numero sign, not punctuation. Stripped as punctuation it left
+        `Tyco Part #` as `tyco part`, a superset of no alias at all, so the column
+        the purchase orders are keyed on matched nothing at all.
+        """
+        assert normalize_header(header) == "part no"
 
     @pytest.mark.parametrize("header", ["MATNR", "ETA", "SKU", "EBELN", "WERKS"])
     def test_an_acronym_is_left_whole(self, header):

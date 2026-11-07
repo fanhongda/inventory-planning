@@ -275,6 +275,10 @@ class DocContract:
     table_assertions: List[Assertion] = dc_field(default_factory=list)
     capabilities: List[str] = dc_field(default_factory=list)
     default_filters: List[str] = dc_field(default_factory=list)
+    # Columns that distinguish one telling of a row from another rather than one part
+    # of it from another. Rows identical on everything but these are the same row said
+    # twice, and the rollup would sum their measures. See `po_history.yaml`.
+    repeat_markers: List[str] = dc_field(default_factory=list)
     # Content test used only to break a tie between documents whose headers are
     # indistinguishable. One ERP export filtered two ways — open orders and shipped
     # history — has byte-identical columns, so no header-based rule can separate them;
@@ -365,6 +369,7 @@ class DocContract:
             table_assertions=[Assertion.parse(a) for a in (raw.get("assertions", []) or [])],
             capabilities=list(raw.get("capabilities", []) or []),
             default_filters=default_filters,
+            repeat_markers=[str(c) for c in (raw.get("repeat_markers") or [])],
             discriminator=str(discriminator) if discriminator else None,
             discriminators=discriminators,
             identifying_any=identifying_any,

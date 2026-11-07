@@ -14,7 +14,7 @@ import pandas as pd
 from .feedback.snapshot import SnapshotSaver
 from .provenance import RunManifest, RunRegistry
 from .readers.sales_history_reader import SalesHistoryReader
-from .readers.po_history_reader import POHistoryReader
+from .readers.po_history_reader import POHistoryReader, consolidate_to_receipt_grain
 from .readers.open_so_reader import OpenSOReader
 from .readers.open_po_reader import OpenPOReader
 from .readers.inventory_reader import InventoryReader, consolidate_to_planning_grain
@@ -118,6 +118,10 @@ class InventoryPlanner:
         # Readers
         self.sales_reader   = SalesHistoryReader(self.config_dir)
         self.po_reader      = POHistoryReader(self.config_dir)
+        # So an extract whose suppliers are missing from the transit table can leave a
+        # starter copy of it beside the run's other outputs, rather than only naming
+        # them in a line of console output that scrolls away.
+        self.po_reader.output_dir = self.output_dir
         self.open_so_reader = OpenSOReader(self.config_dir)
         self.open_po_reader = OpenPOReader(self.config_dir)
         self.inv_reader     = InventoryReader(self.config_dir)
@@ -239,6 +243,10 @@ class InventoryPlanner:
             inventory_df, planning_location=self.inv_reader.location_id, verbose=False,
             stock_status=self.inv_reader.stock_status,
         )
+        # No `consolidate_to_receipt_grain` here, unlike the stock snapshot above and
+        # unlike `run_kpi_review`: this stage takes its purchase history from `results`,
+        # which `run_planning` already consolidated, and has no parameter for it.
+        #
         # The planning run already resolved these against the same file. Reusing them
         # is not an optimisation — rebuilding would give the policy layer its own copy
         # of every parameter, and the first time one of them drifted the report would
@@ -424,6 +432,7 @@ class InventoryPlanner:
             inventory_df, planning_location=self.inv_reader.location_id, verbose=False,
             stock_status=self.inv_reader.stock_status,
         )
+        po_history_df = consolidate_to_receipt_grain(po_history_df, verbose=False)
 
         # One anchor for the whole review, taken from the data. Mixing a data-derived
         # date in one section with today's date in another makes the two halves
@@ -992,6 +1001,31 @@ class InventoryPlanner:
             inventory_df, planning_location=self.inv_reader.location_id,
             stock_status=self.inv_reader.stock_status,
         )
+        # Same argument one document over. A confirmation-level purchase export carries
+        # one row per vendor confirmation, so a PO line arrives twice — acknowledgement
+        # and shipping notification — and the line-level quantity on both is counted
+        # twice by every ordering-pattern figure. Done here rather than in the reader's
+        # `_post_process` alone because the intake path does not run it: the contract
+        # derives `lead_time_days` itself, and this is where the two paths meet.
+        #
+        # `po_history_as_read` goes to the store for the same reason the stock snapshot
+        # does: the dropped rows are a real property of the export, and history not
+        # collected cannot be recovered later.
+        po_history_as_read = po_history_df
+        po_history_df = consolidate_to_receipt_grain(po_history_df)
+        # And the lead-time clock, for the same reason: the intake path never runs the
+        # reader, and the contract's own derivation is `days_between(receive_date,
+        # po_date)` — precisely the one that cannot evaluate on an extract carrying a
+        # confirmed-dispatch date and no goods receipt. Idempotent: a frame that already
+        # has a measured lead time keeps it.
+        if po_history_df is not None and len(po_history_df):
+            po_history_df = self.po_reader.ensure_lead_time(po_history_df)
+            # On the manifest, not merely on disk: `/runs/{id}/outputs` lists the
+            # manifest so a directory holding a month of runs can still say which
+            # files belong to this one, and a starter table the screen cannot offer
+            # is a line of console output promising a file nobody can reach.
+            if self.po_reader.transit_template_path is not None:
+                self.run.record_output(self.po_reader.transit_template_path)
         from .policy.service import latest_observed_date
         as_of, stale = latest_observed_date(sales_df, open_so_df, po_history_df)
         if as_of and stale > 45:
@@ -1021,7 +1055,7 @@ class InventoryPlanner:
             print(resting.summary())
 
         self._shadow_write({
-            "sales_history": sales_df, "po_history": po_history_df,
+            "sales_history": sales_df, "po_history": po_history_as_read,
             "open_so": open_so_df, "open_po": open_po_df,
             "inventory": inventory_as_read,
         }, valid_time=as_of)
@@ -1049,6 +1083,12 @@ class InventoryPlanner:
         self._run_gate(quality_checks.gate_demand(
             ts, as_of, stale if as_of else None, self.gate_thresholds))
 
+        # The population the run plans: what sold, union what the masters carry. Taken
+        # before the gate's own view of the demand and after `ts` is final, because the
+        # gate judges the demand history and this widens the plan, not the history.
+        demand_summary, population = self._extend_population_from_masters(
+            demand_summary, ts, item_master_df, planning_master_df)
+
         # Step 2: Supplier lead times
         print("\n[2/7] Computing supplier lead times...")
         supplier_lt = (
@@ -1059,7 +1099,7 @@ class InventoryPlanner:
         )
         print(f"      {len(supplier_lt)} SKU×supplier LT records measured from receipts")
         supplier_lt = self._fill_lead_time_from_masters(
-            supplier_lt, ts.columns, item_master_df, planning_master_df
+            supplier_lt, population, item_master_df, planning_master_df
         )
 
         # Step 3: Demand classification
@@ -1365,6 +1405,86 @@ class InventoryPlanner:
         profile = build_policy_profile(resolved.frame, backlog=backlog,
                                        inventory=inventory)
         return attributes, crosscheck, resolved, profile
+
+    def _extend_population_from_masters(self, demand_summary, ts, item_master_df,
+                                        planning_master_df):
+        """
+        The planning population is the demand history *union* the masters, not the
+        demand history alone.
+
+        Every join downstream of `classified` is a left join onto it, so an item absent
+        from `demand_summary` is not planned, not reported and not counted — it does not
+        come out wrong, it does not come out at all. An item that simply did not sell in
+        the window the extract covers is the ordinary case of that, and so is stock held
+        against an item with no sales history: it was invisible even to the slow-moving
+        analysis, which is built on the same frame.
+
+        Master rows are added at zero demand, because that is what they are. No history
+        is not a forecast of nothing and nothing here invents one: they get a position,
+        a lead time, parameters and an inventory status, and they get no safety stock
+        and no purchase quantity, because there is no demand to size either against.
+        `demand_source` names the rows that arrived this way, so a reader can separate
+        what the history measured from what the master merely lists — which matters more
+        the more of the catalogue the master carries.
+
+        `ts` is left alone on purpose. It is the forecaster's input and the basis of
+        every demand-coverage figure, and padding it with zero columns would collapse
+        the median history depth and have the demand gate report a catalogue of dead
+        series as a thin history.
+
+        Returns `(demand_summary, population)`: the frame, and the SKUs the run is
+        planning — which is what the master lead-time fill is scoped to.
+        """
+        out = (demand_summary.copy() if demand_summary is not None
+               else pd.DataFrame(columns=["sku"]))
+        if "demand_source" not in out.columns:
+            out["demand_source"] = "sales_history"
+        known = set(out["sku"].astype(str)) if len(out) else set()
+
+        total_cycles = int(len(ts)) if ts is not None and len(ts) else 0
+        rows, seen = [], set()
+        for master, label in ((item_master_df, "item_master"),
+                              (planning_master_df, "planning_master")):
+            if master is None or not len(master) or "sku" not in master.columns:
+                continue
+            columns = ["sku"] + (["location_id"] if "location_id" in master.columns
+                                 else [])
+            for row in master[columns].dropna(subset=["sku"]).itertuples(index=False):
+                sku = str(row.sku)
+                if sku in known or sku in seen:
+                    continue
+                seen.add(sku)
+                location = getattr(row, "location_id", None)
+                rows.append({
+                    "sku": sku,
+                    # The master's own plant where it names one. Falling through to the
+                    # configured node is the same rule every other document follows.
+                    "location_id": (str(location)
+                                    if location is not None and pd.notna(location)
+                                    else self.sales_reader.location_id),
+                    "demand_mean": 0.0,
+                    "demand_std": 0.0,
+                    "demand_cv": np.nan,
+                    "active_cycles": 0,
+                    "total_cycles": total_cycles,
+                    "first_sale": pd.NaT,
+                    "last_sale": pd.NaT,
+                    "total_qty": 0.0,
+                    "total_amount": np.nan,
+                    "demand_source": label,
+                })
+
+        if not rows:
+            return out, known
+
+        added = pd.DataFrame(rows)
+        by_source = added["demand_source"].value_counts().to_dict()
+        print(f"      + {len(added):,} SKUs carried by master data with no demand in "
+              f"the history {by_source}")
+        print(f"        Planned at zero demand — position, parameters and inventory "
+              f"status appear; no safety stock or purchase quantity is sized for them. "
+              f"Filter on demand_source to separate them.")
+        return pd.concat([out, added], ignore_index=True), known | seen
 
     @staticmethod
     def _fill_lead_time_from_masters(supplier_lt, skus, item_master_df, planning_master_df):

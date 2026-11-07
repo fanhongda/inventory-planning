@@ -813,6 +813,211 @@ is already the layer whose premise is that it does not estimate.
   constant, and it is not a prerequisite for anything above.
 
 
+## Purchase history: two cleaning layers, and what each one cannot reach (2026-11-07)
+
+`readers.po_history_reader.consolidate_to_receipt_grain` drops the rows of a PO line
+that carry no goods receipt, where that line has one. It exists because a
+*confirmation-grain* export is finer than the `po_receipt_line` grain the contract
+declares: SAP under confirmation control holds one EKES row per vendor confirmation,
+so a line arrives twice — an `AB` acknowledgement with no receipt against it and an
+`LA` shipping notification carrying the goods receipt. `po_qty` and `delivered_qty`
+are line-level values repeated on both rows, so every ordering-pattern figure doubled
+— bought against demand, over-ordered, lot-size conformance, replenishment cadence.
+The lead time was never affected: the acknowledgement row has no receipt date, so
+`lead_time_days` is null on it and the weighted average already dropped it.
+
+Nothing caught it, and that is the part worth remembering. The grain test compares row
+count against distinct natural-key count, and `receive_date` is part of that key — so
+the two rows of one line differ on exactly the column that would have exposed them.
+
+It runs in two places because the entry paths meet nowhere earlier: the reader's
+`_post_process`, and `run_planning` / `run_kpi_review` in the orchestrator. The intake
+path never runs the reader — the contract derives `lead_time_days` itself. The same is
+true of `POHistoryReader.ensure_lead_time`, and for the same reason.
+
+**The other layer, and why it has to be separate.** Where the extract carries *no*
+goods receipt, the two confirmation rows of a line differ on nothing at all: the
+natural key degrades to the line, `_apply_rollup` fires, and it **sums** — 100 + 100
+into 200. That sum is not recoverable, so nothing downstream of intake can fix it.
+The contract therefore declares `repeat_markers: [confirmation_category]`, and
+`Adapter._collapse_repeats` drops rows identical but for a marker, between the filters
+and the rollup.
+
+Two mechanisms at two layers is not duplication; the cases are genuinely different:
+
+| | rows differ on | rollup | fixed by |
+|---|---|---|---|
+| receipt in the extract | `receive_date` | does not fire — keys are distinct | `consolidate_to_receipt_grain`, downstream, keyed on the receipt |
+| no receipt | nothing but the marker | fires and sums | `repeat_markers`, inside intake, before the sum |
+
+The marker rule is deliberately an exact-duplicate test. "The measures are identical
+within the group" would also describe two schedule lines that happen to be equal
+halves of a line, and summing *those* is correct — only a column naming the telling
+can separate the two cases. A row differing anywhere outside the marker is kept, which
+is what leaves partial deliveries and schedule lines intact.
+
+**What is still at the raw grain.** Only the receipt case, since the other is cleaned
+inside intake now. Two views of such a file keep the confirmation rows:
+
+- the fact store, which is handed `po_history_as_read` deliberately, for the same
+  reason the stock snapshot is: the dropped rows are a real property of the export,
+  and history not collected cannot be recovered later
+- `_resting_on`, which sizes each unmeasured assumption against the intake result's
+  own frames rather than the assembled ones — by the design its docstring sets out,
+  because sizing an assumption against a frame whose grain has moved is how a
+  plausible wrong number gets made. On a confirmation-grain export the `Σ po_qty`
+  it prints behind the currency assumption is therefore twice the planning quantity.
+
+No computed figure is affected — the sample data reshaped to confirmation grain and
+the same data at receipt grain produce identical output apart from those two intake
+lines — and the exposure number errs toward overstating what rests on the assumption
+rather than toward false comfort. So this is a legibility gap, not a wrong plan: a
+planner reconciling `Σ po_qty` against their ERP sees twice their number, with the
+explanation several lines earlier instead of beside it.
+
+**Why the receipt case is not moved into intake too.** Three options, none free:
+
+- *Clean it in the intake as well.* The store then holds a frame that is not what was
+  exported, against the principle above — unless intake hands out two frames, one
+  published and one as-read, which is a change to what a document *is* at that layer
+  rather than a tweak. Note the asymmetry this would remove: the repeat-marker case is
+  already cleaned in intake, so the store already does not hold those rows. The
+  principle is being honoured in one case and not the other because in one case the
+  sum forced the issue, not because the two were weighed and decided differently.
+- *Give `_resting_on` a per-document grain correction.* Narrow and cheap, but it puts
+  knowledge of one document type's defect inside the exposure module, which is the
+  coupling that docstring is written against.
+- *Teach the grain test to see it.* Does not fix the number, but it is the cheapest
+  thing that stops the next instance being silent — and there will be a next instance:
+  schedule-line and status-event exports arrive in the same shape, and the related item
+  under *Smaller items* (transfer and rework receipts mixed into purchase lead times)
+  is the same family of defect. The signal is specific enough to test for: a natural
+  key containing a timestamp that is null on some rows of an otherwise identical key.
+
+**A routing trap next door.** A purchase export with no goods receipt needs a delivered
+or open quantity column to be recognised as history: `po_history`'s discriminators are
+`not_null(receive_date)` and `open_qty == 0`, and with neither evaluable such a file
+scores as an open PO and is counted as inbound supply — the exact failure
+`test_po_history_variants` was written for, which inflates the position and stops the
+run recommending purchases. Reproduced at 87% confidence on a dispatch-date extract
+stripped of its delivered-quantity column. Nothing is wrong in the code; the shape is
+genuinely ambiguous. But a file one column away from being misread as its own opposite
+deserves a check that says so, rather than a confidence score nobody reads.
+
+## A lead time built from a promise, and the goods receipts that would replace it (2026-11-07)
+
+`POHistoryReader.ensure_lead_time` runs the best clock the extract supports. Where
+there is a confirmed-dispatch date and no goods receipt, that is
+`(confirmed_delivery_date - po_date) + transit_days`, with the transit leg stated per
+supplier in `config/supplier_transit.csv`, which also declares the transport mode because the purchase export carries none. `transit_days` travels as far as
+`policy.should_be`, which prefers it over the `transit_share_of_lt` convention it
+otherwise guesses the pipeline split with.
+
+**It is a commitment, not a measurement, and the labels now say so.** The date is what
+the supplier *committed* to; a supplier who is chronically late looks punctual in it.
+`lt_basis` is `promised_dispatch_plus_transit` and `lt_source` is `supplier_confirmed`,
+a `crosscheck` authority tier of its own: above the masters, because it is per order
+and current and because on an extract with no receipt nobody has been checking the
+promise against anything, and always below `measured`. It arrived as `measured` when
+first written, which let an optimistic promise outrank a planned delivery time a person
+maintains — the one place the promise is likeliest to be wrong.
+
+**The variability is the weak part, and worse than a missing transit sigma.** The spread
+of `confirmed_delivery_date - po_date` is how much the *promise* varies, not how much
+performance does: a supplier who always promises 45 days and is always ten days late
+shows no spread at all. So `lt_std_days` on this basis is reported as a floor —
+`lt_sigma_basis` is `promise_spread_floor` — rather than zeroed, which would shrink
+safety stock on the strength of a promise, or passed off as measured variability. The
+transit leg is a constant and adds no variance either.
+
+Note what `safety_stock.calculate` does with it: `lt_std_days` is `fillna(0)` and the
+lead-time term of the variance is `d_mean**2 * lt_std**2`, so **"no lead-time variance"
+and "lead-time variance unknown" are the same state** and both silently drop the term.
+On air freight that hides little. On sea it would hide the largest source of lead-time
+risk on the items with the longest exposure.
+
+**The real fix is upstream of all of it: post the goods receipts.** The receipts are
+missing here because of operating discipline, not because the process has no receiving
+step — `open_qty` is 0, so the system knows the goods arrived; only the date is absent.
+Every limit above dissolves the moment that date is recorded: the lead time becomes
+measured, the sigma becomes real, and the transit table stops being load-bearing.
+
+`quality.checks._check_receipt_completeness` is the figure that makes the gap arguable:
+the share of fully-delivered lines with no receipt date, the suppliers behind it
+worst-first, and whether the dates span months — standing practice — or one. It
+distinguishes a column that is absent, where the receipts may well be posted and simply
+not exported and the remedy is to ask for the column, from one present and unfilled,
+where the remedy is to post them. It warns and never blocks: what it measures is
+operating discipline, and a gate that stopped the run would stop the report that makes
+the case.
+
+- **A supplier absent from the transit table gets no lead time**, falling through to the
+  item master's planned delivery time, rather than a lead time short by the whole
+  transit leg. That direction is deliberate: short understates the reorder point, which
+  is the one that stocks out. `default_days` exists for sites that would rather have one
+  number than a gap.
+
+## Air to sea: what breaks when the mode changes (2026-11-07)
+
+**Not an issue while the lead time comes from a promise, and the reason is worth
+keeping.** On the `promised_dispatch_plus_transit` basis only the dispatch leg is
+measured, and that leg does not change with the mode; the transit leg is stated in
+`config/supplier_transit.csv`. So moving a supplier from air to sea is one edit and the
+lead time follows on the next run — no measurement window to refill, no blend. The
+section below is what happens **once goods receipts are posted** and the lead time
+becomes a real measurement with the transit time inside it. It is written down now
+because that is the same change this file is otherwise arguing for, and it should not
+arrive as a surprise.
+
+Then: lead times are measured per `sku × supplier`, and **not per transport mode**.
+While everything ships by air that costs nothing. As products move to sea it becomes
+the largest planning risk in the pipeline, and it is invisible until after the switch.
+
+A SKU mid-transition — eight air receipts at 60 days, then two sea at 100 — comes out
+of `compute_supplier_lt` at **73.8 days, sigma 16.0, n=10, min 60 / max 100**. That
+number describes neither mode. At 100 units a day the demand side of the reorder point
+is short by 2,620 units, about 26 days of cover, and the recency weighting means it
+drifts upward for the whole measurement window: wrong every week, differently.
+
+Two errors in opposite directions, neither controlled. The lead time is short, which
+depresses the reorder point; the sigma is inflated by the bimodality, which pads safety
+stock. The second partly masks the first, so nothing on the report looks wrong.
+
+Grouping by mode fixes more than the arithmetic. A freshly switched item would have two
+or three sea observations, which is below `MIN_SAMPLES_TO_TRUST_MEASUREMENT` — so the
+thin-evidence rule in `crosscheck` would demote it and the item master's planned
+delivery time, updated for the new mode, would take over. That is the behaviour wanted
+during a transition, and it falls out of the existing design once the grouping is right.
+
+What is needed, in order, and none of it before the receipts exist:
+
+1. **Group the lead time by `sku × supplier × mode`.** The mode is on the frame already,
+   put there by `supplier_transit.csv` since no export carries it. One supplier shipping
+   both ways is what makes this necessary: a supplier that only ever ships one way is
+   already separated by `sku × supplier`.
+2. **A value domain for `transport_mode`.** It is a dimension with no normalisation, so
+   `AIR` / `Air Freight` / `AF` / `SEA` / `Ocean` / `FCL` / `LCL` would each be their own
+   group. Harmless while the values come from one hand-maintained CSV; necessary the
+   moment an export supplies them. The only consumer today is
+   `diagnostics._chronic_air`, which hardcodes four air spellings.
+3. **A transit sigma per lane**, so the variance term is not silently zero on the leg
+   that carries most of the risk. This is the second thing the receipts unlock, and the
+   only one of these that cannot be done with a config file.
+4. **`_chronic_air` means something different after the switch.** Today it reports air
+   used as routine rather than exception, which is the old normal. It becomes the right
+   diagnostic again once sea is the baseline, and wants rewording rather than rework.
+
+A smaller thing found on the way and fixed: `open_po_reader.inbound_schedule` did
+`df["location_id"].iloc[0]` on a frame that can legitimately be empty — a business with
+nothing currently on order has one — and took the whole run down with an IndexError
+several steps after the thing worth reporting.
+
+Until then: the drop is reported on every run that triggers it, naming the row and line
+counts, the confirmation codes actually found, and the quantity that would have been
+counted twice. `confirmation_category` is read as a dimension — never filtered on, so
+the rule still works for systems that have no such column — so the codes are on the
+frame for anyone checking.
+
 ## Smaller items
 
 - `IFR` (item fill rate) service metric — `config/stocking_policy.json` documents

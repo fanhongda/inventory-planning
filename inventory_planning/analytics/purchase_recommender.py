@@ -305,7 +305,11 @@ class PurchaseRecommender:
         )
 
         cols = [
-            "sku", "location_id", "stocking_class", "recommended_action",
+            # `demand_source` travels with the recommendation because the population
+            # is the demand history union the masters: a row sourced from a master has
+            # no demand behind it, and a buyer reading NO-ACTION is owed the reason.
+            "sku", "location_id", "stocking_class", "demand_source",
+            "recommended_action",
             "forecast_next_period", "statistical_next_period", "forecast_source",
             "forecast_avg_monthly", "forecast_horizon_qty",
             "backlog_qty", "backlog_due_qty", "backlog_past_due_qty",

@@ -417,11 +417,12 @@ in since the screen was built.
 
 So M0 is not a prettier M2. It answers a different question, and it is the only screen
 whose question is about the planner rather than about the data: *of the things only you
-can know, which have you said?* Three, as of now:
+can know, which have you said?* Four, as of now:
 
 | | | Unset costs |
 |---|---|---|
 | **Warehouse locations** | what each storage-location code means | **blocks.** Quarantine summed into the position overstates it, so the run under-orders |
+| **Supplier transit times** | how each supplier ships, and how long it takes to arrive | no lead time from the dispatch basis — the item falls back to the item master's planned delivery time |
 | **Inventory cover target** | days of inventory the business intends to carry | a plan with no opinion about whether the plan is good |
 | **Service target** | CRSD on-time delivery the business commits to | the same, for service |
 
@@ -445,9 +446,14 @@ completed rows are as loud as its open ones is a checklist nobody finishes.
 the landed stock export and lists the codes it carries with the stock behind each.
 "Declare your storage locations" is a chore with no visible end; "02 holds 469 units and
 nothing says what it is" is a question with an answer, and the quantity is what makes it
-worth answering now.
+worth answering now. The transit card does the same against the landed purchase history:
+not "fill in the transit table" but "Sup-Alpha shipped 66 lines and nothing says how
+long they take to get here". It also distinguishes a supplier answered by name from one
+answered by the `*` row, because a blanket is a reason to finish the table rather than a
+reason to stop — the same distinction `location_status.json` makes about its own
+wildcard.
 
-#### Only one of the three blocks, and that is a decision
+#### Only one of the four blocks, and that is a decision
 
 The temptation is to make all three required, because required is what produces the
 urgency that was missing. It is wrong, in both directions.
@@ -463,6 +469,14 @@ sometimes the honest one. Stopping a first-time planner at the door over a quest
 whose real answer is "we have not decided yet" teaches them that this screen is an
 obstacle to get past, and the next screen that asks them something will be got past the
 same way.
+
+The transit table does not either, and the line it sits on is worth naming because it
+looks like the location case at first glance. A missing transit time **withholds** a
+number: the lead time falls back to the item master's planned delivery time, labelled as
+the stated value it is, and the run says which suppliers it could not answer for. An
+undeclared location **puts a wrong number in the position**. Both are gaps in data only
+a planner holds; only the second produces arithmetic nobody can see through, and only
+that one is worth stopping a run for.
 
 The scoping of the blocking check matters for the same reason. **One location code, or
 none, needs no declaration** — there is nothing to separate, and the snapshot is the

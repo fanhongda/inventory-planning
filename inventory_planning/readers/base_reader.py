@@ -122,6 +122,11 @@ class BaseReader(ABC):
 
     doc_type: str  # set by subclass
 
+    # Where a reader may leave a file for the planner to fill in — the starter transit
+    # table is the one case. None means it writes nothing, which is what a reader
+    # constructed on its own in a test or a notebook should do.
+    output_dir = None
+
     def __init__(self, config_dir: Union[str, Path] = None):
         self.config_dir = Path(config_dir) if config_dir else Path(__file__).parents[2] / "config"
         self.schema = ALL_SCHEMAS[self.doc_type]

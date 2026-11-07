@@ -739,6 +739,7 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
         """
         from ..policy import locations as location_edit
         from ..policy import macro as macro_edit
+        from ..policy import transit as transit_edit
         from ..policy.target import StatedTargetError, stated_target
 
         root = service.config_dir
@@ -796,6 +797,67 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
             "editor": "locations",
             "file": declared["file"],
             "detail": {**declared, "observed": observed, "undeclared": undeclared},
+        })
+
+        # ── The supplier transit table, and the suppliers actually bought from ──
+        # Same discipline as the locations above: not "fill in the transit table" but
+        # "Sup-Alpha shipped 66 lines and nothing says how long they take to get here".
+        transit_declared = transit_edit.current(root)
+        transit_observed: List[Dict[str, Any]] = []
+        try:
+            landed = service.landed_documents()
+            history = landed.documents.get("po_history")
+            frame = getattr(history, "frame", None)
+            if frame is not None and "supplier" in frame.columns:
+                table = {r["supplier"]: r for r in transit_declared["rows"]
+                         if r["supplier"] != transit_declared["wildcard_key"]}
+                names = frame["supplier"].dropna().astype(str).str.strip()
+                for name in sorted(n for n in names.unique() if n):
+                    match = max((k for k in table if name.upper().startswith(k)),
+                                key=len, default=None)
+                    answered = table.get(match) if match else None
+                    transit_observed.append({
+                        "supplier": name,
+                        "rows": int((names == name).sum()),
+                        "transport_mode": (answered or {}).get("transport_mode")
+                                          or (transit_declared["wildcard"] or {}).get(
+                                              "transport_mode"),
+                        "transit_days": (answered or {}).get("transit_days")
+                                        if answered else
+                                        (transit_declared["wildcard"] or {}).get(
+                                            "transit_days"),
+                        # A blanket is not an answer for this supplier, and the screen
+                        # has to be able to say which it is showing.
+                        "named": answered is not None,
+                    })
+        except Exception:
+            # Never fails the screen, for the reason the locations block gives.
+            transit_observed = []
+
+        unnamed = [o["supplier"] for o in transit_observed if not o["named"]]
+        items.append({
+            "key": "transit",
+            "title": "Supplier transit times",
+            "question": "How does each supplier ship, and how long does it take to "
+                        "arrive?",
+            "why": ("No purchase export carries either, so this is the only place they "
+                    "come from. Where the extract has a confirmed dispatch date and no "
+                    "goods receipt, the lead time is that date plus the transit leg "
+                    "declared here — and a supplier with no row gets no lead time from "
+                    "that path at all, falling back to the item master's planned "
+                    "delivery time."),
+            # Not blocking, and the distinction is the same one the locations item
+            # rests on: a missing transit time *withholds* a number and the fallback is
+            # labelled, where an undeclared location puts a wrong number in the
+            # position. Only the second is worth stopping a run for.
+            "blocking": False,
+            "blocking_now": False,
+            "state": "set" if not unnamed and transit_declared["declared"] else (
+                "partial" if transit_declared["declared"] else "missing"),
+            "editor": "transit",
+            "file": transit_declared["file"],
+            "detail": {**transit_declared, "observed": transit_observed,
+                       "unnamed": unnamed},
         })
 
         # ── The two targets ──
@@ -881,6 +943,38 @@ def create_app(config_dir=None, store_root=None, output_dir=None, tenant=None):
                 basis=payload.get("basis", ""), config_dir=service.config_dir,
             )
         except LocationError as refused:
+            raise HTTPException(status_code=409, detail=str(refused))
+
+    @app.put("/setup/transit")
+    def edit_transit(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """
+        Declare how each supplier ships and how long it takes — propose, then apply.
+
+        The same two-step contract as every other editor here: the proposal reports the
+        digest of the file it read, the apply quotes it back, and a file that moved in
+        between is a refusal rather than a surprise. See `policy/transit.py` for why
+        this is a separate editor, and why it cannot stop a run the way the location
+        statuses can.
+
+        `rows` is the whole table, not a patch. A partial submission would make
+        "withdraw a supplier" unexpressible, and withdrawing one is a real edit: it
+        moves that supplier's items back to the item master's planned delivery time,
+        which is sometimes the right answer.
+        """
+        from ..policy.transit import TransitError, apply as apply_transit, propose
+
+        rows = payload.get("rows")
+        if rows is None:
+            raise HTTPException(status_code=400, detail="rows is required")
+        try:
+            if not payload.get("apply"):
+                return propose(rows, service.config_dir).as_dict()
+            return apply_transit(
+                rows,
+                reason=payload.get("reason", ""), by=payload.get("by", ""),
+                basis=payload.get("basis", ""), config_dir=service.config_dir,
+            )
+        except TransitError as refused:
             raise HTTPException(status_code=409, detail=str(refused))
 
     @app.get("/gates")

@@ -469,6 +469,7 @@ class Adapter:
         df = self._apply_filters(df, log, contract)
 
         # 7. Grain rollup ------------------------------------------------------
+        df = self._collapse_repeats(df, contract, log)
         df = self._apply_rollup(df, contract, log)
 
         return df, log
@@ -678,6 +679,46 @@ class Adapter:
                                          f"dropped rows matching /{pattern}/",
                                          rows_affected=removed))
         return df
+
+    def _collapse_repeats(
+        self, df: pd.DataFrame, contract: DocContract, log: List[TransformStep]
+    ) -> pd.DataFrame:
+        """
+        Keep one row where several say the same thing, before the rollup sums them.
+
+        A contract's `repeat_markers` name the columns that distinguish one *telling* of
+        a row from another — SAP's confirmation category is the case this exists for.
+        Rows identical on every other mapped column are the same line exported twice,
+        and `_apply_rollup` sums measures: two confirmation rows of a 100-unit line
+        become one row of 200, with nothing downstream able to see there was ever more
+        than one row. Run before the rollup because the sum is not recoverable after it.
+
+        Deliberately an exact-duplicate test rather than a per-measure one. "The values
+        are identical within the group" would also describe two schedule lines that
+        happen to be equal halves of a line, and summing *those* is correct. A row that
+        differs anywhere outside the marker — a different receipt date, a different
+        schedule line, a different quantity — is a different row and is kept, which is
+        what keeps partial deliveries intact.
+        """
+        markers = [c for c in (contract.repeat_markers if contract else []) if c in df.columns]
+        if not markers or len(df) < 2:
+            return df
+        rest = [c for c in df.columns if c not in markers]
+        if not rest:
+            return df
+
+        duplicated = df.duplicated(subset=rest, keep="first")
+        if not duplicated.any():
+            return df
+
+        dropped = int(duplicated.sum())
+        seen = sorted({str(v).strip() for v in df.loc[duplicated, markers[0]]
+                       if str(v).strip() and str(v).strip().lower() != "nan"})
+        detail = (f"{dropped:,} row(s) identical but for {'+'.join(markers)}"
+                  + (f" ({', '.join(seen)})" if seen else "")
+                  + " — the same row told twice; kept one so the rollup cannot sum it")
+        log.append(TransformStep("<repeats>", "filtered", detail, rows_affected=dropped))
+        return df[~duplicated].copy()
 
     def _apply_rollup(
         self, df: pd.DataFrame, contract: DocContract, log: List[TransformStep]

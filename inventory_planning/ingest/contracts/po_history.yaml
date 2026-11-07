@@ -97,6 +97,27 @@ fields:
       source finer than the contract.
     aliases: [line, line no, line number, po line,               item, item no., position, pos, line item, seq, sequence]
 
+  confirmation_category:
+    type: string
+    role: dimension
+    normalize: upper_strip
+    description: >
+      Vendor-confirmation category, where the export is at confirmation grain rather
+      than at receipt grain — SAP's EKES-EBTYP. `AB` is the order acknowledgement
+      (Auftragsbestätigung) and `LA` the shipping notification (Lieferavis); the goods
+      receipt is posted against the LA, so a line under confirmation control is
+      exported twice, once with a receipt and once without.
+
+      Read as a dimension and never filtered on. `consolidate_to_receipt_grain` keys
+      on whether the line's rows carry a goods receipt, not on this code, because the
+      same duplication arrives from systems that have no such column and from SAP
+      extracts that drop it. What this field buys is that the finding can name the
+      codes it found instead of asserting them, and that a planner looking for why a
+      row count fell has the column in front of them.
+    aliases: [conf. category, confirmation category, conf category, conf cat,
+              conf. cat., category of confirmation, confirmation type, ebtyp,
+              确认类别]
+
   po_schedule_line:
     type: string
     role: identifier
@@ -133,6 +154,29 @@ fields:
     aliases: [receive date, received date, receipt date, goods receipt date, gr date,
               actual delivery, actual delivery date, actual receipt date, grn date,
               posting date, actual arrival date]
+
+  confirmed_delivery_date:
+    type: date
+    role: timestamp
+    description: >
+      The date the supplier confirmed or notified, as distinct from the date the goods
+      were received — SAP's EKES-EINDT on the confirmation, EKET-EINDT on the schedule
+      line. On an acknowledgement it is the delivery the supplier committed to; on a
+      shipping notification it is the dispatch the supplier announced.
+
+      Read, never treated as a receipt. `receive_date` deliberately excludes bare
+      "delivery date" spellings for exactly this reason — admitting them there would
+      end the lead-time clock at a date the goods had not arrived on, and understate
+      every lead time by the whole transit leg. An understated lead time understates
+      the reorder point, which is the direction that stocks out.
+
+      Its use is `lead_time_basis: ship_plus_transit`, where an extract carries this
+      and no goods receipt: the clock runs order -> dispatch from here and the transit
+      leg comes from `config/transit_times.json`. The result is part measured and part
+      stated, and `lt_source` says so.
+    aliases: [confirmed delivery date, confirmation date, confirmed date,
+              statistical delivery date, vendor confirmed date, ship date,
+              shipment date, dispatch date, asn date, eindt, 确认交期, 发货日期]
 
   lead_time_days:
     type: decimal
@@ -280,6 +324,23 @@ fields:
     description: Supplier minimum order quantity — a hard constraint on any EOQ recommendation
     aliases: [moq, min order qty, minimum order quantity, minimum qty, min qty,
               order multiple, lot size, rounding value]
+
+# Columns that distinguish one *telling* of a line from another, rather than one part
+# of it from another. Rows identical on everything but these are the same line said
+# twice, and the rollup — which sums measures — would double every quantity on it.
+#
+# This is the SAP confirmation case. With confirmation control active, EKES holds one
+# row per vendor confirmation, so a line is exported as an `AB` acknowledgement and an
+# `LA` shipping notification. Where the extract carries a goods receipt the two rows
+# differ on `receive_date` and `readers.po_history_reader.consolidate_to_receipt_grain`
+# resolves them downstream. Where it does not, they differ on nothing else at all, the
+# natural key degrades to the line, and the rollup sums 100 + 100 into 200 — before
+# anything downstream can see there was ever more than one row.
+#
+# Declared rather than inferred. "Values identical within the group" would also
+# describe two schedule lines that happen to be equal halves, and summing those is
+# correct; only a column that names the telling can separate the two cases.
+repeat_markers: [confirmation_category]
 
 assertions:
   - expr: "not_null(sku)"

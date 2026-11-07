@@ -40,6 +40,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from inventory_planning.ingest.adapter import Adapter
+from inventory_planning.orchestrator import InventoryPlanner
 from inventory_planning.ingest.contract import DocContract
 from inventory_planning.ingest.intake import Intake
 from inventory_planning.ingest.registry import AdapterRegistry
@@ -691,6 +692,45 @@ class TestTheSupplierTransitTable:
         assert list(table["supplier"]) == ["V-ALPHA"]
         # Pre-filled from the blanket, and the header says that is what it is.
         assert "blanket" in written.read_text(encoding="utf-8-sig")
+
+    def test_the_run_records_it_so_the_screen_can_offer_it(self, tmp_path):
+        """
+        `/runs/{id}/outputs` lists the run manifest and not the directory — so a
+        folder holding a month of runs can still say which files are this one's. A
+        starter table written to disk and not recorded is therefore invisible to the
+        screen and cannot be downloaded, while the console line promises it exists.
+        """
+        import glob
+        import json
+
+        out = tmp_path / "run"
+        store = tmp_path / "store"
+        data = tmp_path / "data"
+        data.mkdir()
+        for src in SAMPLE_DIR.glob("*.csv"):
+            (data / src.name).write_text(src.read_text(encoding="utf-8"),
+                                         encoding="utf-8")
+        # An extract with a confirmed dispatch date, no goods receipt, and suppliers
+        # that the (empty) shipped transit table does not name.
+        po = pd.read_csv(data / "po_history.csv")
+        po.insert(0, "Purchasing Document", [f"45{i:05d}" for i in range(len(po))])
+        po.insert(1, "Item", 10)
+        po = po.rename(columns={"Goods Receipt Date": "Confirmed Delivery Date"})
+        po["Delivered Qty"] = po["PO Qty"]
+        po["Still to be delivered"] = 0
+        po.to_csv(data / "po_history.csv", index=False)
+
+        planner = InventoryPlanner(output_dir=out, store_root=store,
+                                   interactive=False)
+        loaded = planner.load_all(sorted(str(f) for f in data.glob("*.csv")))
+        planner.run_planning(**loaded)
+
+        written = out / "supplier_transit_template.csv"
+        assert written.exists()
+        newest = sorted(glob.glob(str(out / "runs" / "*.json")))[-1]
+        manifest = json.loads(Path(newest).read_text(encoding="utf-8"))
+        names = [o.get("name") for o in manifest.get("outputs") or []]
+        assert "supplier_transit_template.csv" in names
 
     def test_nothing_is_written_when_every_supplier_is_named(self, tmp_path):
         out_dir = tmp_path / "out"

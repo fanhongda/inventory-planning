@@ -158,6 +158,10 @@ def consolidate_to_receipt_grain(df: pd.DataFrame, verbose: bool = True) -> pd.D
 class POHistoryReader(BaseReader):
     doc_type = "po_history"
 
+    # Set when a run writes the starter transit table, for the caller to record on the
+    # manifest — `/runs/{id}/outputs` lists the manifest, not the directory.
+    transit_template_path = None
+
     def _load_transit_times(self) -> tuple:
         """
         Transport mode and transit days per supplier, from `config/supplier_transit.csv`.
@@ -310,7 +314,15 @@ class POHistoryReader(BaseReader):
         Never written into `config/`: that would either overwrite a table someone is
         maintaining or look like it had been accepted. It goes beside the run's other
         outputs, and the planner moves it.
+
+        The path is kept on `transit_template_path` for the caller to record on the run
+        manifest. That is not bookkeeping: `/runs/{id}/outputs` lists the manifest and
+        not the directory — deliberately, so a folder holding a month of runs can still
+        say which files are this one's — so a file written here and not recorded is
+        invisible to the screen and cannot be downloaded. A starter table nobody can
+        reach is worse than none, because the console line promises it exists.
         """
+        self.transit_template_path = None
         if "supplier" not in df.columns or self.output_dir is None:
             return
         named = {str(s).strip().upper(): str(s).strip()
@@ -336,6 +348,7 @@ class POHistoryReader(BaseReader):
                 pd.DataFrame(rows).to_csv(handle, index=False)
         except OSError:
             return
+        self.transit_template_path = path
         print(f"      Starter table for the {len(rows):,} unlisted supplier(s): {path}")
 
     def _load_supplier_incoterms(self) -> dict:

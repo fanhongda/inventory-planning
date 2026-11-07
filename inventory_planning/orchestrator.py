@@ -1020,6 +1020,12 @@ class InventoryPlanner:
         # has a measured lead time keeps it.
         if po_history_df is not None and len(po_history_df):
             po_history_df = self.po_reader.ensure_lead_time(po_history_df)
+            # On the manifest, not merely on disk: `/runs/{id}/outputs` lists the
+            # manifest so a directory holding a month of runs can still say which
+            # files belong to this one, and a starter table the screen cannot offer
+            # is a line of console output promising a file nobody can reach.
+            if self.po_reader.transit_template_path is not None:
+                self.run.record_output(self.po_reader.transit_template_path)
         from .policy.service import latest_observed_date
         as_of, stale = latest_observed_date(sales_df, open_so_df, po_history_df)
         if as_of and stale > 45:

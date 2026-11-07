@@ -23,6 +23,20 @@ CONFIRMATION_CATEGORY = "confirmation_category"
 # `receive_date` refuses the bare "delivery date" spellings on purpose.
 CONFIRMED_DELIVERY_DATE = "confirmed_delivery_date"
 
+def _text(value) -> str:
+    """
+    One cell as trimmed text, with every flavour of blank reaching "".
+
+    A blank CSV cell arrives from pandas as a float NaN, and `nan or ""` keeps the nan
+    because nan is truthy — so `str()` of it is the literal "nan". Spelled out here
+    because the result of getting it wrong is a transport mode called "NAN" that
+    compares unequal to both a real mode and to nothing.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
 # The planner's table: transport mode and transit days per supplier. A CSV because it
 # is filled in for every supplier and a spreadsheet is the quickest way to do that.
 TRANSIT_FILE = "supplier_transit.csv"
@@ -189,11 +203,11 @@ class POHistoryReader(BaseReader):
 
         table, default = {}, (None, None)
         for row in raw.itertuples(index=False):
-            key = str(getattr(row, "supplier", "") or "").strip().upper()
+            key = _text(getattr(row, "supplier", None)).upper()
             days = pd.to_numeric(getattr(row, "transit_days", None), errors="coerce")
             if not key or pd.isna(days) or days < 0:
                 continue
-            mode = str(getattr(row, "transport_mode", "") or "").strip().upper() or None
+            mode = _text(getattr(row, "transport_mode", None)).upper() or None
             if key == TRANSIT_WILDCARD:
                 default = (mode, float(days))
             else:

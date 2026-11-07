@@ -97,6 +97,27 @@ fields:
       source finer than the contract.
     aliases: [line, line no, line number, po line,               item, item no., position, pos, line item, seq, sequence]
 
+  confirmation_category:
+    type: string
+    role: dimension
+    normalize: upper_strip
+    description: >
+      Vendor-confirmation category, where the export is at confirmation grain rather
+      than at receipt grain — SAP's EKES-EBTYP. `AB` is the order acknowledgement
+      (Auftragsbestätigung) and `LA` the shipping notification (Lieferavis); the goods
+      receipt is posted against the LA, so a line under confirmation control is
+      exported twice, once with a receipt and once without.
+
+      Read as a dimension and never filtered on. `consolidate_to_receipt_grain` keys
+      on whether the line's rows carry a goods receipt, not on this code, because the
+      same duplication arrives from systems that have no such column and from SAP
+      extracts that drop it. What this field buys is that the finding can name the
+      codes it found instead of asserting them, and that a planner looking for why a
+      row count fell has the column in front of them.
+    aliases: [conf. category, confirmation category, conf category, conf cat,
+              conf. cat., category of confirmation, confirmation type, ebtyp,
+              确认类别]
+
   po_schedule_line:
     type: string
     role: identifier

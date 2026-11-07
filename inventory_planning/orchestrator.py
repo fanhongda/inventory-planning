@@ -14,7 +14,7 @@ import pandas as pd
 from .feedback.snapshot import SnapshotSaver
 from .provenance import RunManifest, RunRegistry
 from .readers.sales_history_reader import SalesHistoryReader
-from .readers.po_history_reader import POHistoryReader
+from .readers.po_history_reader import POHistoryReader, consolidate_to_receipt_grain
 from .readers.open_so_reader import OpenSOReader
 from .readers.open_po_reader import OpenPOReader
 from .readers.inventory_reader import InventoryReader, consolidate_to_planning_grain
@@ -239,6 +239,10 @@ class InventoryPlanner:
             inventory_df, planning_location=self.inv_reader.location_id, verbose=False,
             stock_status=self.inv_reader.stock_status,
         )
+        # No `consolidate_to_receipt_grain` here, unlike the stock snapshot above and
+        # unlike `run_kpi_review`: this stage takes its purchase history from `results`,
+        # which `run_planning` already consolidated, and has no parameter for it.
+        #
         # The planning run already resolved these against the same file. Reusing them
         # is not an optimisation — rebuilding would give the policy layer its own copy
         # of every parameter, and the first time one of them drifted the report would
@@ -424,6 +428,7 @@ class InventoryPlanner:
             inventory_df, planning_location=self.inv_reader.location_id, verbose=False,
             stock_status=self.inv_reader.stock_status,
         )
+        po_history_df = consolidate_to_receipt_grain(po_history_df, verbose=False)
 
         # One anchor for the whole review, taken from the data. Mixing a data-derived
         # date in one section with today's date in another makes the two halves
@@ -992,6 +997,18 @@ class InventoryPlanner:
             inventory_df, planning_location=self.inv_reader.location_id,
             stock_status=self.inv_reader.stock_status,
         )
+        # Same argument one document over. A confirmation-level purchase export carries
+        # one row per vendor confirmation, so a PO line arrives twice — acknowledgement
+        # and shipping notification — and the line-level quantity on both is counted
+        # twice by every ordering-pattern figure. Done here rather than in the reader's
+        # `_post_process` alone because the intake path does not run it: the contract
+        # derives `lead_time_days` itself, and this is where the two paths meet.
+        #
+        # `po_history_as_read` goes to the store for the same reason the stock snapshot
+        # does: the dropped rows are a real property of the export, and history not
+        # collected cannot be recovered later.
+        po_history_as_read = po_history_df
+        po_history_df = consolidate_to_receipt_grain(po_history_df)
         from .policy.service import latest_observed_date
         as_of, stale = latest_observed_date(sales_df, open_so_df, po_history_df)
         if as_of and stale > 45:
@@ -1021,7 +1038,7 @@ class InventoryPlanner:
             print(resting.summary())
 
         self._shadow_write({
-            "sales_history": sales_df, "po_history": po_history_df,
+            "sales_history": sales_df, "po_history": po_history_as_read,
             "open_so": open_so_df, "open_po": open_po_df,
             "inventory": inventory_as_read,
         }, valid_time=as_of)

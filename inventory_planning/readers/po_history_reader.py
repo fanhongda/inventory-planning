@@ -15,6 +15,92 @@ from .base_reader import BaseReader
 # site that never set it.
 DEFAULT_LT_ROLLING_MONTHS = 6
 
+# The vendor-confirmation category, where the export carries one. Used only to name the
+# codes in the finding — the consolidation keys on the goods receipt, not on this.
+CONFIRMATION_CATEGORY = "confirmation_category"
+
+
+def consolidate_to_receipt_grain(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Drop the rows of a PO line that carry no goods receipt, where the line has one.
+
+    The contract's grain is `po_receipt_line`, and some ERP exports are finer than
+    that in a way nothing downstream can see. SAP is the common case: with
+    confirmation control active, EKES holds one row per vendor confirmation, so one
+    PO line is exported twice — an `AB` row (Auftragsbestätigung, the order
+    acknowledgement, no receipt against it) and an `LA` row (Lieferavis, the shipping
+    notification, which is what the goods receipt is posted to). Other systems repeat
+    a line per schedule line or per status event with the same effect.
+
+    The lead time survives this untouched: the acknowledgement row has no receipt
+    date, so `lead_time_days` is null on it and the weighted average already drops it.
+    The quantities do not. `po_qty` and `delivered_qty` are line-level values repeated
+    on every row of the line, so summing them counts each order twice — and every
+    figure built on the ordering *pattern* moves: how much was bought against demand,
+    the over-ordered finding, lot-size conformance, the replenishment cadence. None of
+    it errors, the numbers stay internally consistent, and the grain test does not
+    catch it because `receive_date` is part of the natural key and the two rows differ
+    on exactly that column.
+
+    What is dropped is the row, not the order. The retained row carries the same
+    line-level `po_qty`, so nothing about what was ordered is lost. The acknowledgement
+    *date* is lost, and that is deliberate: nothing downstream reads it today, and a
+    column kept for a consumer that does not exist is how a grain gets confused again.
+
+    Deliberately conservative. Three cases are left alone:
+
+      no receipt column, or no receipt anywhere   An extract with no goods-receipt date
+          is still a valid record of what was ordered, how often and how much — the
+          contract says so, and `capability_requires` already withholds the lead-time
+          signal from it. Dropping its rows would empty the file.
+
+      every row has a receipt   Nothing is mixed. Several receipts against one line are
+          *partial deliveries*, legitimately separate rows at this grain, and are kept.
+
+      no line identifier   Without `po_number` there is no line to reason about, and a
+          guess here would delete real receipts.
+    """
+    if df is None or len(df) == 0 or "receive_date" not in df.columns:
+        return df
+    key = [c for c in ("po_number", "po_line_number", "sku") if c in df.columns]
+    if "po_number" not in key:
+        return df
+
+    has_receipt = df["receive_date"].notna()
+    if not has_receipt.any() or has_receipt.all():
+        return df
+
+    # `dropna=False` so a line whose number or position is blank is still grouped
+    # rather than silently dissolving into one row per null.
+    line_has_receipt = has_receipt.groupby(
+        [df[c] for c in key], dropna=False
+    ).transform("any")
+    drop = line_has_receipt & ~has_receipt
+    if not drop.any():
+        return df
+
+    if verbose:
+        lines = len(df.loc[drop, key].drop_duplicates())
+        # Name the codes where the export carried them, rather than asserting AB/LA at
+        # a planner whose system may spell it differently or not at all.
+        named = ""
+        if CONFIRMATION_CATEGORY in df.columns:
+            codes = sorted({str(c).strip() for c in df.loc[drop, CONFIRMATION_CATEGORY]
+                            if str(c).strip() and str(c).strip().lower() != "nan"})
+            if codes:
+                named = f", coded {', '.join(codes)}"
+        repeated = ""
+        if "po_qty" in df.columns:
+            qty = pd.to_numeric(df.loc[drop, "po_qty"], errors="coerce").sum()
+            repeated = (f" They repeat the line's quantity — {qty:,.0f} units that "
+                        f"would have been counted twice in the ordering-pattern "
+                        f"figures.")
+        print(f"  Dropped {int(drop.sum()):,} PO row(s) across {lines:,} line(s) that "
+              f"appear both with and without a goods receipt{named} — a "
+              f"confirmation-level export, where the receipt is posted against the "
+              f"shipping notification and not the acknowledgement.{repeated}")
+    return df[~drop].copy()
+
 
 class POHistoryReader(BaseReader):
     doc_type = "po_history"
@@ -28,6 +114,10 @@ class POHistoryReader(BaseReader):
 
     def _post_process(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.dropna(subset=["sku", "supplier", "po_date"])
+        # Before the lead-time arithmetic, so `lt_days_precalc`'s "is more than half of
+        # this column usable?" test is asked of receipt rows rather than of a frame
+        # padded with acknowledgement rows that carry no lead time by construction.
+        df = consolidate_to_receipt_grain(df)
 
         # Use pre-computed LT column if available, else compute from dates
         if "lt_days_precalc" in df.columns:

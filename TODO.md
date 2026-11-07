@@ -813,6 +813,68 @@ is already the layer whose premise is that it does not estimate.
   constant, and it is not a prerequisite for anything above.
 
 
+## Document cleaning sits after intake, so two views keep the raw grain (2026-11-07)
+
+`readers.po_history_reader.consolidate_to_receipt_grain` drops the rows of a PO line
+that carry no goods receipt, where that line has one. It exists because a
+*confirmation-grain* export is finer than the `po_receipt_line` grain the contract
+declares: SAP under confirmation control holds one EKES row per vendor confirmation,
+so a line arrives twice — an `AB` acknowledgement with no receipt against it and an
+`LA` shipping notification carrying the goods receipt. `po_qty` and `delivered_qty`
+are line-level values repeated on both rows, so every ordering-pattern figure doubled
+— bought against demand, over-ordered, lot-size conformance, replenishment cadence.
+The lead time was never affected: the acknowledgement row has no receipt date, so
+`lead_time_days` is null on it and the weighted average already dropped it.
+
+Nothing caught it, and that is the part worth remembering. The grain test compares row
+count against distinct natural-key count, and `receive_date` is part of that key — so
+the two rows of one line differ on exactly the column that would have exposed them.
+
+It runs in two places because the entry paths meet nowhere earlier: the reader's
+`_post_process`, and `run_planning` / `run_kpi_review` in the orchestrator. The intake
+path never runs the reader — the contract derives `lead_time_days` itself.
+
+**What is still at the raw grain.** The cleaning happens downstream of intake, so two
+views of the file keep the confirmation rows:
+
+- the fact store, which is handed `po_history_as_read` deliberately, for the same
+  reason the stock snapshot is: the dropped rows are a real property of the export,
+  and history not collected cannot be recovered later
+- `_resting_on`, which sizes each unmeasured assumption against the intake result's
+  own frames rather than the assembled ones — by the design its docstring sets out,
+  because sizing an assumption against a frame whose grain has moved is how a
+  plausible wrong number gets made. On a confirmation-grain export the `Σ po_qty`
+  it prints behind the currency assumption is therefore twice the planning quantity.
+
+No computed figure is affected — the sample data reshaped to confirmation grain and
+the same data at receipt grain produce identical output apart from those two intake
+lines — and the exposure number errs toward overstating what rests on the assumption
+rather than toward false comfort. So this is a legibility gap, not a wrong plan: a
+planner reconciling `Σ po_qty` against their ERP sees twice their number, with the
+explanation several lines earlier instead of beside it.
+
+**Why it is not simply moved into intake.** Three options, none free:
+
+- *Clean in the intake, before the frame is published.* The store then holds a frame
+  that is not what was exported, against the principle above — unless intake hands out
+  two frames, one published and one as-read, which is a change to what a document *is*
+  at that layer rather than a tweak.
+- *Give `_resting_on` a per-document grain correction.* Narrow and cheap, but it puts
+  knowledge of one document type's defect inside the exposure module, which is the
+  coupling that docstring is written against.
+- *Teach the grain test to see it.* Does not fix the number, but it is the cheapest
+  thing that stops the next instance being silent — and there will be a next instance:
+  schedule-line and status-event exports arrive in the same shape, and the related item
+  under *Smaller items* (transfer and rework receipts mixed into purchase lead times)
+  is the same family of defect. The signal is specific enough to test for: a natural
+  key containing a timestamp that is null on some rows of an otherwise identical key.
+
+Until then: the drop is reported on every run that triggers it, naming the row and line
+counts, the confirmation codes actually found, and the quantity that would have been
+counted twice. `confirmation_category` is read as a dimension — never filtered on, so
+the rule still works for systems that have no such column — so the codes are on the
+frame for anyone checking.
+
 ## Smaller items
 
 - `IFR` (item fill rate) service metric — `config/stocking_policy.json` documents

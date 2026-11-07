@@ -485,6 +485,66 @@ class TestAWidePeriodSheetWithNoSkuColumnLandsAndSaysSo:
         assert landed["resolution"]["missing_required"] == []
 
 
+class TestAWideSheetThatRepeatsASku:
+    """
+    The India FDT master lists 900 parts over 96 months and two of the part numbers
+    appear twice. The melt produced 86,400 long rows; the adapter dropped `period` at
+    the mapping step because the column map did not name it; the rollup inside the
+    adapter then grouped on `[sku]` alone where the contract's grain is `[sku, period]`
+    and returned 898 rows, each holding eight years of demand as one number. Only the
+    re-attach afterwards — 86,400 values into 898 rows — made any of it visible.
+    """
+
+    @staticmethod
+    def _sheet(tmp_path, skus, periods=4):
+        import pandas as pd
+
+        pytest.importorskip("openpyxl")
+        months = [f"{m}18" for m in ("Jan", "Feb", "Mar", "Apr",
+                                     "May", "Jun")][:periods]
+        head = ["PN#", "Tyco Part #", "Description"] + months
+        rows = [[f"{5889904 + i}", sku, f"PART {i}"] + [i + 1] * periods
+                for i, sku in enumerate(skus)]
+        path = tmp_path / "Demand Plan IN FDT.xlsx"
+        pd.DataFrame(rows, columns=head).to_excel(path, index=False,
+                                                  sheet_name="India FDT")
+        return path
+
+    def test_the_canonical_grain_is_one_row_per_sku_period(self, client, tmp_path):
+        path = self._sheet(tmp_path, ["4100-1", "4100-2", "4100-3"], periods=4)
+        response = client.post("/uploads", files={"file": (path.name, path.read_bytes())})
+        assert response.status_code == 200, response.json()
+        resolution = response.json()["landed"][0]["resolution"]
+        assert resolution["rows"] == 3 * 4
+
+    def test_a_repeated_sku_sums_per_period_rather_than_collapsing(
+            self, client, tmp_path):
+        """Two rows of the same part, 4 periods: 12 long rows become 8, not 2."""
+        path = self._sheet(tmp_path, ["4100-1", "4100-2", "4100-1"], periods=4)
+        batch_id = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]["batch_id"]
+
+        body = client.get(f"/batches/{batch_id}/canonical", params={"limit": 50}).json()
+        assert body["total"] == 2 * 4
+
+        per_sku = {}
+        for row in body["rows"]:
+            per_sku.setdefault(row["sku"], []).append(float(row["qty"]))
+        # rows 1 and 3 are the same part carrying 1 and 3 a period
+        assert sorted(per_sku) == ["4100-1", "4100-2"]
+        assert per_sku["4100-1"] == [4.0] * 4
+        assert per_sku["4100-2"] == [2.0] * 4
+
+    def test_the_rollup_is_reported_on_the_whole_key(self, client, tmp_path):
+        path = self._sheet(tmp_path, ["4100-1", "4100-2", "4100-1"], periods=4)
+        resolution = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]["resolution"]
+        rollup = [t for t in resolution["transforms"] if "<rollup>" in t]
+        assert rollup and "sku+period" in rollup[0]
+
+
 class TestAnUploadThatFailsSaysWhereAndWhy:
     """
     The one POST a planner makes is the one that reads an unseen export, so it is the

@@ -14,7 +14,7 @@ a planner-supplied time series work without anyone knowing a different loader ex
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass, field as dc_field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -1340,15 +1340,43 @@ class Intake:
         long = long.drop(columns=["__period_header"])
         long = long.rename(columns={"__qty": "qty"})
 
-        # Map the identifier columns through the adapter, then re-attach period/qty.
-        adapter = route.adapter
+        # The melt's own two columns go *through* the adapter, not around it.
+        #
+        # `apply` keeps only what the column map names, so handing it `long` without
+        # naming them dropped both at the mapping step and left them to be re-attached
+        # afterwards. Two things went wrong in the gap. The rollup runs inside `apply`,
+        # and with `period` gone it saw a natural key of `[sku]` where the contract
+        # says `[sku, period]` — so a 900-row sheet of 96 months rolled up to 898 rows,
+        # each holding eight years of demand summed into one number. And the re-attach
+        # then could not line up, 86,400 values into 898 rows, which is the only reason
+        # anyone saw it: the arithmetic was wrong well before the exception.
+        #
+        # Named in the map, they are mapped like any other column, the rollup sees the
+        # whole key, and a SKU listed twice in the sheet sums per period, which is what
+        # the grain means.
+        adapter = replace(route.adapter, column_map={
+            **route.adapter.column_map,
+            **{c: c for c in ("period", "qty") if c in long.columns},
+        })
         contract = route.contract
         mapped, apply_log = adapter.apply(long, contract, profile)
         log.extend(apply_log)
 
+        # Belt and braces. Nothing should reach here now that both are in the map, but
+        # a positional assignment is only ever valid while the adapter has not changed
+        # the row count, and it is the assumption that broke. Alignment is by index,
+        # and a frame the adapter reshaped is left alone and reported rather than
+        # filled with values from rows that no longer correspond to it.
         for col in ("period", "qty"):
-            if col not in mapped.columns and col in long.columns:
-                mapped[col] = long[col].values
+            if col in mapped.columns or col not in long.columns:
+                continue
+            if mapped.index.equals(long.index):
+                mapped[col] = long[col]
+            else:
+                log.append(TransformStep(
+                    col, "filtered",
+                    f"could not be carried through the adapter: it reshaped "
+                    f"{len(long):,} rows to {len(mapped):,}"))
 
         mapped["qty"] = pd.to_numeric(
             mapped["qty"].astype(str).str.replace(",", "", regex=False).str.strip(),

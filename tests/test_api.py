@@ -386,6 +386,186 @@ class TestABlankTemplateSaysWhatIsWrongWithIt:
         assert "`data` sheet" in detail
 
 
+class TestAWidePeriodSheetWithNoSkuColumnLandsAndSaysSo:
+    """
+    The India FDT master: a SKU x month matrix whose first column — the SAP part
+    number — carries no header, so nothing maps to `sku`. A required field with no
+    column is an ordinary outcome everywhere else in intake; on the wide path it was
+    a `KeyError: ['sku']` out of `dropna`, which reached the planner as a 500 and
+    never reached the resolution screen that would have let them fix it.
+    """
+
+    @staticmethod
+    def _fdt(tmp_path, key_headers=("PN#", "Tyco Part #")):
+        import pandas as pd
+
+        pytest.importorskip("openpyxl")
+        months = [f"{m}18" for m in ("Oct", "Nov", "Dec")] + \
+                 [f"{m}19" for m in ("Jan", "Feb", "Mar")]
+        head = [*key_headers, "Description", "Classification",
+                "Std cost INR", "In USD", "Supplier"] + months
+        rows = [[f"{5889904 + i}", f"4190-{7026 + i}", f"PART {i}", "OBS",
+                 611269.23 - i, 7191.403 - i, "7600954"] + [(i + j) % 5
+                                                            for j in range(len(months))]
+                for i in range(6)]
+        path = tmp_path / "India FDT.xlsx"
+        pd.DataFrame(rows, columns=head).to_excel(path, index=False,
+                                                  sheet_name="India FDT")
+        return path
+
+    def test_the_tyco_part_number_is_recognised_as_the_sku(self, client, tmp_path):
+        """
+        `PN#` is the SAP number and `Tyco Part #` is what the purchase orders carry,
+        so the Tyco column is the one that has to become `sku`. Before `#` was read
+        as the numero sign it normalised to `tyco part` — a superset of no alias —
+        and neither column matched anything.
+        """
+        path = self._fdt(tmp_path)
+        landed = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]
+        assert landed["doc_type"] == "demand_timeseries"
+        sku = {f["field"]: f for f in landed["resolution"]["fields"]}["sku"]
+        assert sku["source"] == "mapped"
+        assert sku["column"] == "Tyco Part #"
+        assert landed["resolution"]["missing_required"] == []
+
+    def test_a_sheet_whose_key_column_matches_nothing_lands_and_says_so(
+            self, client, tmp_path):
+        path = self._fdt(tmp_path, key_headers=("Local Ref", "Widget Tag"))
+        response = client.post("/uploads", files={"file": (path.name, path.read_bytes())})
+        assert response.status_code == 200, response.json()
+
+        landed = response.json()["landed"][0]
+        assert landed["doc_type"] == "demand_timeseries"
+        resolution = landed["resolution"]
+        assert resolution["missing_required"] == ["sku"]
+        assert {f["field"]: f for f in resolution["fields"]}["sku"]["source"] == "absent"
+        assert any("no column mapped to sku" in step
+                   for step in resolution["transforms"])
+
+    def test_every_row_of_the_sheet_is_landed(self, client, tmp_path):
+        """
+        The unlabelled column also made the first row of data score better as a header
+        than the header did, so the batch used to arrive one row short.
+        """
+        path = self._fdt(tmp_path)
+        landed = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]
+        assert landed["rows"] == 6
+
+    def test_declaring_the_column_is_what_fixes_it(self, client, tmp_path):
+        """
+        `PN#` is the SAP number and `Tyco Part #` is the number the purchase orders
+        carry, so which column is the SKU is a thing only the planner can say. The
+        point of landing rather than raising is that they get to say it.
+        """
+        path = self._fdt(tmp_path, key_headers=("Local Ref", "Widget Tag"))
+        batch_id = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]["batch_id"]
+
+        body = client.post(f"/batches/{batch_id}/declarations",
+                           json={"scope": "mapping", "field": "sku",
+                                 "value": "Widget Tag", "by": "jfanhon",
+                                 "reason": "the POs are keyed on the widget tag"}).json()
+        sku = {f["field"]: f for f in body["resolution"]["fields"]}["sku"]
+        assert sku["source"] == "declared"
+        assert sku["column"] == "Widget Tag"
+        assert sku["fill_rate"] == 1.0
+        assert body["resolution"]["missing_required"] == []
+
+    def test_a_recognised_key_column_still_maps_itself(self, client, tmp_path):
+        """The guard must not stop the ordinary case from routing on its own."""
+        path = self._fdt(tmp_path, key_headers=("Plant", "Material"))
+        landed = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]
+        assert landed["resolution"]["missing_required"] == []
+
+
+class TestAnUploadThatFailsSaysWhereAndWhy:
+    """
+    The one POST a planner makes is the one that reads an unseen export, so it is the
+    one that a real file breaks in ways no fixture anticipated. What it must not do is
+    answer with a bare 500: the only description of the failure then lives in the
+    server console, and the person holding the file is the only one who can act on it.
+    """
+
+    def test_a_routing_failure_names_the_file_the_sheet_and_the_error(
+            self, client, monkeypatch, tmp_path):
+        import inventory_planning.api.app as app_module
+
+        def explode(*_args, **_kwargs):
+            raise ValueError("column 'Material' is not unique")
+
+        monkeypatch.setattr(app_module, "resolve_frame", explode)
+
+        book = tmp_path / "master.xlsx"
+        pytest.importorskip("openpyxl")
+        import pandas as pd
+        pd.DataFrame({"Material": ["A"], "Qty": [1]}).to_excel(
+            book, index=False, sheet_name="Item Master")
+        with open(book, "rb") as fh:
+            response = client.post("/uploads", files={"file": (book.name, fh.read())})
+
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert "master.xlsx" in detail
+        assert "Item Master" in detail
+        assert "ValueError: column 'Material' is not unique" in detail
+        assert "not landed" in detail
+
+    def test_nothing_is_landed_when_routing_fails(self, client, monkeypatch, tmp_path):
+        import inventory_planning.api.app as app_module
+
+        monkeypatch.setattr(app_module, "resolve_frame",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        _upload(client)  # noqa: F841 — the call is the assertion's subject
+        assert client.get("/batches").json() == []
+
+    @pytest.mark.parametrize("case", ["unreadable", "blank template", "good"])
+    def test_the_uploaded_copy_is_never_left_behind(self, client, tmp_path,
+                                                    monkeypatch, case):
+        """
+        The temp copy is an un-anonymised extract sitting outside both the repository
+        and the store's retention, and the paths that do not reach the end of the
+        handler — an unreadable file, a blank template — are the ones a planner hits
+        most. Cleanup belongs on all of them, which is why it is a `finally`.
+        """
+        from inventory_planning.ingest.templates import emit
+
+        spool = tmp_path / "spool"
+        spool.mkdir()
+        made = iter(range(100))
+
+        def under_the_spool(*_a, **_k):
+            path = spool / f"u{next(made)}"
+            path.mkdir()
+            return str(path)
+
+        monkeypatch.setattr("tempfile.mkdtemp", under_the_spool)
+
+        if case == "unreadable":
+            bad = tmp_path / "export.xls"
+            bad.write_text("Material,Qty\nA,1\n", encoding="utf-8")
+            with open(bad, "rb") as fh:
+                assert client.post(
+                    "/uploads", files={"file": (bad.name, fh.read())}
+                ).status_code == 400
+        elif case == "blank template":
+            blank = emit("substitution", tmp_path)
+            with open(blank, "rb") as fh:
+                assert client.post(
+                    "/uploads", files={"file": (blank.name, fh.read())}
+                ).status_code == 400
+        else:
+            assert _upload(client).status_code == 200
+
+        assert list(spool.iterdir()) == []
+
+
 class TestTheReviewScreenIsServedWithoutShadowingTheApi:
 
     def test_the_page_and_its_module_load(self, client):

@@ -1335,7 +1335,24 @@ class Intake:
             log.append(TransformStep("qty", "defaulted",
                                      "blank periods read as zero demand", rows_affected=filled))
 
-        mapped = mapped.dropna(subset=["sku", "period"])
+        # `period` and `qty` the melt always produces; `sku` it does not. The
+        # identifier comes from the adapter's mapping, and a sheet whose key column
+        # has a blank header — a merged title cell above it is the usual cause, and
+        # pandas renders it `Unnamed: 0` — gives the mapping nothing to work with. A
+        # required field with no column is an ordinary, reportable outcome everywhere
+        # else in intake: the resolution lists it under `missing_required`, the batch
+        # still lands, and the planner declares the column and re-resolves. Dropping
+        # on a column that is not there made this one path a `KeyError` instead, which
+        # reached the planner as a 500 and never reached the screen that would have
+        # let them fix it.
+        present = [c for c in ("sku", "period") if c in mapped.columns]
+        if "sku" not in mapped.columns:
+            log.append(TransformStep(
+                "sku", "absent",
+                "no column mapped to sku, so every row is unidentified — declare "
+                "which column holds the material number and re-resolve",
+                rows_affected=len(mapped)))
+        mapped = mapped.dropna(subset=present)
         return mapped.reset_index(drop=True), log
 
     # ── Convenience ──────────────────────────────────────────────────────────

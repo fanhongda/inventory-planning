@@ -72,14 +72,31 @@ def find_header_row(raw: pd.DataFrame, limit: int = 4) -> int:
     data *below* the header, and the canonical frame counts from the same place. If the
     two disagreed, every pointer from a fact back to its source row would be off by the
     height of a banner — and off silently, since both would still be valid row numbers.
+
+    The `<= 0.5` guard is tested before a candidate, not after one, and the order is
+    the whole test. A header row only has to be *good enough* to be the header, which
+    is the question `_read_excel_sheet` asks of row 0 before it hunts at all; the hunt
+    below exists for the banner case, where row 0 is mostly blank. Asked after a
+    candidate has already been scored, the question becomes "which row is blankest"
+    instead, and a real header row carrying one unlabelled column loses it to the
+    first row of data — which has no blanks at all. That row then becomes the header
+    map, the row beneath it becomes `row_no` 0, and the extract arrives one row short
+    with every column named after a part number. One blank header cell is all it
+    takes, and the India FDT master leaves the SAP part number column unlabelled.
+
+    The scan itself stays a scan: a candidate no better than the best so far is
+    skipped rather than stopping the hunt, because a title banner is routinely two
+    rows deep and the second row of it is no blanker than the first.
     """
-    best, best_share = 0, _unnamed_share(list(raw.iloc[0])) if len(raw) else 1.0
+    if not len(raw):
+        return 0
+    best, best_share = 0, _unnamed_share(list(raw.iloc[0]))
     for candidate in range(1, min(limit, len(raw))):
+        if best_share <= 0.5:
+            break
         share = _unnamed_share(list(raw.iloc[candidate]))
         if share < best_share:
             best, best_share = candidate, share
-        if best_share <= 0.5:
-            break
     return best
 
 

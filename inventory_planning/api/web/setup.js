@@ -129,6 +129,146 @@ function locationFields(detail) {
   return { fields, collect };
 }
 
+// The suppliers the purchase history names, with how many lines each placed.
+//
+// Asked the same way round as the locations card, and for the same reason: "fill in
+// the transit table" is a chore with no visible end, and "SIM001 placed 94 lines and
+// nothing says how it ships" is a question with an answer. The two columns are the
+// two things no purchase export carries, which is why this file exists at all.
+function transitFields(detail) {
+  const modes = detail.modes || [];
+  const observed = detail.observed || [];
+  const wildcardKey = detail.wildcard_key || "*";
+  const inputs = new Map();
+
+  const modeSelect = (current) => {
+    // Free text at the contract, normalised on read, so the options are offered
+    // rather than enforced — and fetched with the rest rather than hardcoded, the
+    // same decision `statusSelect` makes about the location vocabulary.
+    const select = el("select", {},
+      el("option", { value: "" }, "— not stated —"),
+      modes.map((m) => el("option", { value: m }, m)));
+    select.value = current || "";
+    return select;
+  };
+  const daysInput = (current) => el("input", {
+    type: "number", min: "0", step: "1", placeholder: "days",
+    value: current === null || current === undefined ? "" : String(current),
+  });
+
+  const register = (supplier, mode, days) => {
+    const pair = { mode: modeSelect(mode), days: daysInput(days) };
+    inputs.set(supplier, pair);
+    return pair;
+  };
+
+  const rows = [];
+  for (const o of observed) {
+    const pair = register(o.supplier, o.transport_mode, o.transit_days);
+    rows.push(el("tr", { class: o.named ? "" : "attention" },
+      el("td", {}, el("code", {}, o.supplier)),
+      el("td", { class: "num" }, num(o.rows)),
+      el("td", {}, pair.mode),
+      el("td", {}, pair.days)));
+  }
+
+  // Rows already in the file that this purchase history does not name. Kept on the
+  // form for the reason the locations card keeps its unseen codes: submitting writes
+  // the whole table, so a supplier left off the screen would be withdrawn by someone
+  // who only came to answer a new one — and withdrawing it moves every one of its
+  // items back to the item master's planned delivery time.
+  const seen = new Set(observed.map((o) => o.supplier));
+  const carried = (detail.rows || [])
+    .filter((r) => r.supplier !== wildcardKey && !seen.has(r.supplier));
+  for (const r of carried) register(r.supplier, r.transport_mode, r.transit_days);
+
+  const extraSupplier = el("input", { type: "text",
+                                      placeholder: "supplier, e.g. SIM001" });
+  const extraMode = modeSelect("");
+  const extraDays = daysInput(null);
+
+  const wildcard = detail.wildcard || {};
+  const wildcardMode = modeSelect(wildcard.transport_mode);
+  const wildcardDays = daysInput(wildcard.transit_days);
+
+  const table = observed.length
+    ? el("div", { class: "scroll" }, el("table", {},
+        el("thead", {}, el("tr", {},
+          el("th", {}, "Supplier"), el("th", { class: "num" }, "Lines"),
+          el("th", {}, "Ships by"), el("th", {}, "Transit days"))),
+        el("tbody", {}, rows)))
+    : el("p", { class: "note" },
+         "No purchase history has been uploaded yet, so there are no suppliers to "
+         + "show. Declare them here, or come back once a file has landed and this "
+         + "will list the suppliers it names with the lines behind each.");
+
+  const fields = [
+    table,
+    carried.length
+      ? el("details", {}, el("summary", {},
+          `${carried.length} supplier(s) declared earlier and not in this history`),
+          el("div", { class: "scroll" }, el("table", {}, el("tbody", {},
+            carried.map((r) => el("tr", {},
+              el("td", {}, el("code", {}, r.supplier)),
+              el("td", {}, inputs.get(r.supplier).mode),
+              el("td", {}, inputs.get(r.supplier).days)))))))
+      : null,
+    el("label", {}, "A supplier this history does not name"),
+    el("div", { class: "row3" }, extraSupplier, extraMode, extraDays),
+    el("label", {}, `Every other supplier (the “${wildcardKey}” wildcard)`),
+    el("div", { class: "row2" }, wildcardMode, wildcardDays),
+    el("p", { class: "note" },
+       "Matching is on the start of the supplier string and the longest match wins, "
+       + "so SIM001 answers for “SIM001 TYCO ELECTRONICS” and a named supplier beats "
+       + "the wildcard. A supplier left with no transit days is left out of the file "
+       + "rather than written as zero — it falls back to the item master's planned "
+       + "delivery time, and the run names it. A blank written as zero would "
+       + "understate the lead time, which is the error that stocks out."),
+  ];
+
+  // Rows without a transit time are omitted, not sent blank. The contract refuses a
+  // blank outright, and it is right to: "unknown" and "no transit at all" are
+  // opposite claims and only one of them is safe to guess.
+  const collect = () => {
+    const out = [];
+    const push = (supplier, mode, days) => {
+      const text = String(days || "").trim();
+      if (!supplier || text === "") return;
+      out.push({ supplier, transport_mode: mode || null, transit_days: Number(text) });
+    };
+    for (const [supplier, pair] of inputs) {
+      push(supplier, pair.mode.value, pair.days.value);
+    }
+    push(extraSupplier.value.trim().toUpperCase(), extraMode.value, extraDays.value);
+    push(wildcardKey, wildcardMode.value, wildcardDays.value);
+    return out;
+  };
+
+  return { fields, collect };
+}
+
+function transitEditor(item, reload) {
+  const { fields, collect } = transitFields(item.detail);
+  return changeForm({
+    endpoint: "/setup/transit",
+    change: () => ({ rows: collect() }),
+    fields,
+    describe: (body) => {
+      const parts = [];
+      if (body.added.length) parts.push(`declares ${body.added.join(", ")}`);
+      if (body.changed.length) parts.push(`changes ${body.changed.join(", ")}`);
+      if (body.removed.length) parts.push(`withdraws ${body.removed.join(", ")}`);
+      return parts.length
+        ? el("p", { class: "note" },
+             `This ${parts.join("; ")}. It takes effect on the next run, for every `
+             + "item of those suppliers at once.") : null;
+    },
+    done: () => reload(),
+    submit: "Show the diff",
+    confirm: "Declare these transit times",
+  });
+}
+
 function locationEditor(item, reload) {
   const { fields, collect } = locationFields(item.detail);
   return changeForm({
@@ -172,19 +312,43 @@ function macroEditor(item, reload) {
   });
 }
 
+// Which editor an item gets, by name rather than by a chain of comparisons against
+// one of them. The chain was `editor === "locations" ? locations : macro`, so every
+// editor that was not the locations one got the macro one — and when the transit card
+// arrived it was handed a form that renders `item.title (item.unit)` over a single
+// number box and submits `{name: item.setting}`. Transit has neither field, so the
+// card read "Supplier transit times (undefined)" and the server answered `'' is not
+// an editable setting`. An unknown editor is now a visible gap rather than a form
+// that posts somewhere else.
+const EDITORS = {
+  locations: locationEditor,
+  transit: transitEditor,
+  macro: macroEditor,
+};
+
+function editorFor(item, reload) {
+  const build = EDITORS[item.editor];
+  if (!build) {
+    return el("p", { class: "status bad" },
+      `This screen has no editor for ${item.editor || "this item"} yet. It is stored `
+      + `in ${item.file || "a config file"} and can be edited there.`);
+  }
+  return build(item, reload);
+}
+
 // A settled item, in one line. The whole point of the layout: what is answered gets
 // out of the way, so the eye lands on what is not.
 function settled(item, reload) {
   const shown = item.key === "locations"
     ? `${Object.keys(item.detail.statuses || {}).length || "wildcard"} declared`
-    : (item.unit === "fraction" ? pct(item.value) : `${num(item.value)} ${item.unit}`);
+    : item.key === "transit"
+      ? `${item.detail.named || "wildcard"} declared`
+      : (item.unit === "fraction" ? pct(item.value) : `${num(item.value)} ${item.unit}`);
   const open = el("button", { class: "link", type: "button" }, "change");
   const body = el("div", {});
   open.addEventListener("click", () => {
     const editing = body.childElementCount > 0;
-    mount(body, editing ? null
-      : (item.editor === "locations" ? locationEditor(item, reload)
-                                     : macroEditor(item, reload)));
+    mount(body, editing ? null : editorFor(item, reload));
     open.textContent = editing ? "change" : "cancel";
   });
   return el("section", { class: "card" },
@@ -208,8 +372,7 @@ function outstanding(item, reload) {
            + "separate — so this is not blocking anything yet.")
       : null,
     item.note ? el("p", { class: "note" }, item.note) : null,
-    item.editor === "locations" ? locationEditor(item, reload)
-                                : macroEditor(item, reload));
+    editorFor(item, reload));
 }
 
 export async function mountSetup() {

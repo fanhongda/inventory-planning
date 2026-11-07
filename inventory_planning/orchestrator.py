@@ -118,6 +118,10 @@ class InventoryPlanner:
         # Readers
         self.sales_reader   = SalesHistoryReader(self.config_dir)
         self.po_reader      = POHistoryReader(self.config_dir)
+        # So an extract whose suppliers are missing from the transit table can leave a
+        # starter copy of it beside the run's other outputs, rather than only naming
+        # them in a line of console output that scrolls away.
+        self.po_reader.output_dir = self.output_dir
         self.open_so_reader = OpenSOReader(self.config_dir)
         self.open_po_reader = OpenPOReader(self.config_dir)
         self.inv_reader     = InventoryReader(self.config_dir)

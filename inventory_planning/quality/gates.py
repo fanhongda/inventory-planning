@@ -230,6 +230,13 @@ _DEFAULTS: Dict[str, float] = {
     # Days between the newest date in the data and the run. Past this the extract is
     # stale enough that open orders are scored against a "now" that has moved.
     "extract_staleness_days": 120.0,
+    # Share of fully-delivered purchase lines with no goods-receipt date. Low because
+    # the consequence is not a wrong figure but a measurement that cannot be taken at
+    # all: above a tenth of the lines, the lead time for those suppliers is a promise
+    # and the safety stock behind it carries no lead-time variance. Warns, never blocks
+    # — what it measures is operating discipline, and stopping the run would stop the
+    # report that makes the case for fixing it.
+    "receipt_completeness_gap": 0.10,
 }
 
 

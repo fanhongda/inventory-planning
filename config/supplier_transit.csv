@@ -1,0 +1,36 @@
+# Transport mode and transit days per supplier — dispatch to arrival at the node.
+#
+# Fill two columns. Save as CSV from Excel; blank lines and #-comments are ignored.
+#
+#   supplier         matches on the START of the supplier string, so SIM001 matches
+#                    "SIM001 TYCO ELECTRONICS". Longest match wins, so a specific
+#                    vendor overrides a group. `*` is the default for everyone unlisted.
+#   transport_mode   AIR / SEA / ROAD / RAIL / COURIER — free text, normalised on read.
+#                    Carried onto the outputs because the purchase export does not have
+#                    it; nothing is inferred from it today beyond being reported.
+#   transit_days     calendar days from the supplier's dispatch to arrival here.
+#
+# Why this file exists: an extract with a confirmed-dispatch date and no goods receipt
+# can measure the clock as far as the supplier shipping and no further. The transit leg
+# is stated here and added, so `lead_time_days = (confirmed dispatch - order) + transit`.
+#
+# Changing a mode here changes the lead time on the NEXT run, for all of that
+# supplier's items at once. That is the point: because the transit leg is stated rather
+# than measured, moving a supplier from air to sea does not wait for a measurement
+# window to catch up. Only the dispatch leg is measured, and that leg does not change
+# with the mode.
+#
+# A supplier matched by nothing and with no `*` row gets NO lead time from this path —
+# the item falls back to the planned delivery time in the item master, and the run
+# names the supplier. That direction is deliberate: a lead time short by the whole
+# transit leg understates the reorder point, which is the error that stocks out.
+#
+# What it costs: a stated transit time is a constant, and a constant has no variance.
+# Safety stock therefore covers no transit risk at all. On air that hides little; on
+# sea it hides the largest single source of lead-time risk. The fix is not a better
+# constant — it is goods receipts, which make the whole clock measurable.
+#
+# A run with suppliers missing from this file writes a starter copy next to its other
+# outputs, listing every supplier it saw. Fill that in and move it here.
+
+supplier,transport_mode,transit_days

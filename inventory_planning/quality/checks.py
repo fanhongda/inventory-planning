@@ -38,6 +38,7 @@ def gate_intake(intake_result, plan, thresholds: GateThresholds) -> GateReport:
     documents = getattr(intake_result, "documents", {}) or {}
 
     report.findings.extend(_check_sku_agreement(documents, thresholds))
+    report.findings.extend(_check_receipt_completeness(documents, thresholds))
     report.findings.extend(_check_semantic_failures(documents, thresholds))
     report.findings.extend(_check_dimension_collisions(documents))
     # Order matters: where the family column is absent altogether, the per-SKU count
@@ -97,6 +98,97 @@ def _check_product_dimension(documents: Dict[str, Any], plan) -> List[Finding]:
              "two-level hierarchy, the finer level is the family and the coarser one "
              "is `business_unit`."),
         evidence={"masters": masters},
+    )]
+
+
+def _check_receipt_completeness(documents: Dict[str, Any],
+                                thresholds: GateThresholds) -> List[Finding]:
+    """
+    Closed purchase lines with no goods-receipt date — the lead time nobody can measure.
+
+    A line whose `open_qty` is 0 was fully delivered: the system knows the goods
+    arrived. Where the receipt *date* is missing anyway, that is a posting that did not
+    happen, and it costs the one thing this pipeline cannot get anywhere else. The lead
+    time falls back to the supplier's confirmed date — a commitment, in which a
+    chronically late supplier looks punctual — or to a planned delivery time in the item
+    master, and in both cases the lead-time variance term of the safety stock is zero.
+
+    Reported per supplier because that is the unit the remediation happens in: a buyer
+    chases the receiving team for one supplier's inbound, not for a percentage. Named
+    worst-first by the number of lines, since that is what makes a conversation.
+
+    Never blocks. The run has a usable answer either way, and the thing being measured
+    is operating discipline rather than a broken file — a gate that stopped the run
+    would stop the report that proves the point.
+    """
+    doc = documents.get("po_history")
+    frame = getattr(doc, "frame", None)
+    if frame is None or not len(frame) or "open_qty" not in frame.columns:
+        return []
+
+    closed = pd.to_numeric(frame["open_qty"], errors="coerce").fillna(-1) == 0
+    if not closed.any():
+        return []
+    # Two states, one finding, different last sentences. A column that is absent was
+    # never exported and the remedy is to ask for it; a column that is present and
+    # empty was exported and not filled, and the remedy is to post the receipts.
+    absent = "receive_date" not in frame.columns
+    missing = closed if absent else (closed & frame["receive_date"].isna())
+    share = float(missing.sum()) / float(closed.sum())
+    if share < thresholds["receipt_completeness_gap"]:
+        return []
+
+    detail = ""
+    if "supplier" in frame.columns:
+        by_supplier = (frame.loc[missing, "supplier"].dropna().astype(str)
+                       .value_counts().head(5))
+        detail = "".join(f"\n      {name} — {int(n):,} line(s)"
+                         for name, n in by_supplier.items())
+
+    span = ""
+    if "po_date" in frame.columns:
+        dates = pd.to_datetime(frame.loc[missing, "po_date"], errors="coerce").dropna()
+        if len(dates):
+            span = (f" The oldest is from {dates.min():%Y-%m} and the newest from "
+                    f"{dates.max():%Y-%m}, so this is standing practice rather than a "
+                    f"one-off." if dates.min().to_period("M") != dates.max().to_period("M")
+                    else f" All of them are from {dates.min():%Y-%m}.")
+
+    return [Finding(
+        stage="intake", check="receipt_completeness", severity=WARN,
+        what=((f"The purchase extract has no goods-receipt date column at all, across "
+               f"{int(closed.sum()):,} fully-delivered line(s)."
+               if absent else
+               f"{int(missing.sum()):,} of {int(closed.sum()):,} fully-delivered "
+               f"purchase lines ({share:.0%}) carry no goods-receipt date.")
+              + span + (f" Worst suppliers:{detail}" if detail else "")),
+        why=("`open_qty` is 0 on these lines, so the goods arrived and only the posting "
+             "is missing. The lead time therefore cannot be measured: it falls back to "
+             "the supplier's confirmed date, which is a commitment a late supplier still "
+             "meets on paper, or to a stated planned delivery time. Either way the "
+             "lead-time variance term of the safety stock is zero, so safety stock "
+             "covers demand variability only."),
+        fix=(("Ask for the goods-receipt date to be added to this extract — the "
+              "receipts may well be posted and simply not exported."
+              if absent else
+              "Post the goods receipts, or have the receiving team record the date on "
+              "future ones.")
+             + " This is the only input that turns the lead time from a promise into a "
+               "measurement, and nothing in the config can substitute for it."),
+        evidence={"closed_lines": int(closed.sum()),
+                  "missing_receipt": int(missing.sum()),
+                  "share": round(share, 4),
+                  "column_absent": absent,
+                  "by_supplier": {str(k): int(v) for k, v in
+                                  (frame.loc[missing, "supplier"].dropna().astype(str)
+                                   .value_counts().head(20).items()
+                                   if "supplier" in frame.columns else [])}},
+        impacts=[
+            "lead_time_days on supplier_params.csv is the supplier's commitment, not a "
+            "measurement — read lt_basis and lt_source for which",
+            "safety_stock carries no lead-time variance on these items: lt_std_days is "
+            "a floor at best and zero where the lead time came from master data",
+        ],
     )]
 
 

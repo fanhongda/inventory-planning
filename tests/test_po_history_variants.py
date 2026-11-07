@@ -442,16 +442,27 @@ class TestTheSameLineToldTwice:
         assert not log
 
 
-def _transit_config(tmp_path: Path, suppliers: dict, default=None) -> Path:
+def _transit_config(tmp_path: Path, suppliers: dict, default=None,
+                    modes: dict = None) -> Path:
+    """
+    A config directory whose `supplier_transit.csv` holds `suppliers`.
+
+    `suppliers` maps a supplier prefix to transit days; `modes` optionally gives each
+    one a transport mode. `default` becomes the `*` row — the blanket for everyone not
+    named, the same convention `location_status.json` uses.
+    """
     out = tmp_path / "config"
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     for src in CONFIG_DIR.glob("*.json"):
         (out / src.name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    path = out / "transit_times.json"
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["suppliers"] = suppliers
-    raw["default_days"] = default
-    path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    modes = modes or {}
+    lines = ["supplier,transport_mode,transit_days"]
+    if default is not None:
+        lines.append(f"*,{modes.get('*', 'AIR')},{default}")
+    for name, days in suppliers.items():
+        lines.append(f"{name},{modes.get(name, '')},{days}")
+    (out / "supplier_transit.csv").write_text("\n".join(lines) + "\n",
+                                              encoding="utf-8")
     return out
 
 
@@ -615,3 +626,92 @@ class TestADispatchDateAndNoReceipt:
         reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21, "V-BETA": 7}))
         out = reader._post_process(df)
         assert set(out["lt_basis"]) == {"promised_dispatch_plus_transit"}
+
+
+class TestTheSupplierTransitTable:
+    """
+    The purchase export carries no transport mode, so the mode and the transit days are
+    both declared here. A CSV rather than JSON for one reason: it is filled in for every
+    supplier bought from, and a spreadsheet is the quickest way to fill a table.
+    """
+
+    def test_the_wildcard_row_answers_for_suppliers_not_named(self, tmp_path):
+        reader = POHistoryReader(
+            _transit_config(tmp_path, {"V-BETA": 35}, default=5,
+                            modes={"*": "AIR", "V-BETA": "SEA"}))
+        out = reader._post_process(_dispatch_rows())
+        rows = out.set_index("supplier")
+        assert rows.loc["V-ALPHA", "transit_days"].iloc[0] == 5.0
+        assert rows.loc["V-BETA", "transit_days"] == 35.0
+
+    def test_the_mode_is_carried_because_the_export_has_none(self, tmp_path):
+        """
+        Nothing is inferred from it — it changes no arithmetic. It is carried because a
+        reader confronted with a 35-day transit leg needs to know why, and because
+        `diagnostics._chronic_air` already looks for the column.
+        """
+        reader = POHistoryReader(
+            _transit_config(tmp_path, {"V-BETA": 35}, default=5,
+                            modes={"*": "AIR", "V-BETA": "SEA"}))
+        out = reader._post_process(_dispatch_rows())
+        rows = out.set_index("supplier")
+        assert rows.loc["V-BETA", "transport_mode"] == "SEA"
+        assert rows.loc["V-ALPHA", "transport_mode"].iloc[0] == "AIR"
+
+    def test_changing_a_mode_moves_the_lead_time_on_the_next_run(self, tmp_path):
+        """
+        The property that makes a mode change cheap: only the dispatch leg is measured,
+        and that leg does not change with the mode. So moving a supplier from air to sea
+        is one edit, and the lead time follows immediately rather than waiting for a
+        measurement window to refill — which is what it would have to do if the transit
+        time were buried inside a receipt-based measurement.
+        """
+        rows = _dispatch_rows()
+        air = POHistoryReader(_transit_config(tmp_path / "a", {"V-ALPHA": 5}))
+        sea = POHistoryReader(_transit_config(tmp_path / "b", {"V-ALPHA": 35}))
+        before = air._post_process(rows.copy())
+        after = sea._post_process(rows.copy())
+        gap = (after.set_index("po_number").loc["4500001", "lead_time_days"]
+               - before.set_index("po_number").loc["4500001", "lead_time_days"])
+        assert gap == 30.0
+
+    def test_a_starter_table_is_written_for_the_suppliers_not_named(self, tmp_path):
+        """
+        Compiling the supplier list is the slow half of filling this file in, and it is
+        the half the run can do. Written even when a `*` row is covering for them: a
+        blanket is a reason to finish the table, not a reason to stop.
+        """
+        out_dir = tmp_path / "out"
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-BETA": 35}, default=5))
+        reader.output_dir = out_dir
+        reader._post_process(_dispatch_rows())
+        written = out_dir / "supplier_transit_template.csv"
+        assert written.exists()
+        table = pd.read_csv(written, comment="#")
+        assert list(table["supplier"]) == ["V-ALPHA"]
+        # Pre-filled from the blanket, and the header says that is what it is.
+        assert "blanket" in written.read_text(encoding="utf-8-sig")
+
+    def test_nothing_is_written_when_every_supplier_is_named(self, tmp_path):
+        out_dir = tmp_path / "out"
+        reader = POHistoryReader(
+            _transit_config(tmp_path, {"V-ALPHA": 5, "V-BETA": 35}))
+        reader.output_dir = out_dir
+        reader._post_process(_dispatch_rows())
+        assert not (out_dir / "supplier_transit_template.csv").exists()
+
+    def test_it_never_writes_into_the_config_directory(self, tmp_path):
+        """
+        That would either overwrite a table someone is maintaining or look like it had
+        been accepted. A reader with nowhere to write simply does not write.
+        """
+        config = _transit_config(tmp_path, {"V-BETA": 35}, default=5)
+        reader = POHistoryReader(config)
+        assert reader.output_dir is None
+        reader._post_process(_dispatch_rows())
+        assert not (config / "supplier_transit_template.csv").exists()
+
+    def test_the_longest_prefix_still_wins_with_modes(self):
+        table = {"SIM": ("AIR", 5.0), "SIM001": ("SEA", 35.0)}
+        assert POHistoryReader._transit_for("SIM001 TYCO", table, (None, None)) == ("SEA", 35.0)
+        assert POHistoryReader._transit_for("SIM002 OTHER", table, (None, None)) == ("AIR", 5.0)

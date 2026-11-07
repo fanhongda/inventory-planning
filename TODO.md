@@ -909,7 +909,7 @@ deserves a check that says so, rather than a confidence score nobody reads.
 `POHistoryReader.ensure_lead_time` runs the best clock the extract supports. Where
 there is a confirmed-dispatch date and no goods receipt, that is
 `(confirmed_delivery_date - po_date) + transit_days`, with the transit leg stated per
-supplier in `config/transit_times.json`. `transit_days` travels as far as
+supplier in `config/supplier_transit.csv`, which also declares the transport mode because the purchase export carries none. `transit_days` travels as far as
 `policy.should_be`, which prefers it over the `transit_share_of_lt` convention it
 otherwise guesses the pipeline split with.
 
@@ -940,10 +940,16 @@ risk on the items with the longest exposure.
 missing here because of operating discipline, not because the process has no receiving
 step — `open_qty` is 0, so the system knows the goods arrived; only the date is absent.
 Every limit above dissolves the moment that date is recorded: the lead time becomes
-measured, the sigma becomes real, and the transit table stops being load-bearing. What
-is owed in the meantime is a figure that makes the gap visible — GR completeness per
-supplier and per month, as a reportable number rather than a silence — which does not
-exist yet and should.
+measured, the sigma becomes real, and the transit table stops being load-bearing.
+
+`quality.checks._check_receipt_completeness` is the figure that makes the gap arguable:
+the share of fully-delivered lines with no receipt date, the suppliers behind it
+worst-first, and whether the dates span months — standing practice — or one. It
+distinguishes a column that is absent, where the receipts may well be posted and simply
+not exported and the remedy is to ask for the column, from one present and unfilled,
+where the remedy is to post them. It warns and never blocks: what it measures is
+operating discipline, and a gate that stopped the run would stop the report that makes
+the case.
 
 - **A supplier absent from the transit table gets no lead time**, falling through to the
   item master's planned delivery time, rather than a lead time short by the whole
@@ -953,9 +959,19 @@ exist yet and should.
 
 ## Air to sea: what breaks when the mode changes (2026-11-07)
 
-Lead times are measured per `sku × supplier`, and **not per transport mode**. While
-everything ships by air that costs nothing. As products move to sea it is the largest
-planning risk in the pipeline, and it is invisible until after the switch.
+**Not an issue while the lead time comes from a promise, and the reason is worth
+keeping.** On the `promised_dispatch_plus_transit` basis only the dispatch leg is
+measured, and that leg does not change with the mode; the transit leg is stated in
+`config/supplier_transit.csv`. So moving a supplier from air to sea is one edit and the
+lead time follows on the next run — no measurement window to refill, no blend. The
+section below is what happens **once goods receipts are posted** and the lead time
+becomes a real measurement with the transit time inside it. It is written down now
+because that is the same change this file is otherwise arguing for, and it should not
+arrive as a surprise.
+
+Then: lead times are measured per `sku × supplier`, and **not per transport mode**.
+While everything ships by air that costs nothing. As products move to sea it becomes
+the largest planning risk in the pipeline, and it is invisible until after the switch.
 
 A SKU mid-transition — eight air receipts at 60 days, then two sea at 100 — comes out
 of `compute_supplier_lt` at **73.8 days, sigma 16.0, n=10, min 60 / max 100**. That
@@ -973,22 +989,28 @@ thin-evidence rule in `crosscheck` would demote it and the item master's planned
 delivery time, updated for the new mode, would take over. That is the behaviour wanted
 during a transition, and it falls out of the existing design once the grouping is right.
 
-What is needed, in order:
+What is needed, in order, and none of it before the receipts exist:
 
-1. **A value domain for `transport_mode`.** The field exists on `po_history` and
-   `open_po` as a dimension with no normalisation, so `AIR` / `Air Freight` / `AF` /
-   `SEA` / `Ocean` / `FCL` / `LCL` are each their own category. The only consumer today
-   is `diagnostics._chronic_air`, which hardcodes four air spellings.
-2. **Group the lead time by `sku × supplier × mode`** where the column is present.
-3. **Key `transit_times.json` on supplier × mode**, falling back to supplier, then to
-   `default_days`, reporting which tier answered. One number per supplier cannot work
-   once the same supplier ships both ways.
-4. **A stated transit sigma per lane**, so the variance term is not silently zero on the
-   leg that carries most of the risk. Blocked on having real arrival dates — see the
-   goods-receipt item above; this is the second thing that discipline unlocks.
-5. **`_chronic_air` means something different after the switch.** Today it reports air
+1. **Group the lead time by `sku × supplier × mode`.** The mode is on the frame already,
+   put there by `supplier_transit.csv` since no export carries it. One supplier shipping
+   both ways is what makes this necessary: a supplier that only ever ships one way is
+   already separated by `sku × supplier`.
+2. **A value domain for `transport_mode`.** It is a dimension with no normalisation, so
+   `AIR` / `Air Freight` / `AF` / `SEA` / `Ocean` / `FCL` / `LCL` would each be their own
+   group. Harmless while the values come from one hand-maintained CSV; necessary the
+   moment an export supplies them. The only consumer today is
+   `diagnostics._chronic_air`, which hardcodes four air spellings.
+3. **A transit sigma per lane**, so the variance term is not silently zero on the leg
+   that carries most of the risk. This is the second thing the receipts unlock, and the
+   only one of these that cannot be done with a config file.
+4. **`_chronic_air` means something different after the switch.** Today it reports air
    used as routine rather than exception, which is the old normal. It becomes the right
    diagnostic again once sea is the baseline, and wants rewording rather than rework.
+
+A smaller thing found on the way and fixed: `open_po_reader.inbound_schedule` did
+`df["location_id"].iloc[0]` on a frame that can legitimately be empty — a business with
+nothing currently on order has one — and took the whole run down with an IndexError
+several steps after the thing worth reporting.
 
 Until then: the drop is reported on every run that triggers it, naming the row and line
 counts, the confirmation codes actually found, and the quantity that would have been

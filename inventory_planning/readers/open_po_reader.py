@@ -123,7 +123,13 @@ class OpenPOReader(BaseReader):
             )
             grp = grp.merge(inco.rename("incoterm"), on="sku", how="left")
 
-        grp["location_id"] = (df["location_id"].iloc[0] if "location_id" in df.columns
+        # `.iloc[0]` on an empty frame is an IndexError, and an empty open-PO frame is
+        # an ordinary state of the data, not a broken file: a business with nothing
+        # currently on order has one, and so does a run whose open-PO extract was
+        # filtered down to nothing by the contract. Crashing here took the whole run
+        # with it, several steps after the thing worth reporting.
+        grp["location_id"] = (df["location_id"].iloc[0]
+                              if "location_id" in df.columns and len(df)
                               else self.location_id)
         return grp
 

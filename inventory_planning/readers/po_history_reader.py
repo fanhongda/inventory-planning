@@ -22,7 +22,17 @@ CONFIRMATION_CATEGORY = "confirmation_category"
 # The supplier's own date, where the extract has no goods receipt. Never a receipt —
 # `receive_date` refuses the bare "delivery date" spellings on purpose.
 CONFIRMED_DELIVERY_DATE = "confirmed_delivery_date"
-TRANSIT_TIMES_FILE = "transit_times.json"
+
+# The planner's table: transport mode and transit days per supplier. A CSV because it
+# is filled in for every supplier and a spreadsheet is the quickest way to do that.
+TRANSIT_FILE = "supplier_transit.csv"
+# The row that answers for every supplier not named. Same convention as the "*" in
+# `location_status.json`, and reported the same way — as a blanket rather than an
+# inventory of suppliers.
+TRANSIT_WILDCARD = "*"
+# Written beside the run's other outputs when suppliers are missing from the table, so
+# the planner fills in a list rather than compiling one.
+TRANSIT_TEMPLATE = "supplier_transit_template.csv"
 
 # Which clock produced `lead_time_days`. Orthogonal to `lt_source`, which says whether
 # the number was measured at all and from which window.
@@ -150,35 +160,56 @@ class POHistoryReader(BaseReader):
 
     def _load_transit_times(self) -> tuple:
         """
-        Transit days per supplier, and the default for the ones not listed.
+        Transport mode and transit days per supplier, from `config/supplier_transit.csv`.
 
-        Prefix matching, longest key first, because an export's supplier column
-        routinely carries the code and the name in one field — the same rule
-        `supplier_incoterm.json` is read by.
+        A CSV rather than JSON because this is a table a planner fills in for every
+        supplier they buy from, and the quickest way to fill a table is a spreadsheet.
+        The same reason `sample_data/templates/README.md` gives for the substitution
+        list: a person who will not open a text editor can still supply this.
+
+        Returns `(table, default)` where `table` maps an upper-cased supplier prefix to
+        `(mode, days)` and `default` is the `*` row, or `(None, None)` where there is
+        none. Prefix matching with longest-wins, the rule `supplier_incoterm.json`
+        already uses, because export columns routinely carry the code and the name in
+        one field.
         """
-        cfg = self.config_dir / TRANSIT_TIMES_FILE
+        cfg = self.config_dir / TRANSIT_FILE
         if not cfg.exists():
-            return {}, None
+            return {}, (None, None)
         try:
-            raw = json.loads(cfg.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            return {}, None
-        table = {}
-        for key, value in (raw.get("suppliers") or {}).items():
-            days = pd.to_numeric(value, errors="coerce")
-            if pd.notna(days) and days >= 0:
-                table[str(key).strip().upper()] = float(days)
-        default = pd.to_numeric(raw.get("default_days"), errors="coerce")
-        return table, (float(default) if pd.notna(default) and default >= 0 else None)
+            raw = pd.read_csv(cfg, comment="#", dtype=str)
+        except (ValueError, OSError, pd.errors.ParserError):
+            return {}, (None, None)
+        if "supplier" not in raw.columns or "transit_days" not in raw.columns:
+            return {}, (None, None)
+
+        table, default = {}, (None, None)
+        for row in raw.itertuples(index=False):
+            key = str(getattr(row, "supplier", "") or "").strip().upper()
+            days = pd.to_numeric(getattr(row, "transit_days", None), errors="coerce")
+            if not key or pd.isna(days) or days < 0:
+                continue
+            mode = str(getattr(row, "transport_mode", "") or "").strip().upper() or None
+            if key == TRANSIT_WILDCARD:
+                default = (mode, float(days))
+            else:
+                table[key] = (mode, float(days))
+        return table, default
 
     @staticmethod
     def _transit_for(supplier, table: dict, default):
-        """The transit days for one supplier: longest matching prefix, else the default."""
+        """
+        The `(mode, days)` for one supplier: longest matching prefix, else the default.
+
+        Longest wins so a specific vendor code can override a group — `SIM001` beats
+        `SIM`, which is how one plant of a supplier gets its own transit time without
+        restating every other.
+        """
         text = str(supplier or "").strip().upper()
         if not text:
             return default
         matches = [(len(k), v) for k, v in table.items() if text.startswith(k)]
-        return max(matches)[1] if matches else default
+        return max(matches, key=lambda m: m[0])[1] if matches else default
 
     def _lead_time_from_dispatch(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -211,13 +242,22 @@ class POHistoryReader(BaseReader):
         """
         table, default = self._load_transit_times()
         dispatch = (df[CONFIRMED_DELIVERY_DATE] - df["po_date"]).dt.days
-        suppliers = df["supplier"] if "supplier" in df.columns else pd.Series(
-            None, index=df.index)
-        transit = suppliers.map(
-            lambda v: self._transit_for(v, table, default)
-        ).astype("float64")
+        suppliers = (df["supplier"] if "supplier" in df.columns
+                     else pd.Series(None, index=df.index))
+        found = suppliers.map(lambda v: self._transit_for(v, table, default))
+        transit = found.map(lambda t: t[1] if t else np.nan).astype("float64")
+        mode = found.map(lambda t: t[0] if t else None)
 
         df["transit_days"] = transit
+        # The purchase export has no mode column, so this is the only place it comes
+        # from. Carried because it is what a reader needs to make sense of a 35-day
+        # transit leg, and because `diagnostics._chronic_air` already looks for it.
+        # Nothing is inferred from it: it does not change an arithmetic result.
+        if "transport_mode" not in df.columns:
+            df["transport_mode"] = mode
+        else:
+            df["transport_mode"] = df["transport_mode"].where(
+                df["transport_mode"].notna(), mode)
         df["lead_time_days"] = dispatch + transit
         df["lt_basis"] = np.where(df["lead_time_days"].notna(),
                                   BASIS_PROMISED_PLUS_TRANSIT, "")
@@ -229,27 +269,74 @@ class POHistoryReader(BaseReader):
               f"dispatch ({CONFIRMED_DELIVERY_DATE}) plus a stated transit leg. This is "
               f"what the supplier committed to, not what they delivered.")
         if known:
-            print(f"      {known:,} of {len(df):,} rows: transit from "
-                  f"{TRANSIT_TIMES_FILE}"
-                  + (f", default {default:g}d where the supplier is unlisted"
-                     if default is not None else "")
-                  + f". Median total {df['lead_time_days'].median():.0f}d "
-                    f"({dispatch.median():.0f}d to dispatch + "
-                    f"{transit.median():.0f}d transit)")
+            by_mode = (pd.DataFrame({"mode": mode, "days": transit})
+                       .dropna(subset=["days"]).fillna({"mode": "unstated"})
+                       .groupby("mode")["days"].agg(["size", "median"]))
+            spread = ", ".join(f"{m} {r['median']:.0f}d x{int(r['size']):,}"
+                               for m, r in by_mode.iterrows())
+            print(f"      {known:,} of {len(df):,} rows: transit from {TRANSIT_FILE} "
+                  f"({spread})"
+                  + (f", default {default[1]:g}d for suppliers not named"
+                     if default and default[1] is not None else ""))
+            print(f"      Median total {df['lead_time_days'].median():.0f}d "
+                  f"({dispatch.median():.0f}d to dispatch + "
+                  f"{transit.median():.0f}d transit)")
             print(f"      lt_std_days here is a FLOOR, not a measurement: it is the "
                   f"spread of the supplier's promise, and a supplier who is reliably "
                   f"late shows no spread at all. The transit leg is a constant and adds "
                   f"none either. Safety stock covers less lead-time risk than the number "
                   f"suggests — post goods receipts and the measurement becomes real.")
-        missing = df.loc[transit.isna(), "supplier"].dropna().unique() if known < len(df) else []
-        if len(missing):
-            shown = ", ".join(str(m) for m in missing[:4])
+        missing = (sorted(df.loc[transit.isna(), "supplier"].dropna().astype(str).unique())
+                   if known < len(df) and "supplier" in df.columns else [])
+        if missing:
+            shown = ", ".join(missing[:4])
             print(f"      {len(df) - known:,} rows across {len(missing):,} supplier(s) "
-                  f"have no transit time and so no measured lead time — they fall back "
-                  f"to the item master's planned delivery time. Add them to "
-                  f"{TRANSIT_TIMES_FILE}: {shown}"
+                  f"have no transit time and so no lead time from this path — they fall "
+                  f"back to the item master's planned delivery time. Add them to "
+                  f"{TRANSIT_FILE}: {shown}"
                   + (" ..." if len(missing) > 4 else ""))
+        self._write_transit_template(df, table, default)
         return df
+
+    def _write_transit_template(self, df: pd.DataFrame, table: dict, default) -> None:
+        """
+        Write a starter copy of the transit table, listing every supplier in the extract.
+
+        Compiling the supplier list is the slow half of filling this file in, and it is
+        the half the run can do. Written whenever a supplier is unlisted — including
+        when a `*` row is covering for them, because a blanket is a reason to finish the
+        table rather than a reason to stop.
+
+        Never written into `config/`: that would either overwrite a table someone is
+        maintaining or look like it had been accepted. It goes beside the run's other
+        outputs, and the planner moves it.
+        """
+        if "supplier" not in df.columns or self.output_dir is None:
+            return
+        named = {str(s).strip().upper(): str(s).strip()
+                 for s in df["supplier"].dropna().unique() if str(s).strip()}
+        unlisted = {raw for key, raw in named.items()
+                    if not any(key.startswith(k) for k in table)}
+        if not unlisted:
+            return
+        rows = [{"supplier": raw,
+                 "transport_mode": (default[0] or "") if default else "",
+                 "transit_days": (default[1] if default and default[1] is not None
+                                  else "")}
+                for raw in sorted(unlisted)]
+        path = Path(self.output_dir) / TRANSIT_TEMPLATE
+        try:
+            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                handle.write(f"# {len(rows)} supplier(s) with no row in "
+                             f"{TRANSIT_FILE}. Fill transport_mode and transit_days,\n")
+                handle.write(f"# then move this file to config/{TRANSIT_FILE}.\n")
+                handle.write("# Any value already shown came from the \"*\" row and is "
+                             "a blanket, not an answer for this supplier.\n")
+                pd.DataFrame(rows).to_csv(handle, index=False)
+        except OSError:
+            return
+        print(f"      Starter table for the {len(rows):,} unlisted supplier(s): {path}")
 
     def _load_supplier_incoterms(self) -> dict:
         cfg = self.config_dir / "supplier_incoterm.json"

@@ -594,3 +594,96 @@ class TestHealthReachesTheOutputs:
         assert (tmp_path / "out" / f"run_health_{planner.run.run_id}.md").exists()
         assert (tmp_path / "out" / f"quality_gates_{planner.run.run_id}.json").exists()
         assert health.to_dict()["run_id"] == planner.run.run_id
+
+
+# ── Goods receipts that were never posted ─────────────────────────────────────
+
+
+class _ReceiptDoc:
+    """The one attribute the receipt check reads off a loaded document."""
+
+    def __init__(self, frame):
+        self.frame = frame
+        self.source_name = "po_history.csv"
+
+
+def _closed_lines(rows: int = 40, with_column: bool = True,
+                  missing: int = 40) -> pd.DataFrame:
+    """Fully delivered purchase lines — `open_qty` 0 — some without a receipt date."""
+    frame = pd.DataFrame({
+        "po_number": [f"45{i:05d}" for i in range(rows)],
+        "sku": [f"SKU-{i % 5:03d}" for i in range(rows)],
+        "supplier": [["V-ALPHA", "V-BETA"][i % 2] for i in range(rows)],
+        "po_date": pd.date_range("2025-01-05", periods=rows, freq="10D"),
+        "open_qty": 0,
+        "po_qty": 100,
+    })
+    if with_column:
+        frame["receive_date"] = pd.date_range("2025-03-05", periods=rows, freq="10D")
+        frame.loc[frame.index[:missing], "receive_date"] = pd.NaT
+    return frame
+
+
+class TestGoodsReceiptCompleteness:
+    """
+    A line whose `open_qty` is 0 was fully delivered, so the system knows the goods
+    arrived. A missing receipt *date* on such a line is a posting that did not happen,
+    and it costs the only measurement of lead time there is.
+    """
+
+    @staticmethod
+    def _findings(frame):
+        from inventory_planning.quality.checks import _check_receipt_completeness
+        return _check_receipt_completeness({"po_history": _ReceiptDoc(frame)},
+                                           GateThresholds())
+
+    def test_an_absent_column_is_reported_with_its_own_remedy(self):
+        """
+        The receipts may well be posted and simply not exported, so the fix is to ask
+        for the column rather than to chase the receiving team.
+        """
+        found = self._findings(_closed_lines(with_column=False))
+        assert len(found) == 1
+        assert found[0].evidence["column_absent"] is True
+        assert "no goods-receipt date column at all" in found[0].what
+        assert "Ask for the goods-receipt date" in found[0].fix
+
+    def test_a_column_present_and_unfilled_is_reported_differently(self):
+        found = self._findings(_closed_lines(missing=30))
+        assert len(found) == 1
+        assert found[0].evidence["column_absent"] is False
+        assert found[0].evidence["missing_receipt"] == 30
+        assert "Post the goods receipts" in found[0].fix
+
+    def test_it_names_the_suppliers_because_that_is_who_gets_chased(self):
+        found = self._findings(_closed_lines(missing=30))
+        assert "V-ALPHA" in found[0].what
+        assert found[0].evidence["by_supplier"]
+
+    def test_it_warns_and_never_blocks(self):
+        """
+        What it measures is operating discipline, not a broken file. A gate that stopped
+        the run would stop the report that makes the case for fixing it.
+        """
+        found = self._findings(_closed_lines(with_column=False))
+        assert found[0].severity == WARN
+
+    def test_a_complete_extract_raises_nothing(self):
+        assert self._findings(_closed_lines(missing=0)) == []
+
+    def test_a_few_gaps_are_below_the_threshold(self):
+        assert self._findings(_closed_lines(rows=40, missing=2)) == []
+
+    def test_open_lines_are_not_counted(self):
+        """
+        A line still awaiting delivery has no receipt because the goods have not come,
+        which is not a missing posting. Only `open_qty == 0` lines are judged.
+        """
+        frame = _closed_lines(with_column=False)
+        frame["open_qty"] = 50
+        assert self._findings(frame) == []
+
+    def test_the_impacts_say_what_the_figures_will_look_like(self):
+        found = self._findings(_closed_lines(with_column=False))
+        joined = " ".join(found[0].impacts)
+        assert "lt_basis" in joined and "lead-time variance" in joined

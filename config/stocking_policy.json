@@ -25,6 +25,9 @@
   ],
   "lt_outlier_sigma": 3.0,
   "lt_rolling_months": 6,
+
+  "_lt_rolling_months_note": "How many months of goods receipts measure a supplier lead time. Counted back from the newest PO date in the extract, not from today, so an extract pulled last month is not read as having no recent history. The window selects; it does not discard an item. A SKU x supplier with no receipt inside it is measured from its own older receipts instead and labelled lt_source = measured_outside_window — an item bought quarterly against a catalogue bought monthly used to lose every one of its receipts to other items' order dates and drop out of the lead-time table silently. Only items with no receipt history at all fall through to a stated value from master data, which carries no sigma.",
+
   "demand_rolling_cycles": 12,
   "forecast_horizon_months": 6,
   "cv_intermittent_threshold": 0.5,

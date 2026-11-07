@@ -208,7 +208,11 @@ class InventoryProjector:
             df["pushout_open_po_qty"] = 0
 
         cols = [
-            "sku", "location_id", "stocking_class", "service_level",
+            # `demand_source` is carried through because the planning population is the
+            # demand history union the masters. A row with no demand behind it comes out
+            # at zero should-be and NO-ACTION, which reads identically to an item the
+            # history says is dormant — and the two want different answers.
+            "sku", "location_id", "stocking_class", "demand_source", "service_level",
             "demand_mean_rolling", "wma_lead_time_days",
             "safety_stock", "demand_during_lt", "demand_during_exposure",
             "ss_exposure_days", "ss_exposure_basis", "review_period_days",

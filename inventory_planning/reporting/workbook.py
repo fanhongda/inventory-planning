@@ -80,7 +80,7 @@ LEAD_COLUMNS: Dict[str, Sequence[Tuple[str, Optional[str]]]] = {
     ],
     "Purchase": [
         ("sku", None), ("description", None), ("product_family", None),
-        ("recommended_action", None),
+        ("demand_source", None), ("recommended_action", None),
         ("suggested_po_qty", QTY), ("pushout_open_po_qty", QTY),
         ("mto_order_by", None), ("mto_order_status", None),
         ("net_requirement", QTY), ("order_quantity", QTY), ("order_lot", QTY),

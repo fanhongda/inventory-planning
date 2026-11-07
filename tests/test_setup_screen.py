@@ -476,3 +476,63 @@ class TestTheTransitSetupItem:
 
     def test_the_form_offers_the_modes_it_knows(self, client):
         assert "SEA" in self._item(client)["detail"]["modes"]
+
+
+class TestEveryEditorTheScreenAsksForExists:
+    """
+    The screen dispatched on `item.editor` with a single comparison against the
+    locations one, so everything that was not it got the macro editor. When the
+    transit card arrived it was handed a form that renders `item.title (item.unit)`
+    over one number box and submits `{name: item.setting}` to `/policy/macro`.
+    Transit has neither field, so the planner saw "Supplier transit times
+    (undefined)", typed a transport mode into the box meant for who was making the
+    change, and the server answered `'' is not an editable setting`.
+
+    Nothing failed. The backend editor existed, was correct and was tested; the page
+    simply never called it. So the test is the join between them, and it is written
+    against `/setup` rather than against a list of editor names — a hardcoded list is
+    the same drift one level up.
+    """
+
+    @pytest.fixture
+    def client(self, config, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from inventory_planning.api.app import create_app
+
+        return TestClient(create_app(config_dir=config,
+                                     output_dir=tmp_path / "out",
+                                     store_root=tmp_path / "store"))
+
+    @staticmethod
+    def _page():
+        return (Path(__file__).parents[1]
+                / "inventory_planning/api/web/setup.js").read_text(encoding="utf-8")
+
+    def test_the_page_registers_an_editor_for_every_kind_setup_serves(self, client):
+        page = self._page()
+        kinds = {i["editor"] for i in client.get("/setup").json()["items"]}
+        assert kinds, "/setup served no items"
+        missing = sorted(k for k in kinds if f"\n  {k}: " not in page)
+        assert missing == [], f"no editor registered in setup.js for: {missing}"
+
+    def test_the_transit_card_posts_to_the_transit_endpoint(self):
+        """
+        The specific regression. `/policy/macro` is the endpoint it used to reach,
+        and reaching it is what produced the refusal rather than a transit table.
+        """
+        page = self._page()
+        transit_editor = page.split("function transitEditor")[1].split("\nfunction ")[0]
+        assert '"/setup/transit"' in transit_editor
+        assert "/policy/macro" not in transit_editor
+
+    def test_an_unregistered_editor_says_so_instead_of_posting_elsewhere(self):
+        """
+        The failure mode was silent: a card that looked like a form, submitted, and
+        was refused by an endpoint it had no business calling. A gap has to read as a
+        gap.
+        """
+        page = self._page()
+        fallback = page.split("function editorFor")[1].split("\n}")[0]
+        assert "no editor for" in fallback
+

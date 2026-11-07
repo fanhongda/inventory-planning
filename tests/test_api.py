@@ -386,6 +386,88 @@ class TestABlankTemplateSaysWhatIsWrongWithIt:
         assert "`data` sheet" in detail
 
 
+class TestAWidePeriodSheetWithNoSkuColumnLandsAndSaysSo:
+    """
+    The India FDT master: a SKU x month matrix whose first column — the SAP part
+    number — carries no header, so nothing maps to `sku`. A required field with no
+    column is an ordinary outcome everywhere else in intake; on the wide path it was
+    a `KeyError: ['sku']` out of `dropna`, which reached the planner as a 500 and
+    never reached the resolution screen that would have let them fix it.
+    """
+
+    @staticmethod
+    def _fdt(tmp_path, first_header=None):
+        import pandas as pd
+
+        pytest.importorskip("openpyxl")
+        months = [f"{m}18" for m in ("Oct", "Nov", "Dec")] + \
+                 [f"{m}19" for m in ("Jan", "Feb", "Mar")]
+        head = [first_header, "Tyco Part #", "Description", "Classification",
+                "Std cost INR", "In USD", "Supplier"] + months
+        rows = [[f"{5889904 + i}", f"4190-{7026 + i}", f"PART {i}", "OBS",
+                 611269.23 - i, 7191.403 - i, "7600954"] + [(i + j) % 5
+                                                            for j in range(len(months))]
+                for i in range(6)]
+        path = tmp_path / "India FDT.xlsx"
+        pd.DataFrame(rows, columns=head).to_excel(path, index=False,
+                                                  sheet_name="India FDT")
+        return path
+
+    def test_it_lands_and_names_sku_as_the_field_with_no_column(self, client, tmp_path):
+        path = self._fdt(tmp_path)
+        response = client.post("/uploads", files={"file": (path.name, path.read_bytes())})
+        assert response.status_code == 200, response.json()
+
+        landed = response.json()["landed"][0]
+        assert landed["doc_type"] == "demand_timeseries"
+        resolution = landed["resolution"]
+        assert resolution["missing_required"] == ["sku"]
+        assert {f["field"]: f for f in resolution["fields"]}["sku"]["source"] == "absent"
+        assert any("no column mapped to sku" in step
+                   for step in resolution["transforms"])
+
+    def test_every_row_of_the_sheet_is_landed(self, client, tmp_path):
+        """
+        The unlabelled column also made the first row of data score better as a header
+        than the header did, so the batch used to arrive one row short.
+        """
+        path = self._fdt(tmp_path)
+        landed = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]
+        assert landed["rows"] == 6
+
+    def test_declaring_the_column_is_what_fixes_it(self, client, tmp_path):
+        """
+        `PN#` is the SAP number and `Tyco Part #` is the number the purchase orders
+        carry, so which column is the SKU is a thing only the planner can say. The
+        point of landing rather than raising is that they get to say it.
+        """
+        path = self._fdt(tmp_path)
+        batch_id = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]["batch_id"]
+
+        body = client.post(f"/batches/{batch_id}/declarations",
+                           json={"scope": "mapping", "field": "sku",
+                                 "value": "Tyco Part #", "by": "jfanhon",
+                                 "reason": "the POs carry the Tyco part number; "
+                                           "PN# is the SAP number"}).json()
+        sku = {f["field"]: f for f in body["resolution"]["fields"]}["sku"]
+        assert sku["source"] == "declared"
+        assert sku["column"] == "Tyco Part #"
+        assert sku["fill_rate"] == 1.0
+        assert body["resolution"]["missing_required"] == []
+
+    def test_a_labelled_key_column_still_maps_itself(self, client, tmp_path):
+        """The guard must not stop the ordinary case from routing on its own."""
+        path = self._fdt(tmp_path, first_header="Material")
+        landed = client.post(
+            "/uploads", files={"file": (path.name, path.read_bytes())}
+        ).json()["landed"][0]
+        assert landed["resolution"]["missing_required"] == []
+
+
 class TestAnUploadThatFailsSaysWhereAndWhy:
     """
     The one POST a planner makes is the one that reads an unseen export, so it is the

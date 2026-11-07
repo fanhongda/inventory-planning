@@ -200,6 +200,43 @@ class TestBannerRows:
         raw = pd.DataFrame([["Material", "Qty"], ["1003524", "8"]])
         assert find_header_row(raw) == 0
 
+    def test_one_unlabelled_column_does_not_hand_the_header_to_the_first_data_row(self):
+        """
+        A header row only has to be good enough, not blankest.
+
+        The India FDT master leaves the SAP part number column unlabelled, so row 0
+        scores one blank cell in twenty-two and the first row of data scores none.
+        Ranking by blankness alone made the data row the header: it went into the
+        header map, the row under it became `row_no` 0, and the extract arrived one
+        row short — with every column renamed after a part number.
+        """
+        raw = pd.DataFrame([
+            [None, "Tyco Part #", "Description", "Oct18", "Nov18"],
+            ["5889904", "4190-7026", "TSW DESKTOP I7 PC WIN10", "0", "0"],
+            ["5714206", "557.202.724", "FCG-004 1-24/DONG", "1", "2"],
+        ])
+        assert find_header_row(raw) == 0
+
+    def test_no_row_is_swallowed_when_a_header_cell_is_blank(self, store, tmp_path):
+        path = _write_xlsx(tmp_path / "fdt.xlsx", [
+            [None, "Tyco Part #", "Oct18"],
+            ["5889904", "4190-7026", "0"],
+            ["5714206", "557.202.724", "2"],
+        ])
+        record = store.land(path, doc_type="demand_timeseries", batch_id="d1")
+        assert record["rows"] == 2
+        assert [c["header"] for c in record["columns"]] == ["", "Tyco Part #", "Oct18"]
+        assert store.source_row("demand_timeseries", "d1", 0)["Tyco Part #"] == "4190-7026"
+
+    def test_a_banner_still_wins_over_a_mostly_blank_first_row(self):
+        """The hunt is still a hunt — the guard must not switch it off."""
+        raw = pd.DataFrame([
+            ["India FDT — demand matrix", None, None, None],
+            ["Material", "Plant", "Oct18", "Nov18"],
+            ["1003524", "5051", "8", "3"],
+        ])
+        assert find_header_row(raw) == 1
+
 
 class TestRejectsAreCounted:
     """Isolated, not dropped — and the count is answerable afterwards."""

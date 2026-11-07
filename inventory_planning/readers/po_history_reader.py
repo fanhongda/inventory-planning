@@ -27,8 +27,40 @@ TRANSIT_TIMES_FILE = "transit_times.json"
 # Which clock produced `lead_time_days`. Orthogonal to `lt_source`, which says whether
 # the number was measured at all and from which window.
 BASIS_RECEIPT = "receipt"
-BASIS_DISPATCH_PLUS_TRANSIT = "dispatch_plus_transit"
+# Named "promised" because that is what the date is. `confirmed_delivery_date` is the
+# date the supplier *committed* to, and a supplier who is chronically late looks
+# punctual in it — so a lead time built on it is a commitment, never a measurement, and
+# `lt_source` puts it in the `supplier_confirmed` authority tier rather than `measured`.
+BASIS_PROMISED_PLUS_TRANSIT = "promised_dispatch_plus_transit"
 BASIS_PRECALC = "precalc_column"
+
+# Lead-time sources, by what stands behind the number. The window suffix says the
+# receipts or confirmations were older than the measurement window, not that the grade
+# of evidence is different.
+SOURCE_MEASURED = "measured"
+SOURCE_MEASURED_OLD = "measured_outside_window"
+SOURCE_CONFIRMED = "supplier_confirmed"
+SOURCE_CONFIRMED_OLD = "supplier_confirmed_outside_window"
+
+# What `lt_std_days` actually measures, where that is not the obvious thing.
+SIGMA_PROMISE_FLOOR = "promise_spread_floor"
+
+
+def _lt_source(grp: pd.DataFrame, in_window: bool) -> str:
+    """
+    Which grade of evidence stands behind this pair's lead time.
+
+    A commitment and a receipt are not the same claim, and `crosscheck` ranks them
+    apart: `measured` outranks everything, `supplier_confirmed` outranks the masters
+    but never a receipt. Labelling a commitment `measured` would let an optimistic
+    promise beat the planned delivery time a person maintains — which is the one place
+    the promise is most likely to be wrong and the master most likely to be right.
+    """
+    promised = ("lt_basis" in grp.columns
+                and (grp["lt_basis"] == BASIS_PROMISED_PLUS_TRANSIT).any())
+    if promised:
+        return SOURCE_CONFIRMED if in_window else SOURCE_CONFIRMED_OLD
+    return SOURCE_MEASURED if in_window else SOURCE_MEASURED_OLD
 
 
 def consolidate_to_receipt_grain(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
@@ -157,15 +189,25 @@ class POHistoryReader(BaseReader):
         so without this such a file yields no measured lead time at all and every item
         falls back to the planned delivery time in the item master.
 
-        What this produces is part measured and part stated, and both halves are named:
-        `lt_basis` says `dispatch_plus_transit`, and `transit_days` carries the stated
-        leg — which `policy.should_be._transit_days` then uses in place of its
-        `transit_share_of_lt` convention, so the pipeline-stock figure stops guessing
-        too.
+        What this produces is a *commitment*, not a measurement, and every label says
+        so: `lt_basis` is `promised_dispatch_plus_transit` and `lt_source` puts the
+        pair in the `supplier_confirmed` authority tier, below a receipt and above the
+        masters. `transit_days` carries the stated leg, which
+        `policy.should_be._transit_days` then uses in place of its
+        `transit_share_of_lt` convention, so the pipeline-stock figure stops guessing.
 
-        A supplier with no entry gets no lead time rather than a short one. Treating a
-        missing transit time as zero understates the reorder point, and that is the
-        direction that stocks out.
+        **The variability is the part to be careful about.** The spread of
+        `confirmed_delivery_date - po_date` across orders is how much the supplier's
+        *promise* varies, not how much their performance does: a supplier who always
+        promises 45 days and is always ten days late shows a spread of zero. So the
+        number is kept and reported as a floor — the true lead-time sigma is at least
+        this and probably more — rather than either zeroed, which would shrink safety
+        stock on the strength of a promise, or passed off as measured variability.
+        `lt_sigma_basis` names it.
+
+        A supplier with no transit entry gets no lead time rather than a short one.
+        Treating a missing transit time as zero understates the reorder point, and that
+        is the direction that stocks out.
         """
         table, default = self._load_transit_times()
         dispatch = (df[CONFIRMED_DELIVERY_DATE] - df["po_date"]).dt.days
@@ -178,11 +220,14 @@ class POHistoryReader(BaseReader):
         df["transit_days"] = transit
         df["lead_time_days"] = dispatch + transit
         df["lt_basis"] = np.where(df["lead_time_days"].notna(),
-                                  BASIS_DISPATCH_PLUS_TRANSIT, "")
+                                  BASIS_PROMISED_PLUS_TRANSIT, "")
+        df["lt_sigma_basis"] = np.where(df["lead_time_days"].notna(),
+                                        SIGMA_PROMISE_FLOOR, "")
 
         known = int(transit.notna().sum())
-        print(f"  No goods-receipt date — lead time measured to the supplier's dispatch "
-              f"({CONFIRMED_DELIVERY_DATE}) plus a stated transit leg")
+        print(f"  No goods-receipt date — lead time taken from the supplier's confirmed "
+              f"dispatch ({CONFIRMED_DELIVERY_DATE}) plus a stated transit leg. This is "
+              f"what the supplier committed to, not what they delivered.")
         if known:
             print(f"      {known:,} of {len(df):,} rows: transit from "
                   f"{TRANSIT_TIMES_FILE}"
@@ -191,9 +236,11 @@ class POHistoryReader(BaseReader):
                   + f". Median total {df['lead_time_days'].median():.0f}d "
                     f"({dispatch.median():.0f}d to dispatch + "
                     f"{transit.median():.0f}d transit)")
-            print(f"      The transit leg is a constant, so it adds no variance: "
-                  f"lt_std_days here is the dispatch leg's variability only, and "
-                  f"safety stock covers less lead-time risk than it appears to.")
+            print(f"      lt_std_days here is a FLOOR, not a measurement: it is the "
+                  f"spread of the supplier's promise, and a supplier who is reliably "
+                  f"late shows no spread at all. The transit leg is a constant and adds "
+                  f"none either. Safety stock covers less lead-time risk than the number "
+                  f"suggests — post goods receipts and the measurement becomes real.")
         missing = df.loc[transit.isna(), "supplier"].dropna().unique() if known < len(df) else []
         if len(missing):
             shown = ", ".join(str(m) for m in missing[:4])
@@ -385,7 +432,7 @@ class POHistoryReader(BaseReader):
                 # Which grade of measurement this is. `_fill_lead_time_from_masters`
                 # adds `item_master` / `planning_master` for the items with no receipt
                 # history at all, so the column reads as one scale end to end.
-                "lt_source": "measured" if in_window else "measured_outside_window",
+                "lt_source": _lt_source(grp, in_window),
                 "lt_window_months": int(rolling_months),
                 # Which clock produced it. `lt_source` says whether it was measured and
                 # from which window; this says how far the measurement actually reached.
@@ -394,6 +441,9 @@ class POHistoryReader(BaseReader):
                              else BASIS_RECEIPT),
                 "transit_days": (pd.to_numeric(grp["transit_days"], errors="coerce").median()
                                  if "transit_days" in grp.columns else np.nan),
+                "lt_sigma_basis": (grp["lt_sigma_basis"].dropna().iloc[0]
+                                   if "lt_sigma_basis" in grp.columns
+                                   and grp["lt_sigma_basis"].notna().any() else ""),
             })
 
         out = pd.DataFrame(results)

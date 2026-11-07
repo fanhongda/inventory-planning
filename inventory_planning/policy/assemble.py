@@ -28,9 +28,11 @@ from .crosscheck import (
     ITEM_MASTER,
     MEASURED,
     PLANNING_MASTER,
+    SUPPLIER_CONFIRMED,
     CrossCheckResult,
     SourceResolver,
 )
+from ..readers.po_history_reader import BASIS_PROMISED_PLUS_TRANSIT
 from .parameters import PlanningParameters
 
 # Planner-set parameters carried through untouched. They are the benchmark the
@@ -210,6 +212,28 @@ def build_sku_attributes(
     return df, crosscheck
 
 
+def _split_confirmed_from_measured(df: pd.DataFrame, candidates: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Move the promise-based rows out of the `measured` candidate into `supplier_confirmed`.
+
+    Keyed on `lt_basis` rather than on `lt_source`, because the basis is the fact —
+    which clock produced the number — while the source is the conclusion drawn from it.
+    Where the column is absent nothing moves, so a run on receipt-based history is
+    unchanged.
+    """
+    basis = df.get("lt_basis")
+    measured = candidates.get(MEASURED)
+    if basis is None or measured is None:
+        return candidates
+    promised = basis.astype(str) == BASIS_PROMISED_PLUS_TRANSIT
+    if not promised.any():
+        return candidates
+    out = dict(candidates)
+    out[MEASURED] = measured.where(~promised)
+    out[SUPPLIER_CONFIRMED] = measured.where(promised)
+    return out
+
+
 # ── Master data ──────────────────────────────────────────────────────────────
 
 
@@ -310,12 +334,23 @@ def _merge_masters(
     for attribute, (measured, from_item, from_plan) in resolutions.items():
         if from_item is None and from_plan is None:
             continue
+        candidates = {MEASURED: measured, ITEM_MASTER: from_item,
+                      PLANNING_MASTER: from_plan}
+        if attribute == "lead_time_days":
+            # A lead time built from the supplier's confirmed date is a commitment, not
+            # a receipt — see `lt_basis` on `po_history_reader`. Split out of the
+            # measured channel so it cannot outrank the planned delivery time a person
+            # maintains: that is the one place the promise is most likely to be wrong
+            # and the master most likely to be right.
+            candidates = _split_confirmed_from_measured(df, candidates)
         resolved = resolver.resolve(
             attribute,
             skus=df["sku"],
-            candidates={MEASURED: measured, ITEM_MASTER: from_item, PLANNING_MASTER: from_plan},
+            candidates=candidates,
             # Only lead time has a sample count behind it; the rest are stated values
-            # wherever they come from.
+            # wherever they come from. A commitment carries no sample count: given
+            # twice it is still the commitment, where a measurement taken twice is not
+            # yet a distribution.
             sample_counts=df.get("lt_samples") if attribute == "lead_time_days" else None,
         )
         df[attribute] = resolved["value"]

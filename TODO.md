@@ -904,27 +904,91 @@ stripped of its delivered-quantity column. Nothing is wrong in the code; the sha
 genuinely ambiguous. But a file one column away from being misread as its own opposite
 deserves a check that says so, rather than a confidence score nobody reads.
 
-## Lead time measured to dispatch: the variance it cannot see (2026-11-07)
+## A lead time built from a promise, and the goods receipts that would replace it (2026-11-07)
 
 `POHistoryReader.ensure_lead_time` runs the best clock the extract supports. Where
-there is a confirmed-delivery or dispatch date and no goods receipt, that is
+there is a confirmed-dispatch date and no goods receipt, that is
 `(confirmed_delivery_date - po_date) + transit_days`, with the transit leg stated per
-supplier in `config/transit_times.json`. `lt_basis` says `dispatch_plus_transit` on
-every row it produced, and `transit_days` travels as far as `policy.should_be`, which
-prefers it over the `transit_share_of_lt` convention it otherwise guesses with.
+supplier in `config/transit_times.json`. `transit_days` travels as far as
+`policy.should_be`, which prefers it over the `transit_share_of_lt` convention it
+otherwise guesses the pipeline split with.
 
-Two limits, both inherent rather than bugs:
+**It is a commitment, not a measurement, and the labels now say so.** The date is what
+the supplier *committed* to; a supplier who is chronically late looks punctual in it.
+`lt_basis` is `promised_dispatch_plus_transit` and `lt_source` is `supplier_confirmed`,
+a `crosscheck` authority tier of its own: above the masters, because it is per order
+and current and because on an extract with no receipt nobody has been checking the
+promise against anything, and always below `measured`. It arrived as `measured` when
+first written, which let an optimistic promise outrank a planned delivery time a person
+maintains — the one place the promise is likeliest to be wrong.
 
-- **The stated leg has no variance.** A constant adds none, so `lt_std_days` on this
-  basis is the variability of the dispatch leg alone and safety stock covers less
-  lead-time risk than the number suggests. Reported on every run that uses the basis.
-  The fix is not a better constant — it is a second source with real arrival dates
-  (an inbound delivery report, a warehouse receipt log), measured per lane.
-- **A supplier absent from the table gets no lead time**, falling through to the item
-  master's planned delivery time, rather than a lead time short by the whole transit
-  leg. That direction is deliberate: short understates the reorder point, which is the
-  one that stocks out. `default_days` exists for sites that would rather have one
+**The variability is the weak part, and worse than a missing transit sigma.** The spread
+of `confirmed_delivery_date - po_date` is how much the *promise* varies, not how much
+performance does: a supplier who always promises 45 days and is always ten days late
+shows no spread at all. So `lt_std_days` on this basis is reported as a floor —
+`lt_sigma_basis` is `promise_spread_floor` — rather than zeroed, which would shrink
+safety stock on the strength of a promise, or passed off as measured variability. The
+transit leg is a constant and adds no variance either.
+
+Note what `safety_stock.calculate` does with it: `lt_std_days` is `fillna(0)` and the
+lead-time term of the variance is `d_mean**2 * lt_std**2`, so **"no lead-time variance"
+and "lead-time variance unknown" are the same state** and both silently drop the term.
+On air freight that hides little. On sea it would hide the largest source of lead-time
+risk on the items with the longest exposure.
+
+**The real fix is upstream of all of it: post the goods receipts.** The receipts are
+missing here because of operating discipline, not because the process has no receiving
+step — `open_qty` is 0, so the system knows the goods arrived; only the date is absent.
+Every limit above dissolves the moment that date is recorded: the lead time becomes
+measured, the sigma becomes real, and the transit table stops being load-bearing. What
+is owed in the meantime is a figure that makes the gap visible — GR completeness per
+supplier and per month, as a reportable number rather than a silence — which does not
+exist yet and should.
+
+- **A supplier absent from the transit table gets no lead time**, falling through to the
+  item master's planned delivery time, rather than a lead time short by the whole
+  transit leg. That direction is deliberate: short understates the reorder point, which
+  is the one that stocks out. `default_days` exists for sites that would rather have one
   number than a gap.
+
+## Air to sea: what breaks when the mode changes (2026-11-07)
+
+Lead times are measured per `sku × supplier`, and **not per transport mode**. While
+everything ships by air that costs nothing. As products move to sea it is the largest
+planning risk in the pipeline, and it is invisible until after the switch.
+
+A SKU mid-transition — eight air receipts at 60 days, then two sea at 100 — comes out
+of `compute_supplier_lt` at **73.8 days, sigma 16.0, n=10, min 60 / max 100**. That
+number describes neither mode. At 100 units a day the demand side of the reorder point
+is short by 2,620 units, about 26 days of cover, and the recency weighting means it
+drifts upward for the whole measurement window: wrong every week, differently.
+
+Two errors in opposite directions, neither controlled. The lead time is short, which
+depresses the reorder point; the sigma is inflated by the bimodality, which pads safety
+stock. The second partly masks the first, so nothing on the report looks wrong.
+
+Grouping by mode fixes more than the arithmetic. A freshly switched item would have two
+or three sea observations, which is below `MIN_SAMPLES_TO_TRUST_MEASUREMENT` — so the
+thin-evidence rule in `crosscheck` would demote it and the item master's planned
+delivery time, updated for the new mode, would take over. That is the behaviour wanted
+during a transition, and it falls out of the existing design once the grouping is right.
+
+What is needed, in order:
+
+1. **A value domain for `transport_mode`.** The field exists on `po_history` and
+   `open_po` as a dimension with no normalisation, so `AIR` / `Air Freight` / `AF` /
+   `SEA` / `Ocean` / `FCL` / `LCL` are each their own category. The only consumer today
+   is `diagnostics._chronic_air`, which hardcodes four air spellings.
+2. **Group the lead time by `sku × supplier × mode`** where the column is present.
+3. **Key `transit_times.json` on supplier × mode**, falling back to supplier, then to
+   `default_days`, reporting which tier answered. One number per supplier cannot work
+   once the same supplier ships both ways.
+4. **A stated transit sigma per lane**, so the variance term is not silently zero on the
+   leg that carries most of the risk. Blocked on having real arrival dates — see the
+   goods-receipt item above; this is the second thing that discipline unlocks.
+5. **`_chronic_air` means something different after the switch.** Today it reports air
+   used as routine rather than exception, which is the old normal. It becomes the right
+   diagnostic again once sea is the baseline, and wants rewording rather than rework.
 
 Until then: the drop is reported on every run that triggers it, naming the row and line
 counts, the confirmation codes actually found, and the quantity that would have been

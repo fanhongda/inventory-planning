@@ -470,7 +470,7 @@ class TestADispatchDateAndNoReceipt:
         # 2026-01-05 -> 2026-02-20 is 46 days to dispatch, plus 21 in transit.
         assert rows.loc["4500001", "lead_time_days"] == 67.0
         assert rows.loc["4500003", "lead_time_days"] == 33.0
-        assert set(out["lt_basis"]) == {"dispatch_plus_transit"}
+        assert set(out["lt_basis"]) == {"promised_dispatch_plus_transit"}
 
     def test_the_stated_leg_is_named_on_the_row(self, tmp_path):
         """
@@ -524,6 +524,86 @@ class TestADispatchDateAndNoReceipt:
         out = reader._post_process(df)
         assert set(out["lt_basis"]) == {"receipt"}
 
+    def test_it_is_a_commitment_and_is_not_labelled_measured(self, tmp_path):
+        """
+        The date is what the supplier *committed* to. A supplier who always promises 45
+        days and is always ten days late looks punctual in it, so calling the result
+        `measured` would let an optimistic promise outrank the planned delivery time a
+        person maintains — the one place the promise is most likely to be wrong.
+        """
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21, "V-BETA": 7}))
+        lt = reader.compute_supplier_lt(reader._post_process(_dispatch_rows()))
+        assert set(lt["lt_source"]) == {"supplier_confirmed"}
+        assert set(lt["lt_sigma_basis"]) == {"promise_spread_floor"}
+
+    def test_a_receipt_still_outranks_a_confirmation(self, tmp_path):
+        """
+        The half of the ordering that is not a judgement call: a measurement of what
+        arrived beats a commitment about what would, whatever the commitment says.
+        """
+        from inventory_planning.policy.assemble import build_sku_attributes
+
+        classified = pd.DataFrame([{
+            "sku": "SKU-001", "demand_mean_rolling": 10.0, "demand_std_rolling": 2.0,
+            "demand_cv": 0.2, "stocking_class": "stocking-high",
+            "service_level": 0.95, "z_score": 1.65,
+        }])
+        measured = pd.DataFrame([{
+            "sku": "SKU-001", "supplier": "V-ALPHA", "wma_lead_time_days": 88.0,
+            "lt_std_days": 9.0, "sample_count": 9, "lt_basis": "receipt",
+            "lt_source": "measured",
+        }])
+        item_master = pd.DataFrame([{"sku": "SKU-001", "lead_time_days": 95.0}])
+        attributes, _ = build_sku_attributes(
+            classified, measured, inventory=None, item_master=item_master)
+        row = attributes.set_index("sku").loc["SKU-001"]
+        assert row["lead_time_days_source"] == "measured"
+        assert row["lead_time_days"] == 88.0
+
+    def test_a_receipt_based_pair_keeps_the_measured_label(self, tmp_path):
+        """The relabelling must not reach the case that really is measured."""
+        df = _dispatch_rows()
+        df["receive_date"] = pd.Timestamp("2026-04-01")
+        reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21}))
+        lt = reader.compute_supplier_lt(reader._post_process(df))
+        assert set(lt["lt_source"]) == {"measured"}
+
+    def test_a_confirmed_lead_time_lands_in_its_own_tier(self, tmp_path):
+        """
+        End of the chain: `assemble` splits the promise out of the measured channel, so
+        `crosscheck` ranks it in its own tier. Without the split it arrived as
+        `measured` and beat every stated value in the run — including a planned
+        delivery time maintained by a person who can see lateness the system never
+        recorded.
+
+        `AUTHORITY_ORDER` then puts it above the masters: per order and current beats a
+        standing field, and on an extract with no goods receipt nobody has been
+        checking the promise against anything, so a stale master is the likelier of the
+        two to be wrong. It stays below a receipt, always.
+        """
+        from inventory_planning.policy.assemble import build_sku_attributes
+
+        classified = pd.DataFrame([{
+            "sku": "SKU-001", "demand_mean_rolling": 10.0, "demand_std_rolling": 2.0,
+            "demand_cv": 0.2, "stocking_class": "stocking-high",
+            "service_level": 0.95, "z_score": 1.65,
+        }])
+        supplier_lt = pd.DataFrame([{
+            "sku": "SKU-001", "supplier": "V-ALPHA", "wma_lead_time_days": 65.0,
+            "lt_std_days": 1.5, "sample_count": 9,
+            "lt_basis": "promised_dispatch_plus_transit",
+            "lt_source": "supplier_confirmed", "transit_days": 21.0,
+        }])
+        item_master = pd.DataFrame([{"sku": "SKU-001", "lead_time_days": 95.0}])
+        attributes, _ = build_sku_attributes(
+            classified, supplier_lt, inventory=None, item_master=item_master)
+        row = attributes.set_index("sku").loc["SKU-001"]
+        assert row["lead_time_days_source"] == "supplier_confirmed"
+        assert row["lead_time_days"] == 65.0
+        # And the defect this closes: it is no longer in the measured channel, where it
+        # outranked every stated value in the run.
+        assert row["lead_time_days_source"] != "measured"
+
     def test_a_present_but_empty_receipt_column_does_not_win(self, tmp_path):
         """
         It used to: the branch tested whether the column existed, not whether anything
@@ -534,4 +614,4 @@ class TestADispatchDateAndNoReceipt:
         df["receive_date"] = pd.NaT
         reader = POHistoryReader(_transit_config(tmp_path, {"V-ALPHA": 21, "V-BETA": 7}))
         out = reader._post_process(df)
-        assert set(out["lt_basis"]) == {"dispatch_plus_transit"}
+        assert set(out["lt_basis"]) == {"promised_dispatch_plus_transit"}

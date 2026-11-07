@@ -12,14 +12,24 @@ quietly: every MRP run in the ERP is planning on it.
 
 Sources are ranked by what kind of claim they are, not by how convenient they are:
 
-    measured        derived from transactions in this run — what actually happened
-    item_master     a standing parameter in the system of record — an intention
-    planning_master a value a person maintains by hand — a decision
-    config          a pipeline-wide default — a guess
+    measured          derived from transactions in this run — what actually happened
+    supplier_confirmed the supplier's own commitment, per order and current — what they
+                      said they would do, which is not what they did
+    item_master       a standing parameter in the system of record — an intention
+    planning_master   a value a person maintains by hand — a decision
+    config            a pipeline-wide default — a guess
 
 Higher authority wins. The exception is thin evidence: a lead time "measured" from two
 receipts is not a distribution, and a master value that reflects years of buying is
 the better number. Below `min_samples` the measured value yields.
+
+`supplier_confirmed` sits where it does for one reason: an extract that carries the
+supplier's confirmed date and no goods receipt can state the lead time the supplier
+committed to, and cannot measure the one they delivered. That is better than a static
+field in the item master — it is per order and it is current — and it is categorically
+weaker than a receipt, because a supplier who is chronically late looks punctual in it.
+It is not subject to the thin-evidence rule: a commitment given twice is still the
+commitment, where a measurement taken twice is not yet a distribution.
 
 ## Three jobs, one mechanism
 
@@ -47,14 +57,16 @@ import numpy as np
 import pandas as pd
 
 MEASURED = "measured"
+SUPPLIER_CONFIRMED = "supplier_confirmed"
 ITEM_MASTER = "item_master"
 PLANNING_MASTER = "planning_master"
 CONFIG = "config"
 
-AUTHORITY_ORDER = (MEASURED, ITEM_MASTER, PLANNING_MASTER, CONFIG)
+AUTHORITY_ORDER = (MEASURED, SUPPLIER_CONFIRMED, ITEM_MASTER, PLANNING_MASTER, CONFIG)
 
 SOURCE_LABELS = {
     MEASURED: "measured from transactions",
+    SUPPLIER_CONFIRMED: "supplier's own confirmation (a commitment, not a receipt)",
     ITEM_MASTER: "ERP item master",
     PLANNING_MASTER: "planner worksheet",
     CONFIG: "config default",

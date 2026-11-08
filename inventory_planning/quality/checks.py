@@ -92,11 +92,15 @@ def _check_product_dimension(documents: Dict[str, Any], plan) -> List[Finding]:
             "Not affected: safety stock, reorder points, purchase quantities and every "
             "per-SKU recommendation. Those never use the family.",
         ],
-        fix=("Map the product family in the master. The column is usually there under "
-             "a name no alias matched — run `python -m inventory_planning.explain "
-             "<master file>` to see the unmatched headers. Where a master carries a "
-             "two-level hierarchy, the finer level is the family and the coarser one "
-             "is `business_unit`."),
+        fix=("Declare `product_family` as the column that holds it. The column is "
+             "usually there under a name no alias matched — the resolution screen "
+             "lists them as unmatched, or run `python -m inventory_planning.explain "
+             "<master file>`. Declaring it is the remedy, not renaming the column in "
+             "the export: the declaration is read from the landed rows and applies to "
+             "every later upload of the same source, where a renamed header has to be "
+             "renamed again next month and nothing says so when it is not. Where a "
+             "master carries a two-level hierarchy, the finer level is the family and "
+             "the coarser one is `business_unit`."),
         evidence={"masters": masters},
     )]
 
@@ -235,11 +239,16 @@ def _check_sku_agreement(documents: Dict[str, Any],
                   for name, values in getattr(doc, "key_candidates", {}).items()
                   if len(values) >= _MIN_KEY_DISTINCT]
         best_share, best_col = max(better, default=(0.0, None))
-        fix = (f"Map `sku` to {best_col!r} in an adapter for this export — it would "
-               f"match {best_share:.0%}."
+        fix = (f"Declare `sku` as {best_col!r} for this batch — it would match "
+               f"{best_share:.0%}. On the review screen, or as a `scope: mapping` "
+               f"entry in `config/declarations.yaml`; both write the same record and "
+               f"it is re-read from the landed rows, so there is nothing to re-upload "
+               f"and no adapter to author."
                if best_col and best_share > max(share + 0.2, floor)
                else "Check which column the rest of the business uses as the item "
-                    "number, and map `sku` to it in an adapter for this export.")
+                    "number and declare `sku` as that column for this batch — on the "
+                    "review screen, or as a `scope: mapping` entry in "
+                    "`config/declarations.yaml`.")
         out.append(Finding(
             stage="intake", check="sku_agreement",
             severity=(WARN if superset else BLOCK),
@@ -299,9 +308,10 @@ def _check_semantic_failures(documents: Dict[str, Any],
                 why=("At this rate it is not dirt in the data but the wrong column, or "
                      "two columns the wrong way round. Every figure derived from it "
                      "carries the same error, uniformly and invisibly."),
-                fix=(f"Look at the source columns behind {result.name} — run "
-                     f"`python -m inventory_planning.explain <file>` — and correct the "
-                     f"mapping in an adapter."),
+                fix=(f"Look at the source columns behind {result.name} — the "
+                     f"resolution screen shows the mapping beside the landed rows, or "
+                     f"run `python -m inventory_planning.explain <file>` — and declare "
+                     f"the right column for the field that is wrong."),
                 evidence={"doc_type": doc_type, "source": doc.source_name,
                           "test": result.name, "failure_rate": round(rate, 4)},
             ))

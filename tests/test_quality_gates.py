@@ -154,6 +154,68 @@ class TestTheJoinThatMatchesNothing:
         assert finding.why and finding.what
 
 
+class TestAFindingNamesTheRemedyThatExists:
+    """
+    The landing layer's whole purpose, from `api/app.py`: a correction re-resolves
+    from what was landed, "so fixing a mapping costs neither a re-upload nor a
+    hand-authored adapter — the two remedies that existed before and both of which
+    have broken a run."
+
+    The gate was recommending both of them. `sku_agreement` said "map `sku` to 'PN#'
+    in an adapter for this export"; `no_product_dimension` said "map the product
+    family in the master", which reads as an instruction to edit the spreadsheet. A
+    planner who follows either does work the architecture exists to spare them — and
+    renaming a header in an export is worse than useless, because it has to be
+    redone on every later export and nothing says so when it is not.
+    """
+
+    @staticmethod
+    def _joinless():
+        sales = [f"P-{i:03d}" for i in range(100)]
+        stock = [f"X-{i:03d}" for i in range(100)]
+        docs = {
+            "sales_history": _Doc(pd.DataFrame({"sku": sales})),
+            "inventory": _Doc(pd.DataFrame({"sku": stock}), "stock.xlsx"),
+        }
+        docs["sales_history"].key_candidates = {"PN#": set(stock)}
+        return docs
+
+    def test_the_join_finding_points_at_a_declaration(self):
+        report = quality_checks.gate_intake(
+            _result(self._joinless()), None, GateThresholds.load(None))
+        fix = next(f for f in report.blocking if f.check == "sku_agreement").fix
+        assert "PN#" in fix
+        assert "eclare" in fix
+        assert "re-upload" in fix          # says the two old remedies are not needed
+        assert "in an adapter" not in fix
+
+    def test_the_family_finding_does_not_ask_for_the_export_to_be_edited(self):
+        docs = {
+            "planning_master": _Doc(pd.DataFrame({"sku": [f"P-{i:03d}" for i in range(50)]}),
+                                    "master.xlsx"),
+            "sales_history": _Doc(pd.DataFrame({"sku": [f"P-{i:03d}" for i in range(50)]})),
+        }
+        report = quality_checks.gate_intake(_result(docs), None, GateThresholds.load(None))
+        fix = next(f for f in report.findings if f.check == "no_product_dimension").fix
+        assert "eclare" in fix
+        assert "product_family" in fix
+        # The instruction it used to give, and the reason it was wrong.
+        assert "renaming" in fix
+
+    def test_no_check_in_this_module_sends_a_planner_to_write_an_adapter(self):
+        """
+        A sweep rather than a case per finding: the next check added is the one that
+        would carry the old advice, and it would be true for every planner on every
+        export before any test of its own existed.
+        """
+        import re
+
+        source = (Path(__file__).parents[1]
+                  / "inventory_planning/quality/checks.py").read_text(encoding="utf-8")
+        offenders = [m for m in re.findall(r'"[^"]*in an adapter[^"]*"', source)]
+        assert offenders == [], f"gate findings still recommending an adapter: {offenders}"
+
+
 class TestAWiderGrainIsNotABrokenJoin:
     """
     The one document whose item list is *meant* to be bigger than everyone else's.

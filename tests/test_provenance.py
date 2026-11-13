@@ -175,6 +175,63 @@ class TestConfigFingerprint:
                                                     encoding="utf-8")
         assert _manifest(config_dir=cfg).config_fingerprint != before
 
+    def test_editing_the_transit_table_moves_it(self, tmp_path):
+        """
+        It did not, because the glob was `*.json` and this file is a CSV. The transit
+        leg is the one term in `lead_time_days` that exists in no export, so two runs
+        that differ only here plan to different reorder points and used to compare as
+        `identical`.
+        """
+        cfg = tmp_path / "config"; cfg.mkdir()
+        transit = cfg / "supplier_transit.csv"
+        transit.write_text("supplier,transport_mode,transit_days\nACME,SEA,45\n",
+                           encoding="utf-8")
+        before = _manifest(config_dir=cfg).config_fingerprint
+        transit.write_text("supplier,transport_mode,transit_days\nACME,AIR,5\n",
+                           encoding="utf-8")
+        assert _manifest(config_dir=cfg).config_fingerprint != before
+
+    def test_editing_the_declarations_moves_it(self, tmp_path):
+        """Column maps and gate waivers decide what the canonical frames contain."""
+        cfg = tmp_path / "config"; cfg.mkdir()
+        decl = cfg / "declarations.yaml"
+        decl.write_text("version: 1\noverrides:\n", encoding="utf-8")
+        before = _manifest(config_dir=cfg).config_fingerprint
+        decl.write_text("version: 1\noverrides: []\ngate_waivers: []\n",
+                        encoding="utf-8")
+        assert _manifest(config_dir=cfg).config_fingerprint != before
+
+    def test_a_declaration_written_through_the_interface_moves_it_too(self, tmp_path):
+        """
+        `Declarations.load` reads `declarations.d/*.yaml` beside the hand-authored
+        file. A fingerprint over only the hand-authored half would move for a
+        correction typed in an editor and hold still for the identical one made in
+        the UI.
+        """
+        cfg = tmp_path / "config"; cfg.mkdir()
+        (cfg / "declarations.yaml").write_text("version: 1\n", encoding="utf-8")
+        before = _manifest(config_dir=cfg).config_fingerprint
+        machine = cfg / "declarations.d"; machine.mkdir()
+        (machine / "20260101_000000-mapping-qty.yaml").write_text(
+            "version: 1\noverrides: []\n", encoding="utf-8")
+        assert _manifest(config_dir=cfg).config_fingerprint != before
+
+    def test_a_nested_file_is_keyed_by_its_path_not_its_name(self, tmp_path):
+        """
+        Two files of the same name, one nested, must not collide in `config_files` —
+        a collision drops one of them from the hash and nothing says so. Everything
+        directly in the config directory keeps the bare name it always had.
+        """
+        cfg = tmp_path / "config"; cfg.mkdir()
+        (cfg / "declarations.yaml").write_text("version: 1\n", encoding="utf-8")
+        machine = cfg / "declarations.d"; machine.mkdir()
+        (machine / "declarations.yaml").write_text("version: 1\noverrides: []\n",
+                                                   encoding="utf-8")
+        files = _manifest(config_dir=cfg).config_files
+        assert "declarations.yaml" in files
+        assert "declarations.d/declarations.yaml" in files
+        assert files["declarations.yaml"] != files["declarations.d/declarations.yaml"]
+
     def test_a_missing_config_directory_is_a_note_not_a_failure(self, tmp_path):
         m = _manifest(config_dir=tmp_path / "nope")
         assert m.config_files == {}

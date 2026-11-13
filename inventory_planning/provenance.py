@@ -42,7 +42,23 @@ INDEX_NAME = "index.jsonl"
 
 # Files whose contents decide what the pipeline computes, as opposed to what it reads.
 # `planning_parameters.md` is in here because the rule engine is driven by it.
-_CONFIG_GLOBS = ("*.json", "planning_parameters.md")
+#
+# Not only `*.json`, and the two that were missing were missing for the same reason:
+# the glob was written when every setting was JSON, and the settings that arrived
+# later brought their own formats with them. `supplier_transit.csv` supplies the
+# transit leg of every lead time — the one term in `lead_time_days` that exists in no
+# export — and `declarations.yaml` supplies the column maps and gate waivers that
+# decide what the canonical frames contain. Two runs differing only in one of those
+# compared as `identical`, whose description tells the reader that a real
+# configuration result is non-determinism. That is the failure `policy_fingerprint`
+# was split out to stop, reappearing one file at a time.
+#
+# `declarations.d/*.yaml` is here because `Declarations.load` reads it alongside
+# `declarations.yaml` — same declarations, written through an interface rather than
+# by hand. A fingerprint that covered only the hand-authored half would move for a
+# correction typed in an editor and hold still for the identical one made in the UI.
+_CONFIG_GLOBS = ("*.json", "planning_parameters.md", "supplier_transit.csv",
+                 "declarations.yaml", "declarations.d/*.yaml")
 
 
 def sha256_file(path: Path) -> Optional[str]:
@@ -226,7 +242,11 @@ class RunManifest:
             for path in sorted(config_dir.glob(pattern)):
                 digest = sha256_file(path)
                 if digest:
-                    self.config_files[path.name] = digest
+                    # Relative, not `path.name`: `declarations.d` holds files beside
+                    # ones that may share their name, and a key collision would drop a
+                    # file from the hash silently. Identical to the old key for
+                    # everything directly in the config directory.
+                    self.config_files[path.relative_to(config_dir).as_posix()] = digest
 
     # ── Recording ────────────────────────────────────────────────────────────
 
@@ -384,7 +404,8 @@ class RunManifest:
     def config_fingerprint(self) -> str:
         """
         The configuration that transformed the inputs — FX table, incoterm rules, node
-        map. Fixed at `begin()` and never moved afterwards, because this is the value
+        map, the transit table, the declarations. Fixed at `begin()` and never moved
+        afterwards, because this is the value
         stamped on every batch at intake time and a batch has to be joinable back to
         the manifest that describes the run that wrote it.
 

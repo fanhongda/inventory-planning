@@ -266,7 +266,16 @@ class Service:
         # to refuse. For the default tenant the workspace resolves to that same
         # directory, so nothing moved for the case the fallback was written for.
         self.config_dir = self.workspace.config_dir
-        self.store_root = store_root
+        # The workspace's too, and for the same reason — this one was left on the raw
+        # argument when the config fallback above was fixed. `--tenant FDT-SG` with no
+        # `--store` left it None, `LandingStore(None)` resolved the *default* store, and
+        # the uploads, the promotion target and every fact query went there: one
+        # tenant's screen listing another's documents while `/workspace` reported the
+        # tenant's own path. Of the three directories this is the one that cannot be
+        # regenerated, so it is the worst of the three to get wrong. `Workspace.resolve`
+        # has already given an explicit `--store` precedence and scoped it to the
+        # tenant, so reading it back from there keeps that argument working.
+        self.store_root = self.workspace.store_root
         # Where the runs are. The registry lives under the output directory the pipeline
         # writes to, so the interface reads the runs the CLI produced rather than
         # keeping a second record that could disagree with it.

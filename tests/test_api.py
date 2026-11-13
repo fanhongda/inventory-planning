@@ -100,6 +100,22 @@ class TestTheWorkspaceIsSetUpFromTheBrowser:
         assert response.status_code == 404
         assert "acme" in response.json()["detail"]
 
+    def test_it_does_not_quietly_serve_another_tenants_documents(self, fresh):
+        """
+        The same defect as the one above, in the directory it costs most.
+
+        `service.store_root` kept the raw argument and was None when unset, so
+        `LandingStore(None)` resolved the *default* store: a server started with
+        `--tenant acme` listed whatever had been uploaded under the default workspace,
+        promoted into its fact store and answered `/facts` from it, while `/workspace`
+        reported acme's own path. Config and output can be regenerated from the repo;
+        this is the one directory that cannot.
+        """
+        health = fresh.get("/health").json()
+        workspace = fresh.get("/workspace").json()
+        assert health["store_root"] == workspace["store_root"]
+        assert "acme" in health["store_root"]
+
     def test_one_call_prepares_it(self, fresh):
         body = fresh.post("/workspace/setup", json={"by": "jfanhon"}).json()
         assert body["ready"] is True

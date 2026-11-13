@@ -279,11 +279,16 @@ class AdapterRegistry:
         profile = Profiler().profile(df, source_name=source_name)
 
         best: Optional[Tuple[Adapter, float, str]] = None
+        passed_over: List[str] = []
         for adapter in self.adapters:
             if doc_type_hint and adapter.doc_type != doc_type_hint:
                 continue
             matched, confidence, reason = adapter.fingerprint.match(profile)
             if not matched:
+                continue
+            unfit = self._cannot_carry(adapter, profile)
+            if unfit:
+                passed_over.append(f"{adapter.slug}: {unfit}")
                 continue
             # Prefer higher confidence; break ties toward reviewed adapters and
             # then toward the newer version.
@@ -321,11 +326,53 @@ class AdapterRegistry:
             contract=contract,
             profile=profile,
             confidence=doc_confidence,
-            reason=f"no adapter matched; drafted from profile ({doc_reason})",
+            reason=(f"no adapter matched; drafted from profile ({doc_reason})"
+                    + (f"; passed over {'; '.join(passed_over)}" if passed_over else "")),
             is_draft=True,
             confidence_basis=basis,
             classification=classification,
         )
+
+    def _cannot_carry(self, adapter: Adapter, profile: TableProfile) -> Optional[str]:
+        """
+        Why a fingerprint hit cannot be this document, or None if it can.
+
+        A signature is a sample of the columns an adapter maps, matched at 60%, and
+        sources from one ERP share most of their vocabulary — an on-hand export and an
+        item master from the same system can both carry `Item`, `Description`,
+        `Currency`. So a signature can match a file that lacks the very column that
+        made the original *this* document: an inventory adapter recognised a planning
+        sheet with no on-hand quantity in it, the stock was read off columns that did
+        not exist, and twenty-one months of demand were never looked at.
+
+        `classify` already refuses that — a contract that finds none of its
+        identifying columns scores zero. This is the same two tests applied to the
+        path that skips `classify`, phrased against the adapter's own map rather than
+        against aliases: every column the adapter says carries a required field has to
+        be in this file, and each identifying group has to be carried by at least one.
+        A field the adapter derives counts as carried; a required field it never mapped
+        to a column (the period and quantity of a wide series, which come from the
+        reshape) is not this test's business.
+        """
+        contract = self.contracts.get(adapter.doc_type)
+        if contract is None:
+            return None
+        tokens = set(profile.header_tokens)
+
+        def carried(field: str) -> bool:
+            if field in adapter.derivations:
+                return True
+            source = adapter.column_map.get(field)
+            return source is not None and normalize_header(source) in tokens
+
+        for field in contract.required_fields:
+            source = adapter.column_map.get(field)
+            if source is not None and not carried(field):
+                return f"required {field} maps to {source!r}, which this file does not have"
+        for group in contract.identifying_any or []:
+            if not any(carried(f) for f in group):
+                return f"carries none of {', '.join(group)}"
+        return None
 
     # ── Document classification ──────────────────────────────────────────────
 

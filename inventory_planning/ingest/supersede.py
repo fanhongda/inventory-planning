@@ -558,61 +558,13 @@ class SupersessionMap:
         happened and the quantities belong together.
         """
         df = df.copy()
-        is_master = list(contract.natural_key) == ["sku"]
         # The successor's own row describes the successor. The predecessor's is a
         # fallback for what the successor's leaves blank — a master row created for a
         # new number is routinely thinner than the one it replaced.
         df["__successor_row"] = ~hit.reindex(df.index).fillna(False).to_numpy()
         df = df.sort_values("__successor_row", ascending=False, kind="stable")
-
-        if is_master:
-            out = df.groupby(key, as_index=False, dropna=False).first()
-            return out.drop(columns="__successor_row")
-
-        qty_col = _quantity_column(df, contract)
-        per_unit = [
-            name for name, spec in contract.fields.items()
-            if name in df.columns and spec.role == "measure"
-            and spec.unit == _PER_UNIT_MONEY
-        ]
-        weighted = []
-        if qty_col:
-            weight = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
-            for name in per_unit:
-                df[f"__w_{name}"] = pd.to_numeric(df[name], errors="coerce") * weight
-                weighted.append(name)
-            df["__weight"] = weight
-
-        agg: Dict[str, str] = {}
-        for col in df.columns:
-            if col in key:
-                continue
-            spec = contract.field(col)
-            additive = (
-                spec is not None and spec.role == "measure"
-                and spec.unit in (_QUANTITY_UNIT, _MONEY_UNIT)
-            )
-            if additive or col.startswith("__w_") or col == "__weight":
-                agg[col] = "sum"
-            else:
-                agg[col] = "first"
-
-        out = df.groupby(key, as_index=False, dropna=False).agg(agg)
-        # A per-unit price is not a thing two rows have two of; it is one number the
-        # combined quantity was bought at. Summing it invents money, averaging it
-        # ignores that one row may be a hundred times the other.
-        # Two rows for one material both at zero stock is ordinary, not exceptional —
-        # an item can appear in a stock report with nothing on the shelf. There is no
-        # weighted price to compute there, so the successor's own price stands.
-        total = pd.to_numeric(out["__weight"], errors="coerce").replace(0.0, float("nan")) \
-            if "__weight" in out.columns else None
-        for name in weighted:
-            blended = pd.to_numeric(out[f"__w_{name}"], errors="coerce") / total
-            out[name] = blended.fillna(pd.to_numeric(out[name], errors="coerce"))
-        drop = [c for c in out.columns if c.startswith("__w_")] + ["__successor_row"]
-        if "__weight" in out.columns:
-            drop.append("__weight")
-        return out.drop(columns=[c for c in drop if c in out.columns])
+        out = aggregate_on_key(df, key, contract)
+        return out.drop(columns=[c for c in ("__successor_row",) if c in out.columns])
 
     # ── Verification ─────────────────────────────────────────────────────────
 
@@ -680,6 +632,76 @@ _HEADLINE_QUANTITY = {
     "open_po": "open_qty",
     "open_so": "open_qty",
 }
+
+
+def aggregate_on_key(df: pd.DataFrame, key: Sequence[str],
+                     contract: DocContract) -> pd.DataFrame:
+    """
+    Combine rows that share `key`, by what each column *is*. The one rule for it.
+
+    It had two homes and they disagreed. This module summed only the quantities and
+    the money and weighted the per-unit prices; the adapter's rollup summed every
+    numeric measure, so a stock report listing one part in eleven bins arrived with
+    eleven times its standard cost — every quantity right, every value wrong by a
+    whole-number factor that differed part by part.
+
+    What a column is, by its unit:
+
+        base_uom, currency      extensive — two rows hold two amounts, so they add
+        currency_per_base_uom   a price — one number the combined quantity is worth,
+                                so weighted by the document's quantity where it has
+                                one; summing invents money, a plain mean ignores that
+                                one row may be a hundred times the other
+        anything else           a day count, a rate, a ratio, a label — the first row
+                                stands, which is why callers order rows first
+
+    A key of `[sku]` alone means one row per material of its standing attributes —
+    a lead time, an MOQ, a nominated supplier — so two such rows are two descriptions
+    of one thing, and adding them up would produce a 180-day lead time out of two
+    90-day ones. Every other key carries an event, a period or a location alongside
+    the SKU, so two rows there are two things and the amounts belong together.
+    """
+    key = list(key)
+    if key == ["sku"]:
+        return df.groupby(key, as_index=False, dropna=False).first()
+
+    df = df.copy()
+    qty_col = _quantity_column(df, contract)
+    weighted: List[str] = []
+    if qty_col:
+        weight = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
+        for name, spec in contract.fields.items():
+            if (name in df.columns and spec.role == "measure"
+                    and spec.unit == _PER_UNIT_MONEY):
+                df[f"__w_{name}"] = pd.to_numeric(df[name], errors="coerce") * weight
+                weighted.append(name)
+        df["__weight"] = weight
+
+    agg: Dict[str, str] = {}
+    for col in df.columns:
+        if col in key:
+            continue
+        spec = contract.field(col)
+        additive = (
+            spec is not None and spec.role == "measure"
+            and spec.unit in (_QUANTITY_UNIT, _MONEY_UNIT)
+        )
+        agg[col] = "sum" if additive or col.startswith("__w_") or col == "__weight" \
+            else "first"
+
+    out = df.groupby(key, as_index=False, dropna=False).agg(agg)
+    # Every row of a part at zero stock is ordinary — an item can appear in a stock
+    # report with nothing on the shelf. There is no weighted price to compute there,
+    # so the first row's own price stands.
+    total = pd.to_numeric(out["__weight"], errors="coerce").replace(0.0, float("nan")) \
+        if "__weight" in out.columns else None
+    for name in weighted:
+        blended = pd.to_numeric(out[f"__w_{name}"], errors="coerce") / total
+        out[name] = blended.fillna(pd.to_numeric(out[name], errors="coerce"))
+    drop = [c for c in out.columns if c.startswith("__w_")]
+    if "__weight" in out.columns:
+        drop.append("__weight")
+    return out.drop(columns=drop)
 
 
 def _quantity_column(df: pd.DataFrame, contract: DocContract = None) -> Optional[str]:

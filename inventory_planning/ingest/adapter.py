@@ -34,10 +34,6 @@ from .profiler import TableProfile, normalize_header
 
 ADAPTERS_DIR = Path(__file__).parent / "adapters"
 
-# Aggregation used when rolling several source rows up to the contract grain.
-# Measures sum; everything else takes the first non-null.
-_MEASURE_AGG = "sum"
-
 
 @dataclass
 class TransformStep:
@@ -756,18 +752,12 @@ class Adapter:
             return df
         key = list(contract.natural_key)
 
-        before = len(df)
-        agg: Dict[str, Any] = {}
-        for col in df.columns:
-            if col in key:
-                continue
-            spec = contract.field(col)
-            if spec is not None and spec.role == "measure" and spec.is_numeric:
-                agg[col] = _MEASURE_AGG
-            else:
-                agg[col] = "first"
+        # Shared with supersession, which had it right: summing every numeric measure
+        # summed the unit cost too, once per bin. See `aggregate_on_key`.
+        from .supersede import aggregate_on_key
 
-        df = df.groupby(key, as_index=False, dropna=False).agg(agg)
+        before = len(df)
+        df = aggregate_on_key(df, key, contract)
         log.append(TransformStep(
             "<rollup>", "rolled_up",
             f"{self.grain} -> {self.rollup_to} on {'+'.join(key)} "

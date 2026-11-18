@@ -132,7 +132,8 @@ class ForwardRisk:
 
     def summary(self) -> str:
         lines = [
-            f"  Forward risk — next {self.horizon_days} days (from {self.as_of})",
+            f"  Forward risk — within each SKU's lead time, {self.horizon_days} days where "
+            f"none resolved (from {self.as_of})",
             "  " + "-" * 58,
         ]
         if len(self.stockout):
@@ -335,6 +336,11 @@ class DiagnosticsAnalyzer:
         df["inbound_day"] = df["sku"].map(self._first_arrival(open_po, as_of))
 
         df["daily_demand"] = pd.to_numeric(df["demand_mean"], errors="coerce").fillna(0.0) / 30.0
+        # Each SKU's own window. Where no lead time resolved, the analyzer's horizon
+        # stands in — the old behaviour, and the cautious one.
+        lead = (pd.to_numeric(df["lead_time_days"], errors="coerce")
+                if "lead_time_days" in df.columns else pd.Series(np.nan, index=df.index))
+        df["horizon_days"] = lead.where(lead > 0).fillna(float(self.horizon_days))
         df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
 
         ss = df["sku"].map(safety_stock).fillna(0.0) if safety_stock is not None else 0.0
@@ -353,48 +359,66 @@ class DiagnosticsAnalyzer:
     # Empty results keep the full schema so callers can index them unconditionally.
     # A bare pd.DataFrame() raises KeyError on `df["sku"]`, which turns "nothing to
     # report" into a crash at exactly the moment the pipeline is working correctly.
-    _STOCKOUT_COLS = ["sku", "days_to_stockout", "on_hand", "backlog", "available_now",
-                      "inbound_qty", "inbound_day", "daily_demand", "qty_at_risk",
-                      "value_at_risk"]
+    _STOCKOUT_COLS = ["sku", "days_to_stockout", "horizon_days", "on_hand", "backlog",
+                      "available_now", "inbound_qty", "inbound_day", "daily_demand",
+                      "qty_at_risk", "value_at_risk"]
     _SLOW_BURN_COLS = ["sku", "days_of_cover", "available_now", "stock_value",
                        "inbound_qty", "daily_demand"]
 
     def _stockout(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Days until stock hits the safety level, and the demand value exposed if it does.
+        The demand each SKU will fail to serve before an order placed today can land.
+
+        Three things decide the number, and each used to be wrong in the direction of
+        a larger one:
+
+        **The window is the SKU's lead time, not a fixed horizon.** A shortfall inside
+        it cannot be closed by buying now — that is the exposure. One beyond it is a
+        purchase not yet placed, which the recommendations exist to place. A flat 180
+        days counted half a year of unbought demand as lost on every item, and on an
+        extract with no open orders that is simply half a year of demand.
+
+        **A sale is lost at an empty shelf, not at the safety level.** Safety stock is
+        held to be spent on exactly this — demand above forecast, supply later than
+        promised. Starting the clock where the safety stock begins counted every unit
+        it would serve as unserved. The planning gap measured against safety stock is
+        the S&IOP sheet's, and is a different question.
+
+        **An item held to order has nothing to run out of.** A non-stocking SKU has no
+        shelf by policy; projecting its demand against zero stock reports a stock-out
+        for every one of them, every run.
 
         Inbound POs postpone the date only if they arrive before it; a PO landing after
         the stockout does not prevent the stockout, it just shortens it.
         """
         work = df[df["daily_demand"] > 0].copy()
+        if "stocking_class" in work.columns:
+            work = work[~work["stocking_class"].astype(str).str.lower().eq("non-stocking")]
         if work.empty:
             return pd.DataFrame(columns=self._STOCKOUT_COLS)
 
-        usable = (work["available_now"] - work["safety_stock"]).clip(lower=0)
+        usable = work["available_now"].clip(lower=0)
         work["days_to_stockout"] = np.floor(usable / work["daily_demand"])
 
         arrives_in_time = (
             work["inbound_day"].notna() & (work["inbound_day"] <= work["days_to_stockout"])
         )
-        with_inbound = (
-            (usable + work["inbound_qty"] - work["safety_stock"] * 0) / work["daily_demand"]
-        )
+        with_inbound = (usable + work["inbound_qty"]) / work["daily_demand"]
         work["days_to_stockout"] = np.where(
             arrives_in_time, np.floor(with_inbound), work["days_to_stockout"]
         )
 
-        at_risk = work[work["days_to_stockout"] <= self.horizon_days].copy()
+        at_risk = work[work["days_to_stockout"] < work["horizon_days"]].copy()
         if at_risk.empty:
             return pd.DataFrame(columns=self._STOCKOUT_COLS)
 
         # Value exposed is the demand that would go unserved over the rest of the
-        # horizon, not the value of the stock — a stockout costs sales, not inventory.
-        unserved_days = (self.horizon_days - at_risk["days_to_stockout"]).clip(lower=0)
+        # window, not the value of the stock — a stockout costs sales, not inventory.
+        unserved_days = (at_risk["horizon_days"] - at_risk["days_to_stockout"]).clip(lower=0)
         at_risk["qty_at_risk"] = unserved_days * at_risk["daily_demand"]
         at_risk["value_at_risk"] = at_risk["qty_at_risk"] * at_risk["unit_cost"]
 
-        cols = ["sku", "days_to_stockout", "on_hand", "backlog", "available_now",
-                "inbound_qty", "inbound_day", "daily_demand", "qty_at_risk", "value_at_risk"]
+        cols = list(self._STOCKOUT_COLS)
         if "abc_class" in at_risk.columns:
             cols.append("abc_class")
         return at_risk[cols].sort_values("value_at_risk", ascending=False).reset_index(drop=True)

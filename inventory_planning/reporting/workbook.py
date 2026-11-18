@@ -110,9 +110,11 @@ LEAD_COLUMNS: Dict[str, Sequence[Tuple[str, Optional[str]]]] = {
         ("first_short_period", None), ("short_periods", QTY),
         ("suggested_po_qty", QTY), ("pushout_open_po_qty", QTY),
         ("safety_stock", QTY),
+        ("lead_time_days", DAYS), ("lead_time_periods", QTY),
+        ("gap qty within lead time", QTY), ("gap amt within lead time", MONEY),
         ("demand qty total", QTY), ("supply qty total", QTY), ("gap qty peak", QTY),
         ("demand amt total", MONEY), ("supply amt total", MONEY),
-        ("gap amt total", MONEY),
+        ("gap amt peak", MONEY),
     ],
 }
 
@@ -178,6 +180,10 @@ SHEET_NOTES: Dict[str, List[str]] = {
         "month is short when it falls below `safety_stock` — which is one column, not one "
         "per month, because the projection holds one floor per item — and `gap qty "
         "<month>` is by how much. Not when the shelf is bare: above an empty shelf.",
+        "`gap … within lead time` is the deepest of those shortfalls inside the item's "
+        "own lead time (`lead_time_periods` months) — what an order placed today cannot "
+        "close, so the exposure to expedite or allocate. Shortfalls after it are still a "
+        "purchase to place. Gaps are levels, so the lead block shows peaks, not sums.",
         "Summed by product line or down a month's column, this sheet is the S&IOP "
         "rollup. The totals come out of these cells, so the two cannot disagree.",
         "Amounts are at cost. Items with no unit cost carry quantities and a blank amount, "

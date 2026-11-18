@@ -39,6 +39,25 @@ still has stock on the rack.
 The projection is run per SKU and summed, never on the aggregate. Aggregating first
 nets one item's surplus against another's shortage — different materials, not
 interchangeable — and reports a business in balance that cannot ship a single order.
+
+## Which part of the gap is a risk and which is a purchase
+
+Not every month of the horizon is the same kind of month. A shortfall inside an item's
+lead time cannot be closed by an order placed today: the order lands after the month
+it was meant to cover, so that gap is service already at risk and the only levers are
+expediting and allocation. A shortfall beyond the lead time is still a buying decision
+— the purchase recommendation exists to close it.
+
+A fixed window treats the two alike. Three months is too long for an item that arrives
+in two weeks, and reports as a risk what is merely a purchase not yet placed; it is too
+short for one that takes four months, and leaves out the very months that can no longer
+be saved. So each item's window is its own lead time, counted in whole periods:
+`gap … within lead time` is the deepest shortfall inside it, and that is the number to
+take to the meeting as exposure. The months beyond it stay on the sheet as the plan.
+
+A gap is a level, not a flow — the distance below the floor at the end of a month — so
+it is carried forward as a peak and never summed across months. Six months short by the
+same hundred units are one shortfall of a hundred, not six hundred.
 """
 
 from __future__ import annotations
@@ -64,6 +83,21 @@ class SIOPPlan:
     @property
     def periods(self) -> List[str]:
         return list(self.by_period["period"]) if len(self.by_period) else []
+
+    @property
+    def gap_within_lead_time(self) -> float:
+        """
+        The exposure an order placed today cannot close, summed across items.
+
+        Each item contributes its deepest shortfall inside its own lead time — a peak,
+        because a gap is a level, and per item before summing, because one item's
+        surplus does not cover another's short.
+        """
+        frame = self.per_sku
+        if frame is None or not len(frame) or "within_lead_time" not in frame:
+            return 0.0
+        inside = frame[frame["within_lead_time"]]
+        return float(inside.groupby("sku")["gap_value"].max().sum()) if len(inside) else 0.0
 
     # The measures that are phased, and how each is spelled when it is spread across
     # the header. `qty`/`amt` and the period last, matching the S&OP worksheet, because
@@ -120,16 +154,29 @@ class SIOPPlan:
         out["first_short_period"] = out["sku"].map(first_short)
         out["short_periods"] = out["sku"].map(
             short.groupby("sku")["period"].nunique()).fillna(0).astype(int)
-        out["safety_stock"] = out["sku"].map(
-            frame.drop_duplicates("sku").set_index("sku")["safety_stock"])
+        first = frame.drop_duplicates("sku").set_index("sku")
+        out["safety_stock"] = out["sku"].map(first["safety_stock"])
+        if "lead_time_days" in frame.columns:
+            out["lead_time_days"] = out["sku"].map(first["lead_time_days"])
+            out["lead_time_periods"] = out["sku"].map(first["lead_time_periods"])
+            inside = frame[frame["within_lead_time"]].groupby("sku")
+            # Zero rather than blank where nothing is short inside the window: the item
+            # was projected and is covered, which is an answer, not a missing one.
+            out["gap qty within lead time"] = out["sku"].map(
+                inside["gap_qty"].max()).fillna(0.0)
+            out["gap amt within lead time"] = out["sku"].map(
+                inside["gap_value"].max()).fillna(0.0)
 
         totals = frame.groupby("sku")
         out["demand qty total"] = out["sku"].map(totals["demand_qty"].sum())
         out["supply qty total"] = out["sku"].map(totals["supply_qty"].sum())
-        out["gap qty peak"] = out["sku"].map(totals["gap_qty"].max())
         out["demand amt total"] = out["sku"].map(totals["demand_cogs"].sum())
         out["supply amt total"] = out["sku"].map(totals["supply_value"].sum())
-        out["gap amt total"] = out["sku"].map(totals["gap_value"].sum())
+        # Peaks, not totals. Demand and supply are flows and add across months; a gap
+        # is how far below the floor a month closes, and summing it counted one
+        # standing shortfall once for every month it stood.
+        out["gap qty peak"] = out["sku"].map(totals["gap_qty"].max())
+        out["gap amt peak"] = out["sku"].map(totals["gap_value"].max())
 
         for column, label in self.PHASED:
             spread = frame.pivot_table(index="sku", columns="period", values=column,
@@ -175,6 +222,12 @@ class SIOPPlan:
             lines.append("    No period falls below its safety stock on committed "
                          "supply. The gap is measured per SKU and summed, never on the "
                          "aggregate — one item's surplus cannot cover another's short.")
+        exposure = self.gap_within_lead_time
+        if exposure > 0:
+            lines.append(
+                f"    Within each item's own lead time: {exposure:,.0f} {self.currency} "
+                f"short — the part of the gap an order placed today cannot close. The "
+                f"rest is a purchase not yet placed.")
         if self.uncosted_skus:
             lines.append(
                 f"    {self.uncosted_skus:,} of "
@@ -235,7 +288,8 @@ def build_siop_plan(
     opening = _opening_position(inventory)
     target = _safety_target(safety_stock)
 
-    per_sku = _project(demand, supply, opening, target, periods, cost)
+    per_sku = _project(demand, supply, opening, target, periods, cost,
+                       _lead_time_days(attributes))
     by_period = (per_sku.groupby("period", as_index=False)
                  .agg(demand_qty=("demand_qty", "sum"),
                       demand_cogs=("demand_cogs", "sum"),
@@ -333,6 +387,34 @@ def _opening_position(inventory: pd.DataFrame) -> dict:
     return frame.assign(_qty=total).groupby("sku")["_qty"].sum().to_dict()
 
 
+def _lead_time_days(attributes) -> dict:
+    """Each item's resolved lead time, where it has one."""
+    if attributes is None or not len(attributes) or "lead_time_days" not in attributes:
+        return {}
+    days = pd.to_numeric(attributes["lead_time_days"], errors="coerce")
+    frame = pd.DataFrame({"sku": attributes["sku"].astype(str), "days": days}).dropna()
+    frame = frame[frame["days"] > 0]
+    return frame.drop_duplicates("sku").set_index("sku")["days"].to_dict()
+
+
+# A period here is a calendar month. Counting a lead time in months by this length
+# rounds 31 days up to two, which is the safe direction: an order due on day 31 has
+# missed the first month.
+DAYS_PER_PERIOD = 30.4375
+
+
+def _lead_time_periods(days, horizon: int) -> int:
+    """
+    How many leading periods an order placed today cannot reach. At least one — the
+    current month is never recoverable — and never more than the horizon. An item with
+    no lead time is treated as unrecoverable across the whole horizon, the cautious
+    reading, rather than dropped from the exposure.
+    """
+    if days is None or pd.isna(days):
+        return horizon
+    return int(min(horizon, max(1, np.ceil(float(days) / DAYS_PER_PERIOD))))
+
+
 def _safety_target(safety_stock: pd.DataFrame) -> dict:
     if safety_stock is None or not len(safety_stock) or "safety_stock" not in safety_stock:
         return {}
@@ -344,7 +426,7 @@ def _safety_target(safety_stock: pd.DataFrame) -> dict:
 # ── The projection ───────────────────────────────────────────────────────────
 
 
-def _project(demand, supply, opening, target, periods, cost) -> pd.DataFrame:
+def _project(demand, supply, opening, target, periods, cost, lead=None) -> pd.DataFrame:
     """
     Roll each SKU forward through the horizon, one period at a time.
 
@@ -366,13 +448,15 @@ def _project(demand, supply, opening, target, periods, cost) -> pd.DataFrame:
         unit = cost.get(sku, np.nan)
         position = float(opening.get(sku, 0.0))
         floor = float(target.get(sku, 0.0))
+        days = (lead or {}).get(sku, np.nan)
+        window = _lead_time_periods(days, len(periods))
         # Only the three numeric columns. `part` still carries `sku`, and filling an
         # object column with a float is the downcast pandas 2 warns about and pandas 3
         # changes the behaviour of — a silent dtype shift in the middle of a projection
         # is exactly the kind of thing that would be noticed a version too late.
         part = (part[["period", "demand_qty", "demand_cogs", "supply_qty"]]
                 .set_index("period").reindex(periods).astype(float).fillna(0.0))
-        for period in periods:
+        for index, period in enumerate(periods):
             demand_qty = float(part.at[period, "demand_qty"])
             supply_qty = float(part.at[period, "supply_qty"])
             position = position + supply_qty - demand_qty
@@ -393,6 +477,9 @@ def _project(demand, supply, opening, target, periods, cost) -> pd.DataFrame:
                 "gap_qty": gap_qty,
                 "gap_value": gap_qty * unit if pd.notna(unit) else 0.0,
                 "safety_stock": floor,
+                "lead_time_days": days,
+                "lead_time_periods": window,
+                "within_lead_time": index < window,
             })
     return pd.DataFrame(rows)
 

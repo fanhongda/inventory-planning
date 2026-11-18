@@ -435,10 +435,15 @@ class KPIReport:
                 f"<strong>{int((should_be.frame['gap_value'] < 0).sum()):,}</strong> others"))
 
         if forward is not None and len(forward.stockout):
+            # The sentence under the figure has to describe the same window as the
+            # figure. It used to count SKUs out within 30 days beneath a sum over 180,
+            # which read as "this much is at risk this month".
             urgent = len(forward.urgent(30))
             tiles.append(self._tile(
                 "Demand at risk", _money(forward.value_at_risk),
-                f"<strong>{urgent}</strong> SKUs run out within 30 days"))
+                f"unserved before an order placed today could land · "
+                f"<strong>{len(forward.stockout):,}</strong> SKUs, "
+                f"<strong>{urgent:,}</strong> of them out within 30 days"))
 
         if not tiles:
             return ""

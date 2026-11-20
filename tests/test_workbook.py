@@ -111,15 +111,16 @@ class TestTheSiopSheetIsTheRollup:
 
     def test_every_cell_of_the_long_frame_is_still_there(self, run):
         """
-        The reshape is a reshape. Each measure x period lands in its own column, and the
-        value in it is the value the projection computed for that SKU in that period.
+        The reshape is a reshape. Each phased measure x period lands in its own column,
+        and the value in it is the value the projection computed for that SKU in that
+        period. Money is not phased — see the test below — so this holds the quantities.
         """
         from inventory_planning.analytics.siop import SIOPPlan
 
         _, results, policy, _ = run
         sheet = collect_sheets(results, policy)["S&IOP"].set_index("sku")
         long = policy["siop"].per_sku
-        for column, label in SIOPPlan.PHASED:
+        for column, label in SIOPPlan.PHASED_QTY:
             for _, row in long.iterrows():
                 cell = f"{label} {row['period']}"
                 assert cell in sheet.columns, f"{cell} is not on the sheet"
@@ -136,14 +137,50 @@ class TestTheSiopSheetIsTheRollup:
         assert (long.groupby("sku")["safety_stock"].nunique() == 1).all()
 
     def test_it_sums_to_the_period_totals(self, run):
+        """Down a month's column the item rows are the rollup — they cannot disagree."""
         _, results, policy, _ = run
         sheet = collect_sheets(results, policy)["S&IOP"]
         by_period = policy["siop"].by_period.set_index("period")
         for period, row in by_period.iterrows():
-            assert sheet[f"demand amt {period}"].sum() == pytest.approx(
-                row["demand_cogs"], rel=1e-6)
-            assert sheet[f"closing amt {period}"].sum() == pytest.approx(
-                row["closing_value"], rel=1e-6)
+            assert sheet[f"demand qty {period}"].sum() == pytest.approx(
+                row["demand_qty"], rel=1e-6)
+            assert sheet[f"closing qty {period}"].sum() == pytest.approx(
+                row["closing_qty"], rel=1e-6)
+
+    def test_money_is_not_phased_across_the_item_rows(self, run):
+        """
+        Four money measures across the horizon is a third of the sheet's width saying
+        `qty x unit cost`, and `closing amt` is worse than redundant: it floors a
+        negative position at zero, so the month an item backorders reads as 0 beside a
+        `closing qty` that says otherwise. What each item is worth stays in the lead
+        block; money by month is the KPI report's job.
+        """
+        _, results, policy, _ = run
+        item = collect_sheets(results, policy)["S&IOP"]
+        by_period = policy["siop"].by_period.set_index("period")
+
+        for period in by_period.index:
+            for measure in ("demand amt", "supply amt", "closing amt", "gap amt"):
+                assert f"{measure} {period}" not in item.columns, \
+                    f"{measure} {period} is back on the item sheet"
+        # The quantities stay phased, and the money headlines stay in the lead block.
+        assert [c for c in item.columns if str(c).startswith("closing qty ")]
+        assert {"gap amt peak", "gap amt within lead time",
+                "demand amt total"} <= set(item.columns)
+
+        # The money by month is not lost, it is just not here: `by_period` still carries
+        # it, and the KPI report's S&IOP section is where it is published.
+        assert {"demand_cogs", "supply_value", "closing_value", "gap_value"} \
+            <= set(by_period.columns)
+
+    def test_the_phased_money_can_be_asked_for(self, run):
+        """Trimmed by default, not deleted — a tenant that wants the old width says so."""
+        _, _, policy, _ = run
+        wide = policy["siop"].per_sku_wide(phased_amounts=True)
+        periods = sorted(policy["siop"].per_sku["period"].astype(str).unique())
+        for period in periods:
+            for measure in ("demand amt", "supply amt", "closing amt", "gap amt"):
+                assert f"{measure} {period}" in wide.columns
 
     def test_the_purchase_behind_the_position_is_on_the_row(self, run):
         """

@@ -103,18 +103,21 @@ class SIOPPlan:
     # the header. `qty`/`amt` and the period last, matching the S&OP worksheet, because
     # the two sheets are read in the same meeting and a planner should not have to learn
     # two conventions to sort them.
-    PHASED = (
+    PHASED_QTY = (
         ("demand_qty", "demand qty"),
         ("supply_qty", "supply qty"),
         ("closing_qty", "closing qty"),
         ("gap_qty", "gap qty"),
+    )
+    PHASED_AMT = (
         ("demand_cogs", "demand amt"),
         ("supply_value", "supply amt"),
         ("closing_value", "closing amt"),
         ("gap_value", "gap amt"),
     )
+    PHASED = PHASED_QTY + PHASED_AMT
 
-    def per_sku_wide(self) -> pd.DataFrame:
+    def per_sku_wide(self, phased_amounts: bool = False) -> pd.DataFrame:
         """
         The same projection, one row per SKU, with the periods across the header.
 
@@ -127,16 +130,26 @@ class SIOPPlan:
         it is sixty rows for ten decisions, and the complaint it drew was exactly that —
         one item, many rows of positions and buys, nothing legible.
 
-        The reshape is lossless: every cell of `per_sku` appears here under a
+        The reshape carries every quantity cell of `per_sku` under a
         `<measure> <unit> <period>` name, which is the spelling the S&OP worksheet
-        already uses. Two deliberate exceptions, both of which remove repetition rather
-        than information:
+        already uses. Three deliberate exceptions, all of which remove repetition
+        rather than information:
 
         - `safety_stock` is one column, not one per period. The projection holds a
           single floor per SKU, so N identical columns would be N-1 columns of nothing.
         - A short block of totals leads, so the question "is this item in trouble at all"
           is answered before any scrolling. They are sums of the row they sit on and
           cannot disagree with it.
+        - The phased amounts are off unless `phased_amounts` asks for them. Four money
+          measures across six periods is twenty-four columns of `qty x unit cost` —
+          a third of the sheet's width carrying no fact the quantity beside it does not
+          already state. One of them is worse than redundant: `closing amt` floors a
+          negative position at zero, by the valuation rule in `_project`, so the month
+          an item backorders reads as a flat 0 next to the `closing qty` of -24,184 that
+          says what actually happened. Each item's money stays in the lead block —
+          `gap amt within lead time`, `gap amt peak`, the totals — and money by month,
+          which is a question about the business rather than the item, is what
+          `by_period` is for and where the KPI report already publishes it.
         """
         frame = self.per_sku
         if frame is None or not len(frame):
@@ -178,7 +191,8 @@ class SIOPPlan:
         out["gap qty peak"] = out["sku"].map(totals["gap_qty"].max())
         out["gap amt peak"] = out["sku"].map(totals["gap_value"].max())
 
-        for column, label in self.PHASED:
+        phased = self.PHASED_QTY + (self.PHASED_AMT if phased_amounts else ())
+        for column, label in phased:
             spread = frame.pivot_table(index="sku", columns="period", values=column,
                                        aggfunc="sum")
             spread.columns = [str(c) for c in spread.columns]

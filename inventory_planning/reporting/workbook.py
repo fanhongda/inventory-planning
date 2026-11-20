@@ -25,9 +25,12 @@ It is also **one row per item, with the months across the header**, and not one 
 item per month. The long form was the grain the projection is computed on, published
 unchanged: a planner holding one item and asking when it runs short had to read six rows
 and compare one against another, which with a real catalogue is thousands of rows for
-hundreds of decisions. The reshape is in `SIOPPlan.per_sku_wide` and is lossless — every
-cell appears under a `<measure> <qty|amt> <period>` name, the spelling the S&OP worksheet
-already uses, so the two sheets a meeting opens together sort the same way.
+hundreds of decisions. The reshape is in `SIOPPlan.per_sku_wide`: every phased cell
+appears under a `<measure> <qty|amt> <period>` name, the spelling the S&OP worksheet
+already uses, so the two sheets a meeting opens together sort the same way. Quantities
+are phased there and money is not: four money measures across the horizon is two dozen
+columns of quantity times unit cost, so each item's money stays in the lead block and
+money by month stays in the KPI report, which already carries it for the business.
 
 ## Column order, and why nothing is dropped
 
@@ -184,8 +187,19 @@ SHEET_NOTES: Dict[str, List[str]] = {
         "own lead time (`lead_time_periods` months) — what an order placed today cannot "
         "close, so the exposure to expedite or allocate. Shortfalls after it are still a "
         "purchase to place. Gaps are levels, so the lead block shows peaks, not sums.",
-        "Summed by product line or down a month's column, this sheet is the S&IOP "
-        "rollup. The totals come out of these cells, so the two cannot disagree.",
+        "A positive `gap qty <month>` does not by itself mean the item ran out. The gap "
+        "is the distance below the floor, so it covers both a month that closes with "
+        "stock but under `safety_stock`, and a month that closes short. `closing qty "
+        "<month>` is what separates them: positive is cover eaten into, negative is a "
+        "backorder, and the shortfall actually owed is whatever that negative is.",
+        "Summed by product line or down a month's quantity column, this sheet is the "
+        "S&IOP rollup. The totals come out of these cells, so the two cannot disagree.",
+        "Money is not phased across these rows: four money measures across the horizon "
+        "was twenty-four columns of quantity times unit cost, and `closing amt` hid the "
+        "month an item went short, because a negative position is floored at zero for "
+        "valuation. What each item is worth is in the lead block — `gap amt within lead "
+        "time`, `gap amt peak`, and the totals. Money by month, for the business rather "
+        "than the item, is the S&IOP section of the KPI report.",
         "Amounts are at cost. Items with no unit cost carry quantities and a blank amount, "
         "so they cannot sum into a total unnoticed.",
     ],
